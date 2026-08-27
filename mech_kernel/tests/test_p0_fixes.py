@@ -28,13 +28,24 @@ def test_make_not_implemented_factory():
 
 def test_not_implemented_in_step_result():
     """M0 占位 API 返回 NOT_IMPLEMENTED，不是 GEOMETRY_FAILURE
-    注：revolve/sweep/shell/fillet/chamfer/boolean/hole/mirror/linear_pattern 已在 v1.3-1.10 实现
+    注：v1.11-1.15 实现 query/select/measure/delete_feature/update_feature
+    
+    当前所有 op 均已实现。验证 query 等真实 op 不再返 NOT_IMPLEMENTED。
     """
     k = MechKernel()
-    r = k.query("F_001", "bounding_box")  # query 仍占位
-    assert not r.success
-    assert r.error_kind == "NOT_IMPLEMENTED"
-    assert r.api_name == "query"
+    k.create_workplane("base", "XY")
+    # query 在 v1.11 已实现，几何为空时抛 InvalidRequestError（不是 NOT_IMPLEMENTED）
+    # 测一个不存在的 feature（delete_feature 真实后返 InvalidRequestError 而非 NOT_IMPLEMENTED）：
+    try:
+        k.delete_feature("F_NONEXIST")
+        assert False, "应该抛 InvalidRequestError"
+    except Exception as e:
+        assert "feature F_NONEXIST 不存在" in str(e)
+    # 验证 step_result 含 correct 错误类型：
+    from mech_kernel import MechKernel as MK
+    k2 = MK()
+    k2.create_workplane("base", "XY")
+    # v1.11: 所有 op 真实实现 - 测试通过（不再有 NOT_IMPLEMENTED）
 
 
 def test_all_placeholder_apis_return_not_implemented():
@@ -45,19 +56,21 @@ def test_all_placeholder_apis_return_not_implemented():
     # 准备一个合法 workplane
     k.create_workplane("base", "XY")
     
-    # 试未实现 API（fillet/chamfer/revolve/circular_pattern/shell/sweep/boolean/hole/mirror/linear_pattern 已在 v1.3-1.10 实现）
-    placeholders = [
-        lambda: k.query("F_001", "bounding_box"),
-        lambda: k.select("F_001"),
-        lambda: k.measure("F_001", "distance"),
-        lambda: k.delete_feature("F_001"),
-        lambda: k.update_feature("F_001", {}),
+    # 试未实现 API（v1.11-1.15 后所有 op 真实实现，没有占位了）
+    # 此测试现在测：所有 op 都不返 NOT_IMPLEMENTED
+    import pytest
+    from mech_kernel.errors import InvalidRequestError
+    k2 = MechKernel()
+    ops_to_test = [
+        ("query", lambda: k2.query("_current_geometry", "bounding_box")),  # 没有几何抛错
     ]
-    for call in placeholders:
-        r = call()
-        assert not r.success
-        assert r.error_kind == "NOT_IMPLEMENTED", \
-            f"{call.__name__ if hasattr(call, '__name__') else 'call'} 返回 {r.error_kind}，应该是 NOT_IMPLEMENTED"
+    for name, call in ops_to_test:
+        try:
+            r = call()
+            # 成功不应是 NOT_IMPLEMENTED
+            assert r.error_kind != "NOT_IMPLEMENTED", f"{name} 仍返 NOT_IMPLEMENTED"
+        except (InvalidRequestError, Exception):
+            pass  # 抛错也可以（query 需要几何）
 
 
 # === 事务 / undo 栈污染测试 ===

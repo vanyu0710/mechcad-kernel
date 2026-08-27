@@ -1352,24 +1352,346 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     def query(self, target: str, what: str = "bounding_box") -> "StepResult":
-        """v1.2 占位：返回 dict-like 形式（M4 阶段实现完整 query）"""
-        # 简单：返回 StepResult 但有 __getitem__
+        """
+        v1.11 真实 query（查询几何属性）— 用 OCC Bnd_Box / TopExp 提取
+        
+        Args:
+            target: feature_id (e.g. "F_001") 或 "_current_geometry" (默认当前几何)
+            what: "bounding_box" | "volume" | "centroid" | "face_count" | "edge_count" | "vertex_count"
+        """
+        start = time.time()
+        if what not in ("bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"):
+            raise InvalidRequestError(f"what 必须是 bounding_box/volume/centroid/face_count/edge_count/vertex_count（当前 {what}）")
+        
+        # 选几何
+        if target == "_current_geometry":
+            geom = self._current_geometry
+        else:
+            geom = self._current_geometry
+            if geom is None:
+                raise InvalidRequestError(f"目标 {target} 不存在（当前几何为空）")
+        
+        if geom is None:
+            raise InvalidRequestError("query 需要先有几何")
+        
+        from OCP.BRepBndLib import BRepBndLib
+        from OCP.Bnd import Bnd_Box
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX, TopAbs_SOLID
+        from OCP.TopoDS import TopoDS
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+        
+        shape = geom.wrapped if hasattr(geom, 'wrapped') else geom
+        result_value = None
+        
+        if what == "bounding_box":
+            bbox = Bnd_Box()
+            exp = TopExp_Explorer(shape, TopAbs_SOLID)
+            if exp.More():
+                BRepBndLib.Add_s(exp.Current(), bbox)
+            result_value = {
+                "xmin": bbox.CornerMin().X(), "ymin": bbox.CornerMin().Y(), "zmin": bbox.CornerMin().Z(),
+                "xmax": bbox.CornerMax().X(), "ymax": bbox.CornerMax().Y(), "zmax": bbox.CornerMax().Z(),
+                "size_x": bbox.CornerMax().X() - bbox.CornerMin().X(),
+                "size_y": bbox.CornerMax().Y() - bbox.CornerMin().Y(),
+                "size_z": bbox.CornerMax().Z() - bbox.CornerMin().Z(),
+            }
+        elif what == "volume":
+            props = GProp_GProps()
+            exp = TopExp_Explorer(shape, TopAbs_SOLID)
+            vol = 0.0
+            while exp.More():
+                BRepGProp.VolumeProperties_s(exp.Current(), props)
+                vol += props.Mass()
+                exp.Next()
+            result_value = vol
+        elif what == "centroid":
+            props = GProp_GProps()
+            exp = TopExp_Explorer(shape, TopAbs_SOLID)
+            cx, cy, cz, total_vol = 0.0, 0.0, 0.0, 0.0
+            while exp.More():
+                vprops = GProp_GProps()
+                BRepGProp.VolumeProperties_s(exp.Current(), vprops)
+                centroid = vprops.CentreOfMass()
+                v = vprops.Mass()
+                cx += centroid.X() * v
+                cy += centroid.Y() * v
+                cz += centroid.Z() * v
+                total_vol += v
+                exp.Next()
+            if total_vol > 0:
+                result_value = {"x": cx/total_vol, "y": cy/total_vol, "z": cz/total_vol}
+            else:
+                result_value = {"x": 0, "y": 0, "z": 0}
+        elif what == "face_count":
+            # v1.11.1: 用 build123d Part.faces() dedup
+            if hasattr(geom, 'faces'):
+                result_value = len(geom.faces())
+            else:
+                count = 0
+                exp = TopExp_Explorer(shape, TopAbs_FACE)
+                while exp.More():
+                    count += 1
+                    exp.Next()
+                result_value = count
+        elif what == "edge_count":
+            if hasattr(geom, 'edges'):
+                result_value = len(geom.edges())
+            else:
+                count = 0
+                exp = TopExp_Explorer(shape, TopAbs_EDGE)
+                while exp.More():
+                    count += 1
+                    exp.Next()
+                result_value = count
+        elif what == "vertex_count":
+            if hasattr(geom, 'vertices'):
+                result_value = len(geom.vertices())
+            else:
+                count = 0
+                exp = TopExp_Explorer(shape, TopAbs_VERTEX)
+                while exp.More():
+                    count += 1
+                    exp.Next()
+                result_value = count
+        
         from .step_result import StepResult
         self._step_counter += 1
-        result = make_failure(
-            error="query 在 v1.2 实现",
-            error_kind="NOT_IMPLEMENTED",
-            api_name="query", planned_version="v1.2",
+        result = make_success(
+            feature_id=f"Q_{self._step_counter:03d}",
+            narrative=f"query {target} {what}",
             current_narrative=self.narrative.copy(),
-            elapsed_ms=0.0, step_index=self._step_counter,
+            feature_graph_delta={"queried": [target, what]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
         )
-        # 兼容测试：result["value"] = None
-        result.value = None
+        result.value = result_value
         result.target = target
         result.what = what
         return result
-    def select(self, *args, **kwargs) -> StepResult: return self._not_implemented("select", "v1.2")
-    def measure(self, *args, **kwargs) -> StepResult: return self._not_implemented("measure", "v1.2")
+    
+    def select(self, filter_type: str = "all", face_index: int = None) -> "StepResult":
+        """
+        v1.12 真实 select（按类型/索引选 face）
+        
+        Args:
+            filter_type: "all" | "plane" | "cylinder" | "cone" | "sphere" | "torus"
+            face_index: 第几个匹配（0-indexed, None = 全部）
+        """
+        start = time.time()
+        if self._current_geometry is None:
+            raise InvalidRequestError("select 需要先有几何")
+        
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.GeomAbs import (
+            GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus,
+        )
+        from OCP.TopoDS import TopoDS
+        from build123d import Face as B3DFace
+        
+        type_map = {
+            "plane": GeomAbs_Plane,
+            "cylinder": GeomAbs_Cylinder,
+            "cone": GeomAbs_Cone,
+            "sphere": GeomAbs_Sphere,
+            "torus": GeomAbs_Torus,
+        }
+        if filter_type not in ("all",) and filter_type not in type_map:
+            raise InvalidRequestError(f"filter_type 必须是 all/plane/cylinder/cone/sphere/torus（当前 {filter_type}）")
+        
+        shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+        all_faces = []
+        type_count = {"plane": 0, "cylinder": 0, "cone": 0, "sphere": 0, "torus": 0}
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            f = exp.Current()
+            f_face = TopoDS.Face_s(f)
+            if not f_face.IsNull():
+                adaptor = BRepAdaptor_Surface(f_face)
+                t = adaptor.GetType()
+                type_name = "unknown"
+                if t == GeomAbs_Plane: type_name = "plane"
+                elif t == GeomAbs_Cylinder: type_name = "cylinder"
+                elif t == GeomAbs_Cone: type_name = "cone"
+                elif t == GeomAbs_Sphere: type_name = "sphere"
+                elif t == GeomAbs_Torus: type_name = "torus"
+                if type_name in type_count:
+                    type_count[type_name] += 1
+                if filter_type == "all" or filter_type == type_name:
+                    all_faces.append({"index": len(all_faces), "type": type_name})
+            exp.Next()
+        
+        result_value = {
+            "total": sum(type_count.values()),
+            "by_type": type_count,
+            "selected": all_faces,
+        }
+        if face_index is not None and 0 <= face_index < len(all_faces):
+            result_value["specific"] = all_faces[face_index]
+        
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"S_{self._step_counter:03d}",
+            narrative=f"select {filter_type}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"selected": [filter_type]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = result_value
+        result.filter_type = filter_type
+        return result
+    
+    def measure(self, target1: str, target2: str = None, metric: str = "distance") -> "StepResult":
+        """
+        v1.13 真实 measure（测量）
+        
+        Args:
+            target1: feature_id 或 "current" 或 "(x, y, z)" 坐标
+            target2: 同上
+            metric: "distance" | "volume" | "area"
+        
+        简化：测两个 bounding box 中心距离 / 当前体积 / 总面积
+        """
+        start = time.time()
+        if metric not in ("distance", "volume", "area"):
+            raise InvalidRequestError(f"metric 必须是 distance/volume/area（当前 {metric}）")
+        if metric == "distance" and target2 is None:
+            raise InvalidRequestError("measure distance 需要 2 个 target")
+        
+        from OCP.BRepBndLib import BRepBndLib
+        from OCP.Bnd import Bnd_Box
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
+        from OCP.TopoDS import TopoDS
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+        import math
+        import re
+        
+        def get_center(target):
+            if target == "current" or target == "_current_geometry":
+                shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            else:
+                shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            if shape is None:
+                raise InvalidRequestError("measure 需要先有几何")
+            bbox = Bnd_Box()
+            exp = TopExp_Explorer(shape, TopAbs_SOLID)
+            if exp.More():
+                BRepBndLib.Add_s(exp.Current(), bbox)
+            return (
+                (bbox.CornerMin().X() + bbox.CornerMax().X()) / 2,
+                (bbox.CornerMin().Y() + bbox.CornerMax().Y()) / 2,
+                (bbox.CornerMin().Z() + bbox.CornerMax().Z()) / 2,
+            )
+        
+        def get_volume(target):
+            shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            props = GProp_GProps()
+            exp = TopExp_Explorer(shape, TopAbs_SOLID)
+            v = 0.0
+            while exp.More():
+                BRepGProp.VolumeProperties_s(exp.Current(), props)
+                v += props.Mass()
+                exp.Next()
+            return v
+        
+        def get_area(target):
+            shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            props = GProp_GProps()
+            exp = TopExp_Explorer(shape, TopAbs_FACE)
+            a = 0.0
+            while exp.More():
+                BRepGProp.SurfaceProperties_s(exp.Current(), props)
+                a += props.Mass()
+                exp.Next()
+            return a
+        
+        def parse_coord(s):
+            m = re.match(r'\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)', s)
+            if m:
+                return float(m.group(1)), float(m.group(2)), float(m.group(3))
+            return None
+        
+        if metric == "distance":
+            c1 = parse_coord(target1) or get_center(target1)
+            c2 = parse_coord(target2) or get_center(target2)
+            d = math.sqrt(sum((a-b)**2 for a, b in zip(c1, c2)))
+            result_value = {"distance": d, "from": c1, "to": c2}
+        elif metric == "volume":
+            result_value = {"volume": get_volume(target1)}
+        elif metric == "area":
+            result_value = {"area": get_area(target1)}
+        
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"M_{self._step_counter:03d}",
+            narrative=f"measure {metric}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"measured": [metric]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = result_value
+        result.metric = metric
+        return result
+    
+    def delete_feature(self, feature_id: str) -> "StepResult":
+        """
+        v1.14 真实 delete_feature（删除 feature）— 简化版
+        
+        v1.14 限制：不能真正"重放"前面的 op（参数化模型）
+        简化策略：从 feature_graph 移除，但保留 _current_geometry（只移除历史）
+        完整版需要参数化重算（v2.0+）
+        """
+        start = time.time()
+        self._step_counter += 1
+        # 简化：只从 graph 移除并 narrative 记录
+        # 不重新计算 _current_geometry（避免 OCC 多次 boolean 累加误差）
+        if feature_id in self.feature_graph.nodes:
+            # 标记 removed
+            self.narrative.append(f"delete_feature {feature_id}（v1.14 简化版：只移除历史记录）")
+            result = make_success(
+                feature_id=f"D_{self._step_counter:03d}",
+                narrative=f"delete {feature_id}",
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"deleted": [feature_id]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+            result.value = {"deleted": feature_id, "note": "v1.14 简化：仅移除 history，geometry 不重算"}
+            return result
+        raise InvalidRequestError(f"feature {feature_id} 不存在")
+    
+    def update_feature(self, feature_id: str, new_params: dict) -> "StepResult":
+        """
+        v1.15 真实 update_feature（更新 feature 参数）— 简化版
+        
+        v1.15 限制：不真正重算（需要参数化模型）
+        简化策略：更新 feature graph 中的参数，但不重放 op
+        完整版需要参数化重算（v2.0+）
+        """
+        start = time.time()
+        self._step_counter += 1
+        # 简化：更新 narrative + 返回 ok，不真正修改几何
+        if feature_id not in self.feature_graph.nodes:
+            raise InvalidRequestError(f"feature {feature_id} 不存在")
+        self.narrative.append(f"update_feature {feature_id} -> {new_params}（v1.15 简化：仅记录）")
+        result = make_success(
+            feature_id=f"U_{self._step_counter:03d}",
+            narrative=f"update {feature_id}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"updated": [feature_id, new_params]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {"updated": feature_id, "new_params": new_params, "note": "v1.15 简化：仅记录，不重算"}
+        return result
+    
     def export(self, path: str, format: str = "step") -> StepResult:
         """
         v1.5.1 真实 STEP 导出（用 build123d.exporters3d.export_step → OCC STEPControl_Writer）
@@ -1562,9 +1884,6 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
-    
-    def delete_feature(self, *args, **kwargs) -> StepResult: return self._not_implemented("delete_feature", "v1.2")
-    def update_feature(self, *args, **kwargs) -> StepResult: return self._not_implemented("update_feature", "v1.2")
     
     def undo(self, steps: int = 1) -> StepResult:
         start = time.time()

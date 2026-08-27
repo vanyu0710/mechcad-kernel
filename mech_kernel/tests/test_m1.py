@@ -276,12 +276,15 @@ def test_kernel_extrude_with_mock_geometry_renders():
 
 
 def test_kernel_no_geometry_renders_none():
-    """没有几何时不渲染（用 query 验证，query 不依赖几何存在）"""
+    """没有几何时不渲染（query 在 v1.11 真实实现，几何为空时抛 InvalidRequestError）"""
     k = MechKernel()
     k.create_workplane("base", "XY")
-    # query 不需要几何
-    result = k.query("feature_count")
-    assert result["value"] is None  # M4 阶段实现
+    # v1.11: query 真实，几何为空时抛 InvalidRequestError
+    try:
+        k.query("_current_geometry", "bounding_box")
+        assert False, "应该抛 InvalidRequestError"
+    except Exception as e:
+        assert "几何为空" in str(e) or "query 需要先有几何" in str(e)
 
 
 def test_kernel_render_cache_works():
