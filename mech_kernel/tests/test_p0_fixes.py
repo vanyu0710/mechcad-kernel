@@ -28,13 +28,13 @@ def test_make_not_implemented_factory():
 
 def test_not_implemented_in_step_result():
     """M0 占位 API 返回 NOT_IMPLEMENTED，不是 GEOMETRY_FAILURE
-    注：revolve/sweep/shell/fillet/chamfer 已在 v1.3-1.6 真实实现
+    注：revolve/sweep/shell/fillet/chamfer/boolean 已在 v1.3-1.7 真实实现
     """
     k = MechKernel()
-    r = k.boolean("union", "F_001", "F_002")  # boolean 仍占位
+    r = k.hole("base", (0, 0), 10)  # hole 仍占位
     assert not r.success
     assert r.error_kind == "NOT_IMPLEMENTED"
-    assert r.api_name == "boolean"
+    assert r.api_name == "hole"
 
 
 def test_all_placeholder_apis_return_not_implemented():
@@ -45,9 +45,8 @@ def test_all_placeholder_apis_return_not_implemented():
     # 准备一个合法 workplane
     k.create_workplane("base", "XY")
     
-    # 试未实现 API（fillet/chamfer/revolve/circular_pattern/shell/sweep 已在 v1.3-1.6 实现）
+    # 试未实现 API（fillet/chamfer/revolve/circular_pattern/shell/sweep/boolean 已在 v1.3-1.7 实现）
     placeholders = [
-        lambda: k.boolean("union", "F_001", "F_002"),
         lambda: k.hole("base", (0, 0), 10),
         lambda: k.linear_pattern("F_001", 4, (1, 0, 0), 10),
         lambda: k.mirror(["F_001"], "base"),

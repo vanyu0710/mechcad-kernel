@@ -626,9 +626,118 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
-    
     def sweep(self, *args, **kwargs) -> StepResult: return self._not_implemented("sweep", "v1.2")
-    def boolean(self, *args, **kwargs) -> StepResult: return self._not_implemented("boolean", "v1.2")
+    
+    def boolean(self, target_sketch: str, tools: list, operation: str = "union", name: str = "") -> StepResult:
+        """
+        v1.7 真实 boolean op — 显式 union/subtract/intersect（不靠 extrude mode）
+        
+        流程：
+        1. 把 target_sketch 拉伸成一个 Part 作为新 body
+        2. 把 tools (草图列表) 每个拉伸成 Part，全部 union
+        3. 把 new body 和 tools 复合体应用 boolean op
+        
+        与 extrude mode 的区别：
+        - boolean 支持多个 tool（自动 union）
+        - boolean 支持 intersect（extrude 只能 add/cut）
+        
+        Args:
+            target_sketch: 目标草图（必填，替换 current_geometry）
+            tools: 工具草图列表 [sk1, sk2, ...]
+            operation: "union" | "subtract" | "intersect"
+            name: 特征名
+        """
+        start = time.time()
+        if target_sketch not in self.sketches:
+            raise InvalidRequestError(f"target 草图 {target_sketch} 不存在")
+        for t in tools:
+            if t not in self.sketches:
+                raise InvalidRequestError(f"tool 草图 {t} 不存在")
+        if operation not in ("union", "subtract", "intersect"):
+            raise InvalidRequestError(f"operation 必须是 union/subtract/intersect（当前 {operation}）")
+        
+        from build123d import (
+            BuildPart, BuildSketch, Plane, add, extrude, Location,
+            Circle as B3DCircle, Rectangle as B3DRect,
+        )
+        from build123d.build_common import Locations
+        
+        def _extrude_sketch_to_part(sk, depth, direction="Z"):
+            """草图 → Part"""
+            plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
+            with BuildPart(plane) as bp:
+                with BuildSketch() as s:
+                    for e in sk.entities:
+                        if e.type == "circle":
+                            r = e.params["radius"]
+                            c = e.params.get("center", (0, 0))
+                            if c == (0, 0) or c == [0, 0]:
+                                add(B3DCircle(r))
+                            else:
+                                with Locations((c[0], c[1], 0)):
+                                    B3DCircle(r)
+                        elif e.type == "rectangle":
+                            w, h = e.params["width"], e.params["height"]
+                            c = e.params.get("center", (0, 0))
+                            if c == (0, 0) or c == [0, 0]:
+                                add(B3DRect(w, h))
+                            else:
+                                with Locations((c[0], c[1], 0)):
+                                    B3DRect(w, h)
+                extrude(amount=depth)
+            return bp.part
+        
+        with Transaction(self, "boolean") as txn:
+            feature_id = next_feature_id()
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.BOOLEAN,
+                parameters={"target_sketch": target_sketch, "tools": tools, "operation": operation, "name": name},
+                name=name or f"boolean_{operation}_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            
+            # 1. 拉伸 target 成新 body
+            target_sk = self.sketches[target_sketch]
+            new_body = _extrude_sketch_to_part(target_sk, 50.0)
+            
+            # 2. 拉伸所有 tools 并 union
+            tools_part = None
+            for t_name in tools:
+                t_sk = self.sketches[t_name]
+                t_part = _extrude_sketch_to_part(t_sk, 50.0)
+                if tools_part is None:
+                    tools_part = t_part
+                else:
+                    tools_part = tools_part + t_part
+            
+            # 3. 应用 boolean op
+            if operation == "union":
+                self._current_geometry = new_body + tools_part
+            elif operation == "subtract":
+                self._current_geometry = new_body - tools_part
+            elif operation == "intersect":
+                # build123d Part 用 __and__ (&) 做 intersect
+                self._current_geometry = new_body.__and__(tools_part)
+            
+            self.narrative.append(f"boolean {operation} target={target_sketch} tools={tools}")
+            txn.commit()
+        
+        render_level = "iso_only"
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"boolean {operation} ({target_sketch} with {len(tools)} tools)",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
     def fillet(self, radius: float, edges: str = "all", name: str = "") -> StepResult:
         """
         v1.4.1 真实 fillet（圆角）— 用 build123d Part.fillet → OCC BRepFilletAPI
