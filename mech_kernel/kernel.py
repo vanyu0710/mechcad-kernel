@@ -844,7 +844,130 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def hole(self, *args, **kwargs) -> StepResult: return self._not_implemented("hole", "v1.2")
+    def hole(
+        self,
+        position: tuple = (0, 0),
+        diameter: float = 10.0,
+        depth: float = None,
+        hole_type: str = "simple",
+        counterbore_diameter: float = None,
+        counterbore_depth: float = None,
+        name: str = "",
+    ) -> StepResult:
+        """
+        v1.8 真实 hole（孔向导）— 在 XY 平面打孔
+        
+        Args:
+            position: 孔位 (x, y) 在 XY 平面
+            diameter: 孔径（mm）
+            depth: 深度（默认 None = 穿透 current_geometry）
+            hole_type: "simple" | "counterbore" | "countersink"
+            counterbore_diameter: 沉孔大圆直径（仅 counterbore/countersink）
+            counterbore_depth: 沉孔深度（仅 counterbore）
+            name: 特征名
+        
+        自动从 current_geometry 切出孔
+        """
+        start = time.time()
+        if self._current_geometry is None:
+            raise InvalidRequestError("hole 需要先有几何")
+        if diameter <= 0:
+            raise InvalidRequestError(f"diameter 必须 > 0（当前 {diameter}）")
+        if hole_type not in ("simple", "counterbore", "countersink"):
+            raise InvalidRequestError(f"hole_type 必须 simple/counterbore/countersink（当前 {hole_type}）")
+        
+        from build123d import (
+            BuildPart, BuildSketch, Plane, add, extrude, Location,
+            Circle as B3DCircle,
+        )
+        from build123d.build_common import Locations
+        
+        # 实际孔深：取 current_geometry bbox 的 Z 长度
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepBndLib import BRepBndLib
+        from OCP.Bnd import Bnd_Box
+        shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+        exp = TopExp_Explorer(shape, TopAbs_SOLID)
+        bbox = Bnd_Box()
+        if exp.More():
+            BRepBndLib.Add_s(exp.Current(), bbox)
+        z_min, z_max = bbox.CornerMin().Z(), bbox.CornerMax().Z()
+        actual_depth = (z_max - z_min) + 10 if depth is None else depth  # +10 保险穿透
+        
+        with Transaction(self, "hole") as txn:
+            feature_id = next_feature_id()
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.HOLE,
+                parameters={
+                    "position": list(position), "diameter": diameter, "depth": actual_depth,
+                    "hole_type": hole_type, "counterbore_diameter": counterbore_diameter,
+                    "counterbore_depth": counterbore_depth, "name": name,
+                },
+                name=name or f"hole_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            
+            # 1. simple: 1 个圆
+            # 2. counterbore: 2 个圆叠切（大圆+深，小圆+深）
+            # 3. countersink: 2 个圆叠切（简化：外大圆切锥度）
+            px, py = position
+            if hole_type == "simple":
+                with BuildPart(Plane.XY) as bp:
+                    with BuildSketch() as s:
+                        with Locations((px, py, 0)):
+                            B3DCircle(diameter / 2)
+                    extrude(amount=actual_depth)
+                cutter = bp.part
+            elif hole_type == "counterbore":
+                cb_d = counterbore_diameter or (diameter * 1.8)
+                cb_depth = counterbore_depth or (diameter * 0.5)
+                with BuildPart(Plane.XY) as bp:
+                    with BuildSketch() as s:
+                        with Locations((px, py, 0)):
+                            B3DCircle(cb_d / 2)  # 沉孔大圆
+                    extrude(amount=cb_depth)
+                    with BuildSketch() as s:
+                        with Locations((px, py, 0)):
+                            B3DCircle(diameter / 2)  # 通孔小圆
+                    extrude(amount=actual_depth)
+                cutter = bp.part
+            elif hole_type == "countersink":
+                # 简化：外大圆 + 小圆（无锥度）
+                cs_d = counterbore_diameter or (diameter * 1.8)
+                with BuildPart(Plane.XY) as bp:
+                    with BuildSketch() as s:
+                        with Locations((px, py, 0)):
+                            B3DCircle(cs_d / 2)  # 沉孔大圆
+                    extrude(amount=actual_depth)
+                    with BuildSketch() as s:
+                        with Locations((px, py, 0)):
+                            B3DCircle(diameter / 2)  # 通孔小圆
+                    extrude(amount=actual_depth)
+                cutter = bp.part
+            
+            # boolean subtract
+            self._current_geometry = self._current_geometry - cutter
+            self.narrative.append(f"hole {hole_type} Ø{diameter} @ ({px}, {py}) 深 {actual_depth:.1f}")
+            txn.commit()
+        
+        render_level = "iso_only"
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"hole {hole_type} Ø{diameter}",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
     
     def shell(self, thickness: float, face_filter: str = "top", name: str = "") -> StepResult:
         """
@@ -948,8 +1071,206 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def linear_pattern(self, *args, **kwargs) -> StepResult: return self._not_implemented("linear_pattern", "v1.2")
-    def mirror(self, *args, **kwargs) -> StepResult: return self._not_implemented("mirror", "v1.2")
+    def linear_pattern(
+        self,
+        sketch_name: str,
+        count: int,
+        direction: tuple = (1, 0),
+        spacing: float = 10.0,
+        mode: str = "cut",
+        name: str = "",
+    ) -> StepResult:
+        """
+        v1.10 真实 linear_pattern（线性阵列）— 沿 direction 复制 N 个草图 + boolean
+        
+        Args:
+            sketch_name: 草图名
+            count: 副本数（>= 2）
+            direction: (dx, dy) 沿 XY 平面方向（自动 normalize）
+            spacing: 副本间距（mm）
+            mode: "cut" | "add" | "union"
+            name: 特征名
+        """
+        start = time.time()
+        if sketch_name not in self.sketches:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        if self._current_geometry is None:
+            raise InvalidRequestError("linear_pattern 需要先有几何")
+        if count < 2:
+            raise InvalidRequestError(f"count 必须 >= 2（当前 {count}）")
+        if mode not in ("cut", "add", "union"):
+            raise InvalidRequestError(f"mode 必须是 cut/add/union（当前 {mode}）")
+        
+        from build123d import (
+            BuildPart, BuildSketch, Plane, add, extrude, Location,
+            Circle as B3DCircle, Rectangle as B3DRect,
+        )
+        from build123d.build_common import Locations
+        import math
+        
+        # normalize direction
+        dx, dy = direction
+        norm = math.sqrt(dx*dx + dy*dy)
+        if norm == 0:
+            raise InvalidRequestError("direction 不能全为 0")
+        ux, uy = dx / norm, dy / norm
+        
+        sk = self.sketches[sketch_name]
+        with Transaction(self, "linear_pattern") as txn:
+            feature_id = next_feature_id()
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.LINEAR_PATTERN,
+                parameters={"sketch_name": sketch_name, "count": count, "direction": list(direction), "spacing": spacing, "mode": mode, "name": name},
+                name=name or f"linear_pattern_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            
+            # 复制 count 次：每次 entity center 偏移 i*spacing*direction
+            with BuildPart(Plane.XY) as bp:
+                with BuildSketch() as s:
+                    for i in range(count):
+                        off_x = i * spacing * ux
+                        off_y = i * spacing * uy
+                        for e in sk.entities:
+                            if e.type == "circle":
+                                r = e.params["radius"]
+                                c = e.params.get("center", (0, 0))
+                                with Locations((c[0] + off_x, c[1] + off_y, 0)):
+                                    B3DCircle(r)
+                            elif e.type == "rectangle":
+                                w, h = e.params["width"], e.params["height"]
+                                c = e.params.get("center", (0, 0))
+                                with Locations((c[0] + off_x, c[1] + off_y, 0)):
+                                    B3DRect(w, h)
+                extrude(amount=50.0)
+            all_parts = bp.part
+            
+            if mode in ("union", "add"):
+                self._current_geometry = self._current_geometry + all_parts
+            elif mode == "cut":
+                self._current_geometry = self._current_geometry - all_parts
+            
+            self.narrative.append(f"linear_pattern {sketch_name} x{count} {direction} 间距 {spacing}")
+            txn.commit()
+        
+        render_level = "iso_only"
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"linear_pattern {sketch_name} x{count}",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+    
+    def mirror(
+        self,
+        sketch_name: str,
+        axis: str = "X",
+        mode: str = "union",
+        name: str = "",
+    ) -> StepResult:
+        """
+        v1.9 真实 mirror（镜像）— 沿 X/Y 轴镜像草图 + boolean
+        
+        Args:
+            sketch_name: 要镜像的草图
+            axis: "X" | "Y"（镜像轴）
+            mode: "union"（镜像后合并到 current_geometry）| "add" | "cut"
+            name: 特征名
+        """
+        start = time.time()
+        if sketch_name not in self.sketches:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        if self._current_geometry is None:
+            raise InvalidRequestError("mirror 需要先有几何")
+        if axis not in ("X", "Y"):
+            raise InvalidRequestError(f"axis 必须是 'X' 或 'Y'（当前 {axis}）")
+        if mode not in ("union", "add", "cut"):
+            raise InvalidRequestError(f"mode 必须是 union/add/cut（当前 {mode}）")
+        
+        from build123d import (
+            BuildPart, BuildSketch, Plane, add, extrude, Location,
+            Circle as B3DCircle, Rectangle as B3DRect,
+        )
+        from build123d.build_common import Locations
+        
+        sk = self.sketches[sketch_name]
+        with Transaction(self, "mirror") as txn:
+            feature_id = next_feature_id()
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.MIRROR,
+                parameters={"sketch_name": sketch_name, "axis": axis, "mode": mode, "name": name},
+                name=name or f"mirror_{axis}_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            
+            # 镜像：原位置（保留）+ 镜像位置（也生成）
+            # axis="X" 镜像 → 翻转 X 坐标（cx=-c[0], cy=c[1]）
+            # axis="Y" 镜像 → 翻转 Y 坐标（cx=c[0], cy=-c[1]）
+            with BuildPart(Plane.XY) as bp:
+                with BuildSketch() as s:
+                    for e in sk.entities:
+                        if e.type == "circle":
+                            r = e.params["radius"]
+                            c = e.params.get("center", (0, 0))
+                            # 原位置
+                            with Locations((c[0], c[1], 0)):
+                                B3DCircle(r)
+                            # 镜像位置
+                            if axis == "X":
+                                cx, cy = -c[0], c[1]
+                            else:  # axis == "Y"
+                                cx, cy = c[0], -c[1]
+                            with Locations((cx, cy, 0)):
+                                B3DCircle(r)
+                        elif e.type == "rectangle":
+                            w, h = e.params["width"], e.params["height"]
+                            c = e.params.get("center", (0, 0))
+                            # 原位置
+                            with Locations((c[0], c[1], 0)):
+                                B3DRect(w, h)
+                            # 镜像位置
+                            if axis == "X":
+                                cx, cy = -c[0], c[1]
+                            else:  # axis == "Y"
+                                cx, cy = c[0], -c[1]
+                            with Locations((cx, cy, 0)):
+                                B3DRect(w, h)
+                extrude(amount=50.0)
+            both_parts = bp.part
+            
+            if mode == "union" or mode == "add":
+                self._current_geometry = self._current_geometry + both_parts
+            elif mode == "cut":
+                self._current_geometry = self._current_geometry - both_parts
+            
+            self.narrative.append(f"mirror {sketch_name} 沿 {axis} {mode}")
+            txn.commit()
+        
+        render_level = "iso_only"
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"mirror {sketch_name} 沿 {axis}",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
     
     def sweep(self, profile_sketch: str, path: str = "x_axis", length: float = 50.0, name: str = "") -> StepResult:
         """

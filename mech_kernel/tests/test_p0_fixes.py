@@ -28,13 +28,13 @@ def test_make_not_implemented_factory():
 
 def test_not_implemented_in_step_result():
     """M0 占位 API 返回 NOT_IMPLEMENTED，不是 GEOMETRY_FAILURE
-    注：revolve/sweep/shell/fillet/chamfer/boolean 已在 v1.3-1.7 真实实现
+    注：revolve/sweep/shell/fillet/chamfer/boolean/hole/mirror/linear_pattern 已在 v1.3-1.10 实现
     """
     k = MechKernel()
-    r = k.hole("base", (0, 0), 10)  # hole 仍占位
+    r = k.query("F_001", "bounding_box")  # query 仍占位
     assert not r.success
     assert r.error_kind == "NOT_IMPLEMENTED"
-    assert r.api_name == "hole"
+    assert r.api_name == "query"
 
 
 def test_all_placeholder_apis_return_not_implemented():
@@ -45,11 +45,13 @@ def test_all_placeholder_apis_return_not_implemented():
     # 准备一个合法 workplane
     k.create_workplane("base", "XY")
     
-    # 试未实现 API（fillet/chamfer/revolve/circular_pattern/shell/sweep/boolean 已在 v1.3-1.7 实现）
+    # 试未实现 API（fillet/chamfer/revolve/circular_pattern/shell/sweep/boolean/hole/mirror/linear_pattern 已在 v1.3-1.10 实现）
     placeholders = [
-        lambda: k.hole("base", (0, 0), 10),
-        lambda: k.linear_pattern("F_001", 4, (1, 0, 0), 10),
-        lambda: k.mirror(["F_001"], "base"),
+        lambda: k.query("F_001", "bounding_box"),
+        lambda: k.select("F_001"),
+        lambda: k.measure("F_001", "distance"),
+        lambda: k.delete_feature("F_001"),
+        lambda: k.update_feature("F_001", {}),
     ]
     for call in placeholders:
         r = call()
