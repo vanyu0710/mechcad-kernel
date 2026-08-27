@@ -1,0 +1,221 @@
+"""
+MechKernel LLM 客户端（DeepSeek OpenAI 兼容）
+
+专家 v8 审查后接真实 LLM（替换 MockPlanner / MockVision）。
+DeepSeek 视觉模型：deepseek-v4-flash-vision-exp
+DeepSeek 推理模型：deepseek-reasoner
+DeepSeek 通用模型：deepseek-chat
+
+环境变量：DSKEY（DeepSeek 官方 API key）
+"""
+from __future__ import annotations
+import os
+import json
+import logging
+import base64
+import requests
+from typing import List, Dict, Any, Optional
+
+_logger = logging.getLogger("mech_kernel.llm")
+
+
+class DeepSeekClient:
+    """DeepSeek OpenAI 兼容 HTTP 客户端"""
+    
+    BASE_URL = "https://api.deepseek.com/v1"
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "deepseek-chat",
+        base_url: Optional[str] = None,
+        timeout: float = 60.0,
+    ):
+        self.api_key = api_key or os.environ.get("DSKEY")
+        if not self.api_key:
+            raise ValueError("DeepSeek API key 未配置（设环境变量 DSKEY）")
+        self.model = model
+        self.base_url = base_url or self.BASE_URL
+        self.timeout = timeout
+    
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int = 2000,
+        response_format: Optional[Dict[str, str]] = None,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        """调用 chat/completions，返回 message dict（含 content/reasoning_content）"""
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if response_format:
+            body["response_format"] = response_format
+        
+        _logger.info(f"DeepSeek call: model={self.model} max_tokens={max_tokens}")
+        r = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=self.timeout,
+        )
+        if r.status_code != 200:
+            _logger.error(f"DeepSeek error {r.status_code}: {r.text[:500]}")
+            r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]
+    
+    def chat_json(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int = 2000,
+    ) -> Dict[str, Any]:
+        """调用并自动解析 JSON 返回"""
+        msg = self.chat(
+            messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        content = msg.get("content", "{}")
+        # DeepSeek reasoning 模式：先 reasoning_content 再 ```json ... ```
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            # 尝试提取 ```json ... ``` 块
+            if "```json" in content:
+                start = content.index("```json") + 7
+                end = content.index("```", start)
+                return json.loads(content[start:end].strip())
+            raise
+
+
+# ====== 系统提示词 ======
+
+VISION_SYSTEM_PROMPT = """你是机械工程师视觉分析助手。
+
+输入：手绘草图（PNG）+ 文字描述
+输出：结构化 JSON
+
+JSON schema：
+{
+  "part_type": "圆盘" | "圆柱" | "立方体" | "环面" | "未知",
+  "primary_features": [
+    {"feature": "特征名（如 外圆、内孔、矩形、盲孔）", "estimated": {"param": "value mm"}, "confidence": 0.0-1.0}
+  ],
+  "dimensions": {
+    "outer_diameter_mm": 数字 或 null,
+    "height_mm": 数字 或 null,
+    "inner_diameter_mm": 数字 或 null,
+    "length_mm": 数字 或 null,
+    "width_mm": 数字 或 null,
+    "thickness_mm": 数字 或 null
+  },
+  "notes": "观察到的细节（不确定就标'无法确定'）",
+  "confidence": 0.0-1.0
+}
+
+原则：
+- 缺值必须 null，不能编造
+- confidence 反映你的把握度
+- 尺寸从草图比例估算，不确定就给 null
+- notes 写"我看到 X，但 Y 看不清"
+"""
+
+
+PLANNER_SYSTEM_PROMPT = """你是机械 CAD Kernel 的 Planner。
+
+输入：Vision LLM 输出的零件 JSON（包含 part_type / dimensions / features）
+输出：可执行的 op 序列（JSON 数组）
+
+可用 op（v1 支持）：
+1. create_workplane(name: str, type: "XY")  - 必第一步
+2. new_sketch(workplane_name: str, sketch_name: str)  - 必在草图前
+3. add_circle(sketch_name: str, center: [x, y], radius: float)  - 圆（mm）
+4. add_rectangle(sketch_name: str, width: float, height: float, center: [x, y])  - 矩形
+5. close_sketch(sketch_name: str)  - ⚠ 必在 extrude 之前！
+6. extrude(sketch_name: str, depth: float, mode: "new_body"|"add"|"cut", name: str)
+
+JSON schema：
+{
+  "ops": [
+    {"op": "create_workplane", "args": {...}},
+    ...
+  ],
+  "rationale": "为什么这个序列",
+  "estimated_volume_mm3": 数字 或 null
+}
+
+原则：
+- 第一步必 create_workplane
+- 草图加完所有 entity 后必 close_sketch，再 extrude
+- 圆盘/圆柱 = create_workplane + new_sketch + add_circle + close_sketch + extrude
+- 立方体 = + add_rectangle
+- 环面 = + add_circle(外) + add_circle(内) + close_sketch + extrude(mode="new_body") + add_circle(内+外) ... 太复杂；用 cut 实现
+- 半径 = 直径/2（注意：add_circle 的 radius 是半径不是直径）
+- mode="new_body" 创建新实体，"cut" 切除
+- 不确定就给出最简版本
+- 输出必须 JSON，不要 markdown
+"""
+
+
+# ====== Vision LLM ======
+
+class DeepSeekVisionLLM(DeepSeekClient):
+    """视觉分析 LLM（deepseek-v4-flash-vision-exp）"""
+    
+    def __init__(self, api_key: Optional[str] = None, **kwargs):
+        super().__init__(api_key=api_key, model="deepseek-v4-flash-vision-exp", **kwargs)
+    
+    def analyze(
+        self,
+        image_b64: str,
+        user_prompt: str = "分析这个零件草图",
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """视觉分析：base64 PNG + 文字 → JSON"""
+        messages = [
+            {"role": "system", "content": system_prompt or VISION_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            ]},
+        ]
+        return self.chat_json(messages, max_tokens=2000)
+    
+    def analyze_file(self, image_path: str, user_prompt: str = "分析这个零件草图") -> Dict[str, Any]:
+        """从文件分析"""
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return self.analyze(b64, user_prompt)
+
+
+# ====== Planner LLM ======
+
+class DeepSeekPlannerLLM(DeepSeekClient):
+    """规划 LLM（deepseek-chat）"""
+    
+    def __init__(self, api_key: Optional[str] = None, **kwargs):
+        super().__init__(api_key=api_key, model="deepseek-chat", **kwargs)
+    
+    def plan(
+        self,
+        vision_json: Dict[str, Any],
+        user_intent: str = "",
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """把 Vision JSON 拆成 op 序列"""
+        messages = [
+            {"role": "system", "content": system_prompt or PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "user_intent": user_intent,
+                "vision_result": vision_json,
+            }, ensure_ascii=False)},
+        ]
+        return self.chat_json(messages, max_tokens=2000)

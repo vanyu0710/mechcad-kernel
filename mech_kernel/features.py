@@ -1,0 +1,319 @@
+"""
+MechKernel Feature 数据结构
+
+P4 原则：所有几何引用用 Reference（语义命名），不用裸索引。
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Optional, Dict, Any, Tuple
+import time
+
+
+class FeatureType(str, Enum):
+    """所有 Feature 类型（18 个 API 对应）"""
+    # 草图类
+    WORKPLANE = "workplane"
+    SKETCH = "sketch"
+    SKETCH_CIRCLE = "sketch_circle"
+    SKETCH_RECTANGLE = "sketch_rectangle"
+    SKETCH_LINE = "sketch_line"
+    
+    # 主体类
+    EXTRUDE = "extrude"
+    REVOLVE = "revolve"
+    SWEEP = "sweep"
+    BOOLEAN = "boolean"
+    
+    # I/O 类 (v1.5)
+    EXPORT = "export"
+    IMPORT_STEP = "import_step"
+    
+    # 细节类
+    HOLE = "hole"
+    FILLET = "fillet"
+    CHAMFER = "chamfer"
+    SHELL = "shell"
+    
+    # 复用类
+    LINEAR_PATTERN = "linear_pattern"
+    CIRCULAR_PATTERN = "circular_pattern"
+    MIRROR = "mirror"
+    
+    # 其他
+    OFFSET_FACE = "offset_face"
+
+
+class FeatureState(str, Enum):
+    PENDING = "pending"
+    COMPUTED = "computed"
+    FAILED = "failed"
+    SUPPRESSED = "suppressed"
+
+
+# Topology-changing operations（决定是否必渲染）
+TOPOLOGY_CHANGING_OPS = frozenset({
+    FeatureType.EXTRUDE,
+    FeatureType.REVOLVE,
+    FeatureType.SWEEP,
+    FeatureType.BOOLEAN,
+    FeatureType.HOLE,
+    FeatureType.FILLET,
+    FeatureType.CHAMFER,
+    FeatureType.SHELL,
+    FeatureType.LINEAR_PATTERN,
+    FeatureType.CIRCULAR_PATTERN,
+    FeatureType.MIRROR,
+    FeatureType.OFFSET_FACE,
+})
+
+
+# Operations that should NOT render (structure-only)
+NON_RENDERING_OPS = frozenset({
+    FeatureType.WORKPLANE,
+    FeatureType.SKETCH,
+    FeatureType.SKETCH_CIRCLE,
+    FeatureType.SKETCH_RECTANGLE,
+    FeatureType.SKETCH_LINE,
+})
+
+
+@dataclass(frozen=True, eq=True)
+class Reference:
+    """
+    语义引用（P4 原则，P0-3 修复：用 frozen=True）。
+    
+    不再用 feat_001.face_2 这种易变引用，
+    改用 ("top_face", "main_body") 这种语义命名。
+    
+    frozen=True 让对象不可变，自动生成正确的 __hash__ 和 __eq__，
+    避免自定义 hash/eq 与 dataclass 默认行为不一致的问题。
+    """
+    kind: str                                  # "feature" | "sketch" | "workplane" | "face" | "edge" | "vertex"
+    semantic_name: str                         # "top_face" | "main_body" | ...
+    owner_feature_id: Optional[str] = None      # 归属 feature（用于重解析）
+    
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "semantic_name": self.semantic_name,
+            "owner_feature_id": self.owner_feature_id,
+        }
+    
+    @staticmethod
+    def feature(name: str, owner: Optional[str] = None) -> "Reference":
+        return Reference(kind="feature", semantic_name=name, owner_feature_id=owner)
+    
+    @staticmethod
+    def face(name: str, owner: Optional[str] = None) -> "Reference":
+        return Reference(kind="face", semantic_name=name, owner_feature_id=owner)
+    
+    @staticmethod
+    def edge(name: str, owner: Optional[str] = None) -> "Reference":
+        return Reference(kind="edge", semantic_name=name, owner_feature_id=owner)
+    
+    @staticmethod
+    def vertex(name: str, owner: Optional[str] = None) -> "Reference":
+        return Reference(kind="vertex", semantic_name=name, owner_feature_id=owner)
+
+
+@dataclass
+class SketchEntity:
+    """草图中的基本图元"""
+    id: str
+    type: str                                  # "line" | "circle" | "arc" | "rectangle" | "polygon" | "point"
+    params: Dict[str, Any] = field(default_factory=dict)
+    name: str = ""
+
+
+@dataclass
+class Sketch:
+    """草图数据（M0 阶段，物理几何单独存放）"""
+    id: str
+    name: str
+    workplane_name: str
+    entities: List[SketchEntity] = field(default_factory=list)
+    closed: bool = False
+    _build123d_object: Optional[Any] = field(default=None, repr=False, compare=False)
+    
+    def add_entity(self, entity: "SketchEntity") -> None:
+        self.entities.append(entity)
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "workplane_name": self.workplane_name,
+            "entities": [{"id": e.id, "type": e.type, "params": e.params, "name": e.name} for e in self.entities],
+            "closed": self.closed,
+        }
+    
+    @staticmethod
+    def from_dict(d: dict) -> "Sketch":
+        sk = Sketch(id=d["id"], name=d["name"], workplane_name=d["workplane_name"], closed=d.get("closed", False))
+        for e in d.get("entities", []):
+            sk.entities.append(SketchEntity(id=e["id"], type=e["type"], params=e.get("params", {}), name=e.get("name", "")))
+        return sk
+
+
+@dataclass
+class FeatureNode:
+    """
+    Feature 树节点。
+    
+    v1.1 改动：进入 Feature Graph（DAG），不再是孤立 list。
+    """
+    id: str
+    type: FeatureType
+    name: str = ""                              # 用户给的语义名（必须）
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    references: List[Reference] = field(default_factory=list)
+    
+    state: FeatureState = FeatureState.PENDING
+    parent_id: Optional[str] = None
+    error: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    
+    # 内部
+    _geometry: Optional[Any] = field(default=None, repr=False, compare=False)
+    _cached_summary: Optional[Any] = field(default=None, repr=False, compare=False)
+    
+    def is_topology_changing(self) -> bool:
+        """是否拓扑变化操作（决定是否必渲染）"""
+        return self.type in TOPOLOGY_CHANGING_OPS
+    
+    def is_non_rendering(self) -> bool:
+        """是否不渲染操作"""
+        return self.type in NON_RENDERING_OPS
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type.value if hasattr(self.type, "value") else str(self.type),
+            "name": self.name,
+            "parameters": self.parameters,
+            "references": [r.to_dict() for r in self.references],
+            "state": self.state.value if hasattr(self.state, "value") else str(self.state),
+            "parent_id": self.parent_id,
+            "error": self.error,
+            "timestamp": self.timestamp,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "FeatureNode":
+        from .features import FeatureType, FeatureState
+        return FeatureNode(
+            id=d["id"],
+            type=FeatureType(d["type"]) if isinstance(d["type"], str) else d["type"],
+            name=d.get("name", ""),
+            parameters=d.get("parameters", {}),
+            references=[],  # 简化：暂时不还原
+            state=FeatureState(d["state"]) if isinstance(d["state"], str) else d.get("state", FeatureState.DONE),
+            parent_id=d.get("parent_id"),
+            error=d.get("error"),
+            timestamp=d.get("timestamp", 0.0),
+        )
+
+
+# ID 生成器（简单的全局计数器）
+class _IdGenerator:
+    def __init__(self, prefix: str = "feat"):
+        self.prefix = prefix
+        self.counter = 0
+    
+    def next(self) -> str:
+        self.counter += 1
+        return f"{self.prefix}_{self.counter:04d}"
+    
+    def reset(self):
+        self.counter = 0
+
+
+_feat_id_gen = _IdGenerator("F")
+_sketch_id_gen = _IdGenerator("SK")
+_workplane_id_gen = _IdGenerator("WP")
+_entity_id_gen = _IdGenerator("E")
+
+
+def next_feature_id() -> str:
+    return _feat_id_gen.next()
+
+
+def next_sketch_id() -> str:
+    return _sketch_id_gen.next()
+
+
+def next_workplane_id() -> str:
+    return _workplane_id_gen.next()
+
+
+def next_entity_id() -> str:
+    return _entity_id_gen.next()
+
+
+def reset_all_id_generators():
+    """重置所有 ID 生成器（用于测试和 undo）"""
+    global _feat_id_gen, _sketch_id_gen, _workplane_id_gen, _entity_id_gen
+    _feat_id_gen = _IdGenerator("F")
+    _sketch_id_gen = _IdGenerator("SK")
+    _workplane_id_gen = _IdGenerator("WP")
+    _entity_id_gen = _IdGenerator("E")
+
+
+# ============================================================
+# Mock 几何（v1.0 阶段，build123d 装不上时的占位）
+# ============================================================
+
+@dataclass
+class MockBox:
+    """Mock 立方体几何（10x10x10 默认）"""
+    width: float = 10.0
+    height: float = 10.0
+    depth: float = 10.0
+    
+    @property
+    def bounding_box(self) -> Tuple[float, float, float, float, float, float]:
+        return (0.0, 0.0, 0.0, self.width, self.height, self.depth)
+    
+    @property
+    def volume(self) -> float:
+        return self.width * self.height * self.depth
+    
+    @property
+    def surface_area(self) -> float:
+        return 2 * (self.width * self.height + self.height * self.depth + self.width * self.depth)
+    
+    @property
+    def vertices(self) -> List[Tuple[float, float, float]]:
+        """8 个立方体顶点（duck-typed，renderer 可提取 mesh）"""
+        return [
+            (0, 0, 0), (self.width, 0, 0),
+            (self.width, self.height, 0), (0, self.height, 0),
+            (0, 0, self.depth), (self.width, 0, self.depth),
+            (self.width, self.height, self.depth), (0, self.height, self.depth),
+        ]
+    
+    @property
+    def faces(self) -> List[List[int]]:
+        """6 个面（每个面 4 顶点索引）"""
+        return [
+            [0, 1, 2, 3],   # 底面
+            [4, 5, 6, 7],   # 顶面
+            [0, 1, 5, 4],   # 前面
+            [2, 3, 7, 6],   # 后面
+            [1, 2, 6, 5],   # 右面
+            [0, 3, 7, 4],   # 左面
+        ]
+    
+    def __repr__(self) -> str:
+        return f"MockBox({self.width}x{self.height}x{self.depth})"
+
+
+@dataclass
+class MockMesh:
+    """Mock 网格"""
+    vertices: List[Tuple[float, float, float]] = field(default_factory=list)
+    faces: List[List[int]] = field(default_factory=list)
+    bounding_box: Tuple[float, float, float, float, float, float] = (0, 0, 0, 1, 1, 1)
+    
+    def __repr__(self) -> str:
+        return f"MockMesh(V={len(self.vertices)}, F={len(self.faces)})"

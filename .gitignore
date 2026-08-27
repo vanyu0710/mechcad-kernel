@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 项目特定
+*.step.bak
+mech_kernel/examples/*/real_geom/*.png.bak
+mech_kernel/examples/fillet_out/04_flange_full.png.bak
+*.log.bak
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
