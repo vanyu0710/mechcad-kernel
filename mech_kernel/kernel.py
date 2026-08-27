@@ -626,7 +626,6 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
-    def sweep(self, *args, **kwargs) -> StepResult: return self._not_implemented("sweep", "v1.2")
     
     def boolean(self, target_sketch: str, tools: list, operation: str = "union", name: str = "") -> StepResult:
         """
