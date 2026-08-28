@@ -1,6 +1,6 @@
 """
 Demo 13: 业余探空火箭固体发动机（壳体 + 堵头 + CD 喷口 + 整机装配）
-— MechKernel 生产力实测（v2.2：revolve 线剖面 + assemble + 多视图截面）
+— MechKernel 生产力实测（v2.3：revolve 线剖面 + assemble + 工程证据图）
 
 1. 壳体  : Ø60 外径 × 3mm 壁厚 × 300mm 管（同心圆 → 拉伸成环）
 2. 堵头  : Ø60 圆盘 × 15mm + 中心点火孔 Ø8 + 外缘倒角
@@ -122,7 +122,7 @@ def build_assembly(case_step, closure_step, nozzle_step):
 
 def main():
     print("=" * 66)
-    print("Demo 13: 业余探空火箭固体发动机 — MechKernel 生产力实测（v2.2）")
+    print("Demo 13: 业余探空火箭固体发动机 — MechKernel 生产力实测（v2.3）")
     print("=" * 66)
 
     print("\n[1/4] 壳体（Ø60 x 壁厚3 x 长300 管）")
@@ -150,7 +150,7 @@ def main():
     save_render(asm.render(views=["iso", "front", "top", "side"], size=640, annotate=True), "motor_views")
     save_render(asm.render(turntable=True, size=480, annotate=True), "motor_turntable")
     # 发动机轴向为 Z；沿 X 保留一半，更适合观察壳体内腔、喷口喉部和堵头。
-    save_render(asm.render(section={"axis": "X", "offset": 0}, size=640, annotate=True), "motor_section")
+    save_render(asm.render(intent="section", section={"axis": "X", "offset": 0}, size=640, annotate=True), "motor_section")
     export_step(asm, "motor_assembly")
 
     print("\n" + "=" * 66)

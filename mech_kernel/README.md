@@ -17,6 +17,7 @@
 - ✅ **Capability Registry**（自动注册 + JSON Schema + LLM 友好）
 - ✅ **自适应多视图渲染**（拓扑变化 full 视图，间隔步骤 iso 快照）
 - ✅ **AI 截面与转台视图**（真实几何半空间切割，不改变模型）
+- ✅ **视觉证据包**（正交投影、固定像素预算、图像哈希与截面 manifest）
 - ✅ **三态拓扑检查**（valid / invalid / unknown，不伪造 False）
 
 **核心创新**：每个 API 调用的结果（`StepResult`）包含 `success / error_kind / error / hint / suggestion / geometry_summary / render_png / next_hints`，让 LLM 拿到**可决策的反馈**。
@@ -74,6 +75,22 @@
 | **可视化** | `render` | ✅ 多视图、转台、标注、真实截面 |
 
 `delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/加载/装配会话保留外部几何，因此重放返回 `RECOVERABLE`。
+
+### Visual Evidence（v2.3）
+
+`render` 生成的是给 AI 验证的工程证据包，不是调试截图：所有视图采用正交投影、无坐标轴和网格，并将拼图限制在请求的 `size` 像素预算内。结果含 `evidence_manifest`，记录投影、截面、bbox、布局和每张图的 SHA-256 指纹。
+
+```python
+# 默认：ISO + 3 个正交视图
+inspect = k.render(intent="inspect", size=640)
+
+# 自动选长轴剖切平面；也可显式传 axis/offset
+section = k.render(intent="section", section={"axis": "X", "offset": 0})
+
+# 指定 feature 的当时几何，供局部检查或修改前后比对
+zoom = k.render(intent="feature_zoom", target="F_0003")
+delta = k.render(intent="delta", target="F_0003")
+```
 
 ---
 

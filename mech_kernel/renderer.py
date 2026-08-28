@@ -1,11 +1,12 @@
 """
-MechKernel Renderer（M1.1 修复版）
+MechKernel Renderer（v2.3 证据图版）
 
 第 4 轮专家审查修复：
 - P0-1 缓存键：用 (id, geometry_revision, level, config) 替代裸 id
 - P0-4 异常隔离：坏几何/NaN/空/缺顶点不崩
 - LRU 限制（默认 32 个）
 - 任何异常都隔离，**绝不**让 kernel 崩溃
+- 面向视觉模型的干净正交/ISO 证据图，不输出调试坐标轴
 """
 from typing import Any, Optional, Dict, List, Tuple
 from collections import OrderedDict
@@ -30,7 +31,7 @@ except ImportError:
 
 class Renderer:
     """
-    离屏 3D 渲染器（duck-typed，P0 修复版）。
+    离屏 CAD 证据图渲染器（duck-typed）。
     
     缓存策略：
     - 缓存键 = (geometry_id, geometry_revision, render_level, config_signature)
@@ -205,8 +206,11 @@ class Renderer:
             return png_bytes
 
     @staticmethod
-    def compose_grid(views: Dict[str, bytes], cols: int = 2) -> Optional[bytes]:
-        """v2.2: 把多张视图拼成带标题网格，供视觉 LLM 一次看多角度（失败返回 None）"""
+    def compose_grid(
+        views: Dict[str, bytes], cols: int = 2, include_titles: bool = False,
+        max_size: Optional[int] = None,
+    ) -> Optional[bytes]:
+        """把多张视图拼成紧凑证据包，避免重复标题占用视觉 token。"""
         from PIL import Image, ImageDraw
         try:
             items = [(k, v) for k, v in views.items() if v]
@@ -219,7 +223,7 @@ class Renderer:
             w = max(im.width for _, im in imgs)
             h = max(im.height for _, im in imgs)
             rows = math.ceil(len(imgs) / cols)
-            pad, title_h = 4, 18
+            pad, title_h = 4, 16 if include_titles else 0
             grid = Image.new("RGB", (cols*w + (cols+1)*pad, rows*(h+title_h) + (rows+1)*pad), (255, 255, 255))
             d = ImageDraw.Draw(grid)
             for idx, (k, im) in enumerate(imgs):
@@ -227,7 +231,10 @@ class Renderer:
                 x = pad + c*(w+pad)
                 y = pad + r*(h+title_h+pad)
                 grid.paste(im, (x, y + title_h))
-                d.text((x + 4, y + 1), k.upper(), fill=(0, 0, 0))
+                if include_titles:
+                    d.text((x + 4, y + 1), k.upper(), fill=(0, 0, 0))
+            if max_size is not None:
+                grid.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             out = io.BytesIO()
             grid.save(out, format="PNG")
             return out.getvalue()
@@ -430,26 +437,19 @@ class Renderer:
                 plt.close(fig)
                 return b""
             
-            mesh = Poly3DCollection(triangles, alpha=0.8, edgecolor="gray", linewidth=0.3)
-            mesh.set_facecolor((0.6, 0.7, 0.9, 0.7))
+            mesh = Poly3DCollection(
+                triangles, alpha=1.0, edgecolor=(0.16, 0.22, 0.30, 0.38), linewidth=0.12,
+            )
+            mesh.set_facecolor((0.47, 0.64, 0.82, 1.0))
             ax.add_collection3d(mesh)
-            
-            # Frame orthographic views by their visible dimensions.  Using
-            # the longest part dimension for every axis makes a long motor's
-            # top view collapse to a few pixels.
-            pad = 0.3
-            half = [max(v * (0.5 + pad), 1.0) for v in size]
-            if view_name == "top":
-                xh, yh, zh = half
-            elif view_name == "front":
-                xh, yh, zh = half[0], max(half[0], half[2]), half[2]
-            elif view_name == "side":
-                xh, yh, zh = max(half[1], half[2]), half[1], half[2]
-            else:
-                xh = yh = zh = lim
-            ax.set_xlim(cx - xh, cx + xh)
-            ax.set_ylim(cy - yh, cy + yh)
-            ax.set_zlim(cz - zh, cz + zh)
+
+            # Per-axis framing keeps long parts large in their useful views.
+            # The old max-dimension cube left most pixels empty for a motor.
+            padding = 0.09
+            half = [max(v * (0.5 + padding), 1.0) for v in size]
+            ax.set_xlim(cx - half[0], cx + half[0])
+            ax.set_ylim(cy - half[1], cy + half[1])
+            ax.set_zlim(cz - half[2], cz + half[2])
             
             dx, dy, dz = camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz
             norm = math.sqrt(dx*dx + dy*dy + dz*dz)
@@ -460,10 +460,15 @@ class Renderer:
                 )
             
             ax.set_box_aspect((size[0] or 1, size[1] or 1, size[2] or 1))
-            ax.set_title(f"{view_name} view", fontsize=10)
+            try:
+                ax.set_proj_type("ortho")
+            except AttributeError:
+                pass
+            ax.set_axis_off()
+            fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
             
             buf = io.BytesIO()
-            plt.savefig(buf, format="png", dpi=self.dpi, bbox_inches="tight", facecolor="white")
+            plt.savefig(buf, format="png", dpi=self.dpi, pad_inches=0, facecolor="white")
             plt.close(fig)
             return buf.getvalue()
         except Exception:

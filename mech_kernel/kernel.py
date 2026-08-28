@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any, Tuple, Union
 import copy
 import time
 import base64
+import hashlib
 
 from .errors import (
     MechKernelError, InvalidRequestError, KernelBugError, StateCorruptionError,
@@ -75,7 +76,9 @@ class MechKernel:
         self._last_render_views: Dict[str, bytes] = {}
         self.geometry_inspector = GeometryInspector()
         self.inspector = self.geometry_inspector  # 别名（兼容测试）
-        self.renderer = Renderer()
+        # Automatic visual checks use a compact evidence budget. Explicit
+        # render(size=...) calls can request a larger final packet.
+        self.renderer = Renderer(image_size=(320, 320))
         self.adaptive_renderer = AdaptiveRenderer(interval=5)  # v1.5 修复：Renderer 不是 interval
         self._undo_stack: List[Dict] = []
         self._redo_stack: List[Dict] = []
@@ -258,6 +261,10 @@ class MechKernel:
                        "annotate": FieldSchema(type="boolean", required=False, default=True),
                        "section": FieldSchema(type="dict", required=False),
                        "turntable": FieldSchema(type="boolean", required=False, default=False),
+                       "intent": FieldSchema(type="enum", required=False, default="inspect",
+                                             enum=["inspect", "section", "feature_zoom", "delta"]),
+                       "target": FieldSchema(type="string", required=False,
+                                             description="feature_zoom/delta 的 feature_id"),
                        "name": FieldSchema(type="string", required=False)},
         }
         for name, schema in placeholder_schemas.items():
@@ -2245,6 +2252,77 @@ class MechKernel:
         except Exception as exc:
             raise InvalidRequestError(f"section 无法切割几何: {exc}") from exc
 
+    def _preferred_section_axis(self, geometry: Any) -> str:
+        """Choose a longitudinal cut plane for the dominant part axis."""
+        try:
+            bb = geometry.bounding_box() if callable(getattr(geometry, "bounding_box", None)) else geometry.bounding_box
+            sizes = {"X": float(bb.size.X), "Y": float(bb.size.Y), "Z": float(bb.size.Z)}
+            longest = max(sizes, key=sizes.get)
+        except Exception:
+            longest = "Z"
+        # A section plane normal to a short axis exposes the long internal path.
+        return {"X": "Y", "Y": "X", "Z": "X"}[longest]
+
+    @staticmethod
+    def _evidence_layout(size: int, view_count: int) -> Tuple[Tuple[int, int], int]:
+        """Keep the final evidence packet within an explicit pixel budget."""
+        cols = 1 if view_count <= 1 else (2 if view_count <= 4 else 4)
+        rows = max(1, (view_count + cols - 1) // cols)
+        pad, title_h = 4, 0
+        per_width = max(64, (size - (cols + 1) * pad) // cols)
+        per_height = max(64, (size - (rows + 1) * pad - rows * title_h) // rows)
+        per_view = min(per_width, per_height)
+        return (per_view, per_view), cols
+
+    def _render_evidence_views(
+        self,
+        geometry: Any,
+        requested: List[str],
+        size: int,
+        annotate: bool,
+        turntable: bool = False,
+    ) -> Tuple[Dict[str, bytes], Optional[bytes], int, Tuple[int, int]]:
+        turntable_views = {"rot0", "rot90", "rot180", "rot270"} if turntable else set()
+        view_count = len(set(requested) | turntable_views)
+        per_view_size, cols = self._evidence_layout(size, max(1, view_count))
+        renders = self.renderer.render(
+            geometry, level="full", geometry_revision=self._geometry_revision,
+            views=requested, annotate=annotate, turntable=turntable, image_size=per_view_size,
+        )
+        actual = {key: value for key, value in renders.items() if key != "default" and value}
+        grid = Renderer.compose_grid(actual, cols=cols, include_titles=not annotate, max_size=size)
+        return actual, grid, cols, per_view_size
+
+    def _make_evidence_manifest(
+        self,
+        intent: str,
+        views: Dict[str, bytes],
+        size: int,
+        cols: int,
+        per_view_size: Tuple[int, int],
+        section: Optional[dict] = None,
+        target: str = "",
+        geometry: Any = None,
+    ) -> dict:
+        summary = self._geometry_summary_for(geometry if geometry is not None else self._current_geometry)
+        return {
+            "intent": intent,
+            "projection": "orthographic",
+            "views": list(views),
+            "section": section,
+            "target": target or None,
+            "bbox_mm": list(summary.bounding_box),
+            "layout": {
+                "max_size_px": size,
+                "columns": cols,
+                "per_view_size_px": list(per_view_size),
+            },
+            "image_hashes": {
+                view: hashlib.sha256(png).hexdigest()[:16]
+                for view, png in views.items()
+            },
+        }
+
     def render(
         self,
         views: list = None,
@@ -2252,9 +2330,11 @@ class MechKernel:
         annotate: bool = True,
         section: dict = None,
         turntable: bool = False,
+        intent: str = "inspect",
+        target: str = "",
         name: str = "",
     ) -> StepResult:
-        """按需生成 AI 可读的多视图/截面渲染，不进入参数化历史。"""
+        """生成预算受控、可解释的 AI 视觉证据包，不进入参数化历史。"""
         start = time.time()
         if self._current_geometry is None:
             self._step_counter += 1
@@ -2266,6 +2346,9 @@ class MechKernel:
             ))
         if not isinstance(size, int) or isinstance(size, bool) or size < 64:
             raise InvalidRequestError("size 必须是 >= 64 的整数")
+        allowed_intents = {"inspect", "section", "feature_zoom", "delta"}
+        if intent not in allowed_intents:
+            raise InvalidRequestError(f"intent 必须是 {sorted(allowed_intents)}（当前 {intent}）")
         if views is not None:
             if not isinstance(views, list) or not all(isinstance(v, str) for v in views):
                 raise InvalidRequestError("views 必须是字符串列表")
@@ -2273,23 +2356,69 @@ class MechKernel:
             unknown = sorted(set(views) - allowed)
             if unknown:
                 raise InvalidRequestError(f"不支持的视图: {unknown}")
-        render_geometry = self._current_geometry
+
+        target_geometry = None
+        if target:
+            if target in ("current", "_current_geometry"):
+                target_geometry = self._current_geometry
+            elif target in self._feature_geometries and self._feature_geometries[target] is not None:
+                target_geometry = self._feature_geometries[target]
+            else:
+                raise InvalidRequestError(f"render target {target} 不存在或无几何记录")
+        if intent in {"feature_zoom", "delta"} and target_geometry is None:
+            raise InvalidRequestError(f"render intent={intent} 需要有效 target feature_id")
+
+        render_geometry = target_geometry if intent == "feature_zoom" else self._current_geometry
         section_note = None
+        if intent == "section" and section is None:
+            section = {"axis": self._preferred_section_axis(render_geometry)}
         if section is not None:
             if not isinstance(section, dict):
                 raise InvalidRequestError("section 必须是字典")
             render_geometry = self._section_half(render_geometry, section.get("axis", "Z"), section.get("offset"))
             section_note = {"axis": str(section.get("axis", "Z")).upper(), "offset": section.get("offset")}
-        requested = views if views is not None else ["iso", "front", "top", "side"]
-        renders = self.renderer.render(
-            render_geometry, level="full", geometry_revision=self._geometry_revision,
-            views=requested, annotate=annotate, turntable=turntable, image_size=(size, size),
-        )
-        actual = {k: v for k, v in renders.items() if k != "default" and v}
+
+        if views is None:
+            requested = {
+                "inspect": ["iso", "front", "top", "side"],
+                "section": ["iso", "front", "side"],
+                "feature_zoom": ["iso", "front"],
+                "delta": ["iso", "front"],
+            }[intent]
+        else:
+            requested = views
+
+        if intent == "delta":
+            before_geometry = target_geometry
+            if section is not None:
+                before_geometry = self._section_half(before_geometry, section_note["axis"], section_note["offset"])
+            before, _, _, _ = self._render_evidence_views(
+                before_geometry, requested, size, annotate, turntable=False,
+            )
+            after, _, _, _ = self._render_evidence_views(
+                render_geometry, requested, size, annotate, turntable=False,
+            )
+            actual = {f"before_{key}": value for key, value in before.items()}
+            actual.update({f"after_{key}": value for key, value in after.items()})
+            if annotate:
+                actual = {
+                    key: self.renderer._annotate_png(
+                        png, f"{'BEFORE' if key.startswith('before_') else 'AFTER'} | {key.split('_', 1)[1].upper()}"
+                    )
+                    for key, png in actual.items()
+                }
+            per_view_size, cols = self._evidence_layout(size, max(1, len(actual)))
+            grid = Renderer.compose_grid(actual, cols=cols, include_titles=False, max_size=size)
+        else:
+            actual, grid, cols, per_view_size = self._render_evidence_views(
+                render_geometry, requested, size, annotate and section_note is None, turntable=turntable,
+            )
         if section_note and annotate:
             suffix = "mid" if section_note["offset"] is None else f"{float(section_note['offset']):g}"
             actual = {
-                view: self.renderer._annotate_png(png, f"SECTION {section_note['axis']}@{suffix}")
+                view: self.renderer._annotate_png(
+                    png, f"SECTION {section_note['axis']}@{suffix} | {view.upper()}"
+                )
                 for view, png in actual.items()
             }
         if not actual:
@@ -2299,22 +2428,31 @@ class MechKernel:
                 current_narrative=self.narrative.copy(), elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
             ))
-        grid = Renderer.compose_grid(actual, cols=2)
+        # Re-compose after section labels have been added.
+        if section_note and actual:
+            grid = Renderer.compose_grid(actual, cols=cols, include_titles=not annotate, max_size=size)
         if grid:
             self._last_render_base64 = base64.b64encode(grid).decode()
         self._last_render_views = dict(actual)
         self._step_counter += 1
         result = make_success(
-            feature_id=f"R_{self._step_counter:03d}", narrative="render 多视图" + ("（截面）" if section_note else ""),
-            render_png=actual.get("iso"), render_views=actual, render_level="full",
+            feature_id=f"R_{self._step_counter:03d}", narrative=f"render {intent}" + ("（截面）" if section_note else ""),
+            render_png=actual.get("iso") or actual.get("after_iso") or next(iter(actual.values())),
+            render_views=actual, render_level="full",
             current_narrative=self.narrative.copy(),
-            feature_graph_delta={"rendered": list(actual), "section": section_note},
+            feature_graph_delta={"rendered": list(actual), "section": section_note, "intent": intent},
             elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
         )
         if grid:
             result.render_base64 = base64.b64encode(grid).decode()
         result.render_views = actual
-        result.value = {"views": list(actual), "section": section_note, "name": name}
+        result.evidence_manifest = self._make_evidence_manifest(
+            intent, actual, size, cols, per_view_size, section_note, target, render_geometry,
+        )
+        result.value = {
+            "views": list(actual), "section": section_note, "intent": intent,
+            "target": target or None, "name": name, "evidence_manifest": result.evidence_manifest,
+        }
         return self._wrap_step_result(result)
     
     def undo(self, steps: int = 1) -> StepResult:
@@ -2836,7 +2974,7 @@ class MechKernel:
             result.render_views = {k: v for k, v in renders.items() if k != "default" and v}
             result.render_png = result.render_views.get("iso") or result.render_png
             if result.render_level == "full" and result.render_views:
-                grid = Renderer.compose_grid(result.render_views, cols=2)
+                grid = Renderer.compose_grid(result.render_views, cols=2, max_size=640)
                 if grid:
                     result.render_base64 = base64.b64encode(grid).decode()
                     self._last_render_base64 = result.render_base64
@@ -2845,6 +2983,11 @@ class MechKernel:
             self._last_render_views = dict(result.render_views)
         if result.geometry_summary is None:
             result.geometry_summary = self._geometry_summary_for(self._geometry_internal)
+        if result.render_views and result.evidence_manifest is None:
+            cols = 1 if len(result.render_views) == 1 else (2 if len(result.render_views) <= 4 else 4)
+            result.evidence_manifest = self._make_evidence_manifest(
+                "automatic", result.render_views, 640, cols, (320, 320), geometry=self._geometry_internal,
+            )
         # 加 hints（如果没设）
         if not result.next_hints:
             result.next_hints = self._generate_hints(result)

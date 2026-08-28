@@ -21,7 +21,7 @@ def test_render_is_public_and_has_schema():
     assert "render" in PUBLIC_OPS
     assert k.cap.has("render")
     assert set(k.cap.get("render").input_schema) == {
-        "views", "size", "annotate", "section", "turntable", "name"
+        "views", "size", "annotate", "section", "turntable", "intent", "target", "name"
     }
 
 
@@ -61,11 +61,24 @@ def test_render_views_and_section_contract():
     assert rr.success and set(rr.render_views) == {"iso", "front"}
     assert rr.render_base64
     assert base64.b64decode(k.get_last_render_base64())
+    assert rr.evidence_manifest["intent"] == "inspect"
+    assert rr.evidence_manifest["projection"] == "orthographic"
+    assert set(rr.evidence_manifest["image_hashes"]) == {"iso", "front"}
     section = k.render(section={"axis": "Z"}, size=160)
     assert section.success
     assert set(section.render_views) == {"iso", "front", "top", "side"}
     turntable = k.render(turntable=True, size=160)
     assert turntable.success and len(turntable.render_views) == 8
+    assert turntable.evidence_manifest["layout"]["columns"] == 4
+    from PIL import Image
+    packet = Image.open(io.BytesIO(base64.b64decode(turntable.render_base64)))
+    assert packet.width <= 160 and packet.height <= 160
+    focus = k.render(intent="feature_zoom", target=r.feature_id, size=160)
+    assert focus.success and focus.evidence_manifest["target"] == r.feature_id
+    delta = k.render(intent="delta", target=r.feature_id, size=160)
+    assert delta.success and set(delta.render_views) == {
+        "before_iso", "before_front", "after_iso", "after_front"
+    }
     original = k.query("_current_geometry", "volume").value
     section_volume = k._section_half(k._current_geometry, "Z").volume
     assert math.isclose(section_volume, original / 2.0, rel_tol=1e-6)
