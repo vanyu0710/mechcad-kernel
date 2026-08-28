@@ -41,6 +41,7 @@ class FeatureType(str, Enum):
     
     # 其他
     OFFSET_FACE = "offset_face"
+    ASSEMBLY = "assembly"  # v2.0: 装配（组合多个零件）
 
 
 class FeatureState(str, Enum):

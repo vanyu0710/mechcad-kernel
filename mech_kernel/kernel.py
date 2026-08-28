@@ -47,6 +47,7 @@ PUBLIC_OPS = frozenset({
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
+    "add_polyline", "add_arc", "assemble",
 })
 
 
@@ -236,6 +237,19 @@ class MechKernel:
             "export": {"path": FieldSchema(type="string", required=True),
                        "format": FieldSchema(type="enum", required=False, default="step", enum=["step"])},
             "rebuild": {"name": FieldSchema(type="string", required=False)},
+            "add_polyline": {"sketch_name": FieldSchema(type="string", required=True),
+                             "points": FieldSchema(type="list", required=True, items_type="list",
+                                                   description="[[x,y],...] 至少 3 点"),
+                             "name": FieldSchema(type="string", required=False)},
+            "add_arc": {"sketch_name": FieldSchema(type="string", required=True),
+                        "center": FieldSchema(type="tuple", required=True, items_type="number", length=2),
+                        "radius": FieldSchema(type="number", required=True, min=0.001),
+                        "start_angle": FieldSchema(type="number", required=True),
+                        "end_angle": FieldSchema(type="number", required=True),
+                        "name": FieldSchema(type="string", required=False)},
+            "assemble": {"parts": FieldSchema(type="list", required=True, items_type="dict",
+                                              description="[{path, position:[x,y,z], rotation:[deg,[ax,ay,az]]}]"),
+                         "name": FieldSchema(type="string", required=False)},
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
@@ -384,6 +398,70 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
+    def add_polyline(self, sketch_name: str, points: list, name: str = "") -> StepResult:
+        """v2.0: 添加多段线（闭合剖面用，可绕轴旋转/拉伸）"""
+        start = time.time()
+        sketch_name = require_non_empty_str("sketch_name", sketch_name)
+        if sketch_name not in self.sketches:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        if self.sketches[sketch_name].closed:
+            raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
+        if not points or len(points) < 3:
+            raise InvalidRequestError("polyline 至少需要 3 个点")
+        sk = self.sketches[sketch_name]
+        entry = self._record_history("add_polyline", sketch_name=sketch_name, points=points, name=name)
+        entity_id = next_entity_id()
+        entry["feature_id"] = entity_id
+        entity = SketchEntity(
+            id=entity_id, type="polyline",
+            params={"points": [tuple(p) for p in points]},
+            name=name or f"poly_{entity_id}",
+        )
+        sk.add_entity(entity)
+        self.narrative.append(f"草图 {sketch_name} 添加多段线")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=entity_id, narrative="画多段线",
+            current_narrative=self.narrative.copy(),
+            render_level="none",
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+    
+    def add_arc(self, sketch_name: str, center: tuple, radius: float, start_angle: float, end_angle: float, name: str = "") -> StepResult:
+        """v2.0: 添加圆弧（角度制，绕 center 从 start_angle 扫到 end_angle）"""
+        start = time.time()
+        sketch_name = require_non_empty_str("sketch_name", sketch_name)
+        require_tuple2("center", center)
+        require_positive("radius", radius)
+        if sketch_name not in self.sketches:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        if self.sketches[sketch_name].closed:
+            raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
+        sk = self.sketches[sketch_name]
+        entry = self._record_history(
+            "add_arc", sketch_name=sketch_name, center=center, radius=radius,
+            start_angle=start_angle, end_angle=end_angle, name=name,
+        )
+        entity_id = next_entity_id()
+        entry["feature_id"] = entity_id
+        entity = SketchEntity(
+            id=entity_id, type="arc",
+            params={"center": tuple(center), "radius": float(radius),
+                    "start_angle": float(start_angle), "end_angle": float(end_angle)},
+            name=name or f"arc_{entity_id}",
+        )
+        sk.add_entity(entity)
+        self.narrative.append(f"草图 {sketch_name} 添加圆弧")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=entity_id, narrative="画圆弧",
+            current_narrative=self.narrative.copy(),
+            render_level="none",
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+    
     def close_sketch(self, sketch_name: str) -> StepResult:
         start = time.time()
         sketch_name = require_non_empty_str("sketch_name", sketch_name)
@@ -493,6 +571,7 @@ class MechKernel:
         
         from build123d import BuildPart, BuildSketch, Plane, add, revolve as b3d_revolve, Axis, Location
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
+        from build123d import BuildLine, Polyline as B3DPolyline, make_face
         from build123d.build_common import Locations
         
         # 验证 axis 不退化
@@ -512,28 +591,41 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
+            # v2.0: line/polyline/arc 剖面 → 闭合线框 → make_face → revolve（解锁 CD 喷口等）
+            profile = None
+            profile_wires = None
+            if any(e.type in ("line", "polyline", "arc") for e in sk.entities):
+                profile = self._collect_closed_profile(sk)
+            if profile is not None:
+                # 注意：BuildLine 不能嵌在 BuildPart/BuildSketch 上下文内
+                with BuildLine() as bl:
+                    B3DPolyline(*profile, close=True)
+                profile_wires = bl.wires()
             with BuildPart(Plane.XY) as bp:
                 with BuildSketch() as s:
-                    for e in sk.entities:
-                        if e.type == "circle":
-                            r = e.params["radius"]
-                            c = e.params.get("center", (0, 0))
-                            if c == (0, 0) or c == [0, 0]:
-                                add(B3DCircle(r))
+                    if profile_wires is not None:
+                        make_face(profile_wires)
+                    else:
+                        for e in sk.entities:
+                            if e.type == "circle":
+                                r = e.params["radius"]
+                                c = e.params.get("center", (0, 0))
+                                if c == (0, 0) or c == [0, 0]:
+                                    add(B3DCircle(r))
+                                else:
+                                    # 关键：用 Locations 上下文（不是 Location * shape）
+                                    with Locations((c[0], c[1], 0)):
+                                        B3DCircle(r)
+                            elif e.type == "rectangle":
+                                w, h = e.params["width"], e.params["height"]
+                                c = e.params.get("center", (0, 0))
+                                if c == (0, 0) or c == [0, 0]:
+                                    add(B3DRect(w, h))
+                                else:
+                                    with Locations((c[0], c[1], 0)):
+                                        B3DRect(w, h)
                             else:
-                                # 关键：用 Locations 上下文（不是 Location * shape）
-                                with Locations((c[0], c[1], 0)):
-                                    B3DCircle(r)
-                        elif e.type == "rectangle":
-                            w, h = e.params["width"], e.params["height"]
-                            c = e.params.get("center", (0, 0))
-                            if c == (0, 0) or c == [0, 0]:
-                                add(B3DRect(w, h))
-                            else:
-                                with Locations((c[0], c[1], 0)):
-                                    B3DRect(w, h)
-                        else:
-                            raise NotImplementedError(f"revolve 暂不支持 entity type={e.type}")
+                                raise NotImplementedError(f"revolve 暂不支持 entity type={e.type}")
                 rot_axis = Axis((ox, oy, oz), (dx, dy, dz))
                 b3d_revolve(axis=rot_axis, revolution_arc=angle)
             new_solid = bp.part
@@ -606,6 +698,8 @@ class MechKernel:
         from build123d import BuildPart, BuildSketch, Plane, add, Axis, Location
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
         
+        if any(e.type not in ("circle", "rectangle") for e in sk.entities):
+            raise NotImplementedError("circular_pattern 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "circular_pattern") as txn:
             entry = self._record_history("circular_pattern", sketch_name=sketch_name, count=count, axis_origin=axis_origin, axis_direction=axis_direction, angle=angle, depth=depth, mode=mode, name=name)
             feature_id = next_feature_id()
@@ -710,29 +804,9 @@ class MechKernel:
         from build123d.build_common import Locations
         
         def _extrude_sketch_to_part(sk, depth, direction="Z"):
-            """草图 → Part"""
+            """草图 → Part（v2.1: 统一助手，支持 polyline/arc）"""
             plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
-            with BuildPart(plane) as bp:
-                with BuildSketch() as s:
-                    for e in sk.entities:
-                        if e.type == "circle":
-                            r = e.params["radius"]
-                            c = e.params.get("center", (0, 0))
-                            if c == (0, 0) or c == [0, 0]:
-                                add(B3DCircle(r))
-                            else:
-                                with Locations((c[0], c[1], 0)):
-                                    B3DCircle(r)
-                        elif e.type == "rectangle":
-                            w, h = e.params["width"], e.params["height"]
-                            c = e.params.get("center", (0, 0))
-                            if c == (0, 0) or c == [0, 0]:
-                                add(B3DRect(w, h))
-                            else:
-                                with Locations((c[0], c[1], 0)):
-                                    B3DRect(w, h)
-                extrude(amount=depth)
-            return bp.part
+            return self._extrude_sketch_solid(sk, depth, plane)
         
         with Transaction(self, "boolean") as txn:
             entry = self._record_history("boolean", target_sketch=target_sketch, tools=tools, operation=operation, name=name)
@@ -1178,6 +1252,8 @@ class MechKernel:
         ux, uy = dx / norm, dy / norm
         
         sk = self.sketches[sketch_name]
+        if any(e.type not in ("circle", "rectangle") for e in sk.entities):
+            raise NotImplementedError("linear_pattern 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "linear_pattern") as txn:
             entry = self._record_history("linear_pattern", sketch_name=sketch_name, count=count, direction=direction, spacing=spacing, mode=mode, name=name)
             feature_id = next_feature_id()
@@ -1268,6 +1344,8 @@ class MechKernel:
         from build123d.build_common import Locations
         
         sk = self.sketches[sketch_name]
+        if any(e.type not in ("circle", "rectangle") for e in sk.entities):
+            raise NotImplementedError("mirror 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "mirror") as txn:
             entry = self._record_history("mirror", sketch_name=sketch_name, axis=axis, mode=mode, name=name)
             feature_id = next_feature_id()
@@ -1469,8 +1547,13 @@ class MechKernel:
         if what == "bounding_box":
             bbox = Bnd_Box()
             exp = TopExp_Explorer(shape, TopAbs_SOLID)
-            if exp.More():
+            found = False
+            while exp.More():
                 BRepBndLib.Add_s(exp.Current(), bbox)
+                found = True
+                exp.Next()
+            if not found:
+                BRepBndLib.Add_s(shape, bbox)  # 无 SOLID（如纯面）时用整体
             result_value = {
                 "xmin": bbox.CornerMin().X(), "ymin": bbox.CornerMin().Y(), "zmin": bbox.CornerMin().Z(),
                 "xmax": bbox.CornerMax().X(), "ymax": bbox.CornerMax().Y(), "zmax": bbox.CornerMax().Z(),
@@ -1675,8 +1758,13 @@ class MechKernel:
             shape = shape.wrapped if hasattr(shape, 'wrapped') else shape
             bbox = Bnd_Box()
             exp = TopExp_Explorer(shape, TopAbs_SOLID)
-            if exp.More():
+            found = False
+            while exp.More():
                 BRepBndLib.Add_s(exp.Current(), bbox)
+                found = True
+                exp.Next()
+            if not found:
+                BRepBndLib.Add_s(shape, bbox)
             return (
                 (bbox.CornerMin().X() + bbox.CornerMax().X()) / 2,
                 (bbox.CornerMin().Y() + bbox.CornerMax().Y()) / 2,
@@ -1746,18 +1834,18 @@ class MechKernel:
         """
         start = time.time()
         self._step_counter += 1
-        idx = self._find_history_index(feature_id)
-        if idx is None:
-            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
         if self._has_non_replayable_op:
             return make_failure(
-                error="会话包含导入/加载操作，delete_feature 重放不可用（会丢失导入几何）",
+                error="会话包含导入/加载/装配操作，delete_feature 重放不可用（会丢失外部几何）",
                 error_kind="RECOVERABLE",
                 suggestion={"action": "新建会话后重新建模，或先导出 STEP 再导入到新会话"},
                 current_narrative=self.narrative.copy(),
                 elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
             )
+        idx = self._find_history_index(feature_id)
+        if idx is None:
+            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
 
         with Transaction(self, "delete_feature") as txn:
             # v2.0：只删目标 entry + 全量重放（独立后续保留，SW 式）。
@@ -1787,18 +1875,18 @@ class MechKernel:
         """
         start = time.time()
         self._step_counter += 1
-        idx = self._find_history_index(feature_id)
-        if idx is None:
-            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
         if self._has_non_replayable_op:
             return make_failure(
-                error="会话包含导入/加载操作，update_feature 重放不可用（会丢失导入几何）",
+                error="会话包含导入/加载/装配操作，update_feature 重放不可用（会丢失外部几何）",
                 error_kind="RECOVERABLE",
                 suggestion={"action": "新建会话后重新建模"},
                 current_narrative=self.narrative.copy(),
                 elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
             )
+        idx = self._find_history_index(feature_id)
+        if idx is None:
+            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
 
         entry = self._op_history[idx]
         op = entry["op"]
@@ -2057,6 +2145,55 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
+    def assemble(self, parts: list, name: str = "") -> StepResult:
+        """v2.0: 装配多个 STEP 零件（定位 + 旋转）→ 组合为一个几何（可导出整机 STEP）"""
+        start = time.time()
+        if not parts:
+            raise InvalidRequestError("parts 不能为空")
+        import os
+        from build123d.importers import import_step as b3d_import_step
+        from build123d import Vector, Axis
+        with Transaction(self, "assemble") as txn:
+            feature_id = next_feature_id()
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.ASSEMBLY,
+                parameters={"parts": parts, "name": name},
+                name=name or f"assembly_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            assembled = None
+            for item in parts:
+                path = item["path"]
+                if not os.path.exists(path):
+                    raise InvalidRequestError(f"零件 STEP 不存在: {path}")
+                part = b3d_import_step(path)
+                rot = item.get("rotation")
+                if rot is not None:
+                    part = part.rotate(Axis((0, 0, 0), tuple(rot[1])), rot[0])
+                pos = item.get("position", [0, 0, 0])
+                part = part.translate(Vector(*pos))
+                assembled = part if assembled is None else assembled + part
+            self._current_geometry = assembled
+            self._has_non_replayable_op = True  # 装配依赖外部 STEP，不可重放
+            self.narrative.append(f"装配 {len(parts)} 个零件 → {feature.name}")
+            txn.commit()
+        render_level = "iso_only"
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"装配 {len(parts)} 个零件",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+    
     def undo(self, steps: int = 1) -> StepResult:
         start = time.time()
         require_positive_int("steps", steps)
@@ -2174,6 +2311,113 @@ class MechKernel:
                 return i
         return None
 
+    def _collect_closed_profile(self, sk) -> List[Tuple[float, float]]:
+        """v2.0: 把 line/polyline/arc 实体收集成闭合剖面点列（revolve / extrude 用）。
+        arc 按 ~5°/段采样成折线。返回闭合环（不含重复首点）。"""
+        import math
+
+        def _snap(pt):
+            # 浮点吸附：近零归零 + 6 位小数（弧采样端点与直线端点才能精确衔接）
+            return (0.0 if abs(pt[0]) < 1e-9 else round(pt[0], 6),
+                    0.0 if abs(pt[1]) < 1e-9 else round(pt[1], 6))
+
+        segs = []
+        for e in sk.entities:
+            if e.type == "line":
+                segs.append((_snap(tuple(e.params["start"])), _snap(tuple(e.params["end"]))))
+            elif e.type == "polyline":
+                pts = [_snap(tuple(p)) for p in e.params["points"]]
+                if pts[0] != pts[-1]:
+                    pts = pts + [pts[0]]  # 自动闭合（剖面用）
+                for i in range(len(pts) - 1):
+                    segs.append((pts[i], pts[i + 1]))
+            elif e.type == "arc":
+                c = tuple(e.params["center"])
+                r = float(e.params["radius"])
+                a0, a1 = float(e.params["start_angle"]), float(e.params["end_angle"])
+                if a1 < a0:
+                    a1 += 360.0
+                span = abs(a1 - a0)
+                n = max(2, int(math.ceil(span / 5.0)))
+                prev = None
+                for i in range(n + 1):
+                    ang = math.radians(a0 + (a1 - a0) * i / n)
+                    pt = (c[0] + r * math.cos(ang), c[1] + r * math.sin(ang))
+                    pt = _snap(pt)
+                    if prev is not None:
+                        segs.append((prev, pt))
+                    prev = pt
+            else:
+                raise InvalidRequestError(f"剖面不支持 entity type={e.type}")
+        if not segs:
+            raise InvalidRequestError("剖面为空")
+        by_start = {}
+        for s_pt, e_pt in segs:
+            by_start.setdefault(s_pt, []).append(e_pt)
+        start = segs[0][0]
+        pts = [start]
+        cur = start
+        for _ in range(len(segs) + 1):
+            nxts = by_start.get(cur)
+            if not nxts:
+                raise InvalidRequestError("剖面不连续（存在断点）")
+            if len(nxts) > 1:
+                raise InvalidRequestError("剖面分叉（一个点引出多条线）")
+            nxt = nxts[0]
+            if nxt == start:
+                break
+            if nxt in pts:
+                raise InvalidRequestError("剖面存在重复点/子环（未整体闭合）")
+            pts.append(nxt)
+            cur = nxt
+        else:
+            raise InvalidRequestError("剖面未闭合")
+        return pts
+
+    def _extrude_sketch_solid(self, sketch, depth, plane):
+        """v2.1: 把草图拉伸成 Part（circle/rectangle/line/polyline/arc 统一支持）。"""
+        from build123d import BuildPart, BuildSketch, add, extrude
+        from build123d import Circle as B3DCircle, Rectangle as B3DRect
+        from build123d import BuildLine, Polyline as B3DPolyline, make_face
+        from build123d.build_common import Locations
+
+        profile = None
+        if any(e.type in ("line", "polyline", "arc") for e in sketch.entities):
+            profile = self._collect_closed_profile(sketch)
+        if profile is not None:
+            with BuildLine() as bl:
+                B3DPolyline(*profile, close=True)
+            profile_wires = bl.wires()
+            with BuildPart(plane) as bp:
+                with BuildSketch() as s:
+                    make_face(profile_wires)
+                extrude(amount=depth)
+            return bp.part
+
+        with BuildPart(plane) as bp:
+            with BuildSketch() as s:
+                for e in sketch.entities:
+                    if e.type == "circle":
+                        r = e.params["radius"]
+                        c = e.params.get("center", (0, 0))
+                        if c == (0, 0) or c == [0, 0]:
+                            add(B3DCircle(r))
+                        else:
+                            with Locations((c[0], c[1], 0)):
+                                B3DCircle(r)
+                    elif e.type == "rectangle":
+                        w, h = e.params["width"], e.params["height"]
+                        c = e.params.get("center", (0, 0))
+                        if c == (0, 0) or c == [0, 0]:
+                            add(B3DRect(w, h))
+                        else:
+                            with Locations((c[0], c[1], 0)):
+                                B3DRect(w, h)
+                    else:
+                        raise NotImplementedError(f"拉伸暂不支持 entity type={e.type}")
+            extrude(amount=depth)
+        return bp.part
+
     def _replay(self) -> None:
         """v2.0 参数化重放：清空状态 + 重置 id + 按 op_history 全量重放（不记录）"""
         self._replaying = True
@@ -2211,9 +2455,10 @@ class MechKernel:
         """
         try:
             from build123d import (
-                BuildPart, BuildSketch, Plane, add, Location,
+                BuildPart, BuildSketch, Plane, add,
                 Circle as B3DCircle, Rectangle as B3DRect, extrude,
             )
+            from build123d.build_common import Locations
             
             if not sketch or not sketch.entities:
                 from .build123d_adapter import extrude_sketch
@@ -2232,7 +2477,9 @@ class MechKernel:
                         if c == (0, 0) or c == [0, 0]:
                             add(B3DCircle(r))
                         else:
-                            add(Location((c[0], c[1], 0)) * B3DCircle(r))
+                            # Locations 上下文（add(Location*shape) 会产生幻影原点副本）
+                            with Locations((c[0], c[1], 0)):
+                                B3DCircle(r)
                     extrude(amount=depth)
                 return bp.part
             
@@ -2246,7 +2493,8 @@ class MechKernel:
                         if c == (0, 0) or c == [0, 0]:
                             add(B3DRect(w, h))
                         else:
-                            add(Location((c[0], c[1], 0)) * B3DRect(w, h))
+                            with Locations((c[0], c[1], 0)):
+                                B3DRect(w, h)
                     extrude(amount=depth)
                 return bp.part
             
@@ -2268,6 +2516,19 @@ class MechKernel:
                             extrude(amount=depth, mode=Mode.SUBTRACT)
                         return bp.part
             
+            # v2.0: line/polyline/arc 闭合剖面 → face → extrude
+            if any(e.type in ("line", "polyline", "arc") for e in sketch.entities):
+                profile = self._collect_closed_profile(sketch)
+                from build123d import BuildLine, Polyline as B3DPolyline, make_face
+                with BuildLine() as bl:
+                    B3DPolyline(*profile, close=True)
+                profile_wires = bl.wires()
+                with BuildPart(plane) as bp:
+                    with BuildSketch() as s:
+                        make_face(profile_wires)
+                    extrude(amount=depth)
+                return bp.part
+
             # 其他 → adapter
             from .build123d_adapter import extrude_sketch
             return extrude_sketch(sketch, depth)
@@ -2293,33 +2554,8 @@ class MechKernel:
         # v1.2.1: direction → plane
         plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
         
-        # 1. 单独把新 sketch 拉伸成 Part
-        with BuildPart(plane) as bp:
-            with BuildSketch() as s:
-                for e in sketch.entities:
-                    if e.type == "circle":
-                        r = e.params["radius"]
-                        c = e.params.get("center", (0, 0))
-                        if c == (0, 0) or c == [0, 0]:
-                            add(B3DCircle(r))
-                        else:
-                            # circle 加 center 偏移
-                            add(Location((c[0], c[1], 0)) * B3DCircle(r))
-                    elif e.type == "rectangle":
-                        w, h = e.params["width"], e.params["height"]
-                        c = e.params.get("center", (0, 0))
-                        if c == (0, 0) or c == [0, 0]:
-                            add(B3DRect(w, h))  # 默认中心 (0,0)
-                        else:
-                            add(Location((c[0], c[1], 0)) * B3DRect(w, h))
-                    elif e.type == "polygon":
-                        from .build123d_adapter import extrude_sketch
-                        new_solid = extrude_sketch(sketch, depth)
-                        break
-                else:
-                    pass
-            extrude(amount=depth)
-        new_solid = bp.part
+        # 1. 单独把新 sketch 拉伸成 Part（v2.1: 统一助手，支持 circle/rect/polyline/arc）
+        new_solid = self._extrude_sketch_solid(sketch, depth, plane)
         
         # 3. 走 boolean
         if mode == "add":
