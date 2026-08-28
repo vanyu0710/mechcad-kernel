@@ -4,6 +4,7 @@ MechKernel 主类（v1.1.1 修复版）
 v1.1 核心：18 个原子 API + 自适应渲染 + 语义引用 + 事务回滚 + 类型化错误
 """
 from typing import List, Optional, Dict, Any, Tuple, Union
+import copy
 import time
 import base64
 
@@ -45,7 +46,7 @@ PUBLIC_OPS = frozenset({
     "hole", "fillet", "chamfer", "shell",
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
-    "undo", "redo", "delete_feature", "update_feature", "export",
+    "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
 })
 
 
@@ -65,6 +66,10 @@ class MechKernel:
         self._txn_depth = 0
         self._geometry_internal: Optional[Any] = None
         self._geometry_revision: int = 0
+        self._feature_geometries: Dict[str, Any] = {}  # v1.16: feature_id -> 该 feature 完成时的几何引用
+        self._op_history: List[Dict] = []  # v2.0: op 历史（参数化重放数据源）
+        self._replaying: bool = False  # v2.0: 重放中（禁止再记录）
+        self._has_non_replayable_op: bool = False  # v2.0: 会话含导入/加载，禁止重放
         self.geometry_inspector = GeometryInspector()
         self.inspector = self.geometry_inspector  # 别名（兼容测试）
         self.renderer = Renderer()
@@ -84,7 +89,7 @@ class MechKernel:
             description="创建工作平面",
             input_schema={
                 "name": FieldSchema(type="string", required=True),
-                "type": FieldSchema(type="enum", required=False, default="XY", enum=["XY", "YZ", "XZ", "face", "custom"]),
+                "type": FieldSchema(type="enum", required=False, default="XY", enum=["XY", "YZ", "XZ", "custom"]),
             },
             permission="public",
         ))
@@ -104,6 +109,7 @@ class MechKernel:
                 "sketch_name": FieldSchema(type="string", required=True),
                 "center": FieldSchema(type="tuple", required=True, items_type="number", length=2),
                 "radius": FieldSchema(type="number", required=True, min=0.001),
+                "name": FieldSchema(type="string", required=False),
             },
             permission="public",
         ))
@@ -115,6 +121,7 @@ class MechKernel:
                 "width": FieldSchema(type="number", required=True, min=0.001),
                 "height": FieldSchema(type="number", required=True, min=0.001),
                 "center": FieldSchema(type="tuple", required=False, items_type="number", length=2),
+                "name": FieldSchema(type="string", required=False),
             },
             permission="public",
         ))
@@ -143,6 +150,7 @@ class MechKernel:
                 "depth": FieldSchema(type="number", required=True, min=0.001),
                 "mode": FieldSchema(type="enum", required=False, default="new_body", enum=["new_body", "add", "cut"]),
                 "name": FieldSchema(type="string", required=False),
+                "direction": FieldSchema(type="enum", required=False, default="Z", enum=["X", "Y", "Z"]),
             },
             permission="public",
         ))
@@ -163,49 +171,71 @@ class MechKernel:
             if method is not None and callable(method):
                 self.cap._caps[name].func = method
 
-        # placeholder op（v7 P0-V4：每个未实现 op 都有 schema + planned_version）
-        # 注意：这些 op 真实方法存在（返回 NOT_IMPLEMENTED），所以 func 绑定会自动发生
+        # op schema（v1.16 修复版：与真实方法签名逐字段对齐）
+        # 说明：v1.11-1.15 已将 query/select/measure/delete_feature/update_feature 真实实现，
+        # 这些 schema 必须与 kernel 方法签名一致，否则 execute() 校验会拒绝合法调用。
         placeholder_schemas = {
             "revolve": {"sketch_name": FieldSchema(type="string", required=True),
-                        "axis": FieldSchema(type="tuple", required=True, items_type="string", length=2),
-                        "angle": FieldSchema(type="number", required=False, default=360.0, min=0.01, max=360.0)},
-            "sweep": {"sketch_name": FieldSchema(type="string", required=True),
-                      "path_name": FieldSchema(type="string", required=True)},
-            "boolean": {"target": FieldSchema(type="string", required=True),
+                        "axis": FieldSchema(type="tuple", required=False, items_type="number", length=6),
+                        "angle": FieldSchema(type="number", required=False, default=360.0, min=0.01, max=360.0),
+                        "mode": FieldSchema(type="enum", required=False, default="new_body", enum=["new_body", "add", "cut"]),
+                        "name": FieldSchema(type="string", required=False)},
+            "sweep": {"profile_sketch": FieldSchema(type="string", required=True),
+                      "path": FieldSchema(type="enum", required=False, default="x_axis", enum=["x_axis", "y_axis", "z_axis"]),
+                      "length": FieldSchema(type="number", required=False, default=50.0, min=0.001),
+                      "name": FieldSchema(type="string", required=False)},
+            "boolean": {"target_sketch": FieldSchema(type="string", required=True),
                         "tools": FieldSchema(type="list", required=True, items_type="string"),
-                        "operation": FieldSchema(type="enum", required=True, enum=["union", "subtract", "intersect"])},
-            "hole": {"target_face": FieldSchema(type="string", required=True),
-                     "diameter": FieldSchema(type="number", required=True, min=0.1),
-                     "depth": FieldSchema(type="number", required=True, min=0.1),
-                     "position": FieldSchema(type="tuple", required=False, items_type="number", length=2),
-                     "hole_type": FieldSchema(type="enum", required=False, default="simple", enum=["simple", "counterbore", "countersink"])},
-            "fillet": {"targets": FieldSchema(type="list", required=True, items_type="string"),
-                       "radius": FieldSchema(type="number", required=True, min=0.01)},
-            "chamfer": {"targets": FieldSchema(type="list", required=True, items_type="string"),
-                        "size": FieldSchema(type="number", required=True, min=0.01)},
-            "shell": {"body_name": FieldSchema(type="string", required=True),
-                      "thickness": FieldSchema(type="number", required=True, min=0.1),
-                      "open_faces": FieldSchema(type="list", required=False, items_type="string")},
-            "linear_pattern": {"feature_id": FieldSchema(type="string", required=True),
+                        "operation": FieldSchema(type="enum", required=False, default="union", enum=["union", "subtract", "intersect"]),
+                        "name": FieldSchema(type="string", required=False)},
+            "hole": {"position": FieldSchema(type="tuple", required=False, default=[0, 0], items_type="number", length=2),
+                     "diameter": FieldSchema(type="number", required=False, default=10.0, min=0.001),
+                     "depth": FieldSchema(type="number", required=False, min=0.001),
+                     "hole_type": FieldSchema(type="enum", required=False, default="simple", enum=["simple", "counterbore", "countersink"]),
+                     "counterbore_diameter": FieldSchema(type="number", required=False, min=0.001),
+                     "counterbore_depth": FieldSchema(type="number", required=False, min=0.001),
+                     "name": FieldSchema(type="string", required=False)},
+            "fillet": {"radius": FieldSchema(type="number", required=True, min=0.001),
+                       "edges": FieldSchema(type="enum", required=False, default="all", enum=["all"]),
+                       "name": FieldSchema(type="string", required=False)},
+            "chamfer": {"length": FieldSchema(type="number", required=True, min=0.001),
+                        "length2": FieldSchema(type="number", required=False, min=0.001),
+                        "edges": FieldSchema(type="enum", required=False, default="all", enum=["all"]),
+                        "name": FieldSchema(type="string", required=False)},
+            "shell": {"thickness": FieldSchema(type="number", required=True, min=0.001),
+                      "face_filter": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "z+", "z-", "x+", "x-", "y+", "y-"]),
+                      "name": FieldSchema(type="string", required=False)},
+            "linear_pattern": {"sketch_name": FieldSchema(type="string", required=True),
                                "count": FieldSchema(type="integer", required=True, min=2, max=100),
-                               "spacing": FieldSchema(type="number", required=True),
-                               "direction": FieldSchema(type="tuple", required=True, items_type="number", length=3)},
-            "circular_pattern": {"feature_id": FieldSchema(type="string", required=True),
+                               "direction": FieldSchema(type="tuple", required=False, default=[1, 0], items_type="number", length=2),
+                               "spacing": FieldSchema(type="number", required=False, default=10.0, min=0.001),
+                               "mode": FieldSchema(type="enum", required=False, default="cut", enum=["cut", "add", "union"]),
+                               "name": FieldSchema(type="string", required=False)},
+            "circular_pattern": {"sketch_name": FieldSchema(type="string", required=True),
                                  "count": FieldSchema(type="integer", required=True, min=2, max=100),
-                                 "axis": FieldSchema(type="tuple", required=True, items_type="string", length=2),
-                                 "angle": FieldSchema(type="number", required=False, default=360.0)},
-            "mirror": {"feature_id": FieldSchema(type="string", required=True),
-                       "plane": FieldSchema(type="string", required=True)},
+                                 "axis_origin": FieldSchema(type="tuple", required=False, default=[0, 0, 0], items_type="number", length=3),
+                                 "axis_direction": FieldSchema(type="tuple", required=False, default=[0, 0, 1], items_type="number", length=3),
+                                 "angle": FieldSchema(type="number", required=False, default=360.0, min=0.01, max=360.0),
+                                 "depth": FieldSchema(type="number", required=False, default=10.0, min=0.001),
+                                 "mode": FieldSchema(type="enum", required=False, default="cut", enum=["cut", "add"]),
+                                 "name": FieldSchema(type="string", required=False)},
+            "mirror": {"sketch_name": FieldSchema(type="string", required=True),
+                       "axis": FieldSchema(type="enum", required=False, default="X", enum=["X", "Y"]),
+                       "mode": FieldSchema(type="enum", required=False, default="union", enum=["union", "add", "cut"]),
+                       "name": FieldSchema(type="string", required=False)},
             "query": {"target": FieldSchema(type="string", required=True),
-                      "what": FieldSchema(type="enum", required=True, enum=["bounding_box", "volume", "faces", "edges"])},
-            "select": {"selector": FieldSchema(type="string", required=True)},
-            "measure": {"between": FieldSchema(type="list", required=True, items_type="string"),
-                        "metric": FieldSchema(type="enum", required=True, enum=["distance", "angle", "area"])},
+                      "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"])},
+            "select": {"filter_type": FieldSchema(type="enum", required=False, default="all", enum=["all", "plane", "cylinder", "cone", "sphere", "torus"]),
+                       "face_index": FieldSchema(type="integer", required=False, min=0)},
+            "measure": {"target1": FieldSchema(type="string", required=True),
+                        "target2": FieldSchema(type="string", required=False),
+                        "metric": FieldSchema(type="enum", required=False, default="distance", enum=["distance", "volume", "area"])},
             "delete_feature": {"feature_id": FieldSchema(type="string", required=True)},
             "update_feature": {"feature_id": FieldSchema(type="string", required=True),
-                               "params": FieldSchema(type="dict", required=True)},
+                               "new_params": FieldSchema(type="dict", required=True)},
             "export": {"path": FieldSchema(type="string", required=True),
-                       "format": FieldSchema(type="enum", required=False, default="step", enum=["step", "iges", "stl"])},
+                       "format": FieldSchema(type="enum", required=False, default="step", enum=["step"])},
+            "rebuild": {"name": FieldSchema(type="string", required=False)},
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
@@ -221,6 +251,7 @@ class MechKernel:
             raise InvalidRequestError(f"工作平面 {name} 已存在")
         
         with Transaction(self, "create_workplane") as txn:
+            entry = self._record_history("create_workplane", name=name, type=type)
             wp = Workplane(id=f"wp_{name}_{next_workplane_id()}", name=name, type=WorkplaneType(type))
             self.workplanes.register(wp)
             self.narrative.append(f"创建工作平面 {name} ({type})")
@@ -245,6 +276,7 @@ class MechKernel:
             raise InvalidRequestError(f"草图 {sketch_name} 已存在")
         
         with Transaction(self, "new_sketch") as txn:
+            entry = self._record_history("new_sketch", workplane_name=workplane_name, sketch_name=sketch_name)
             sk = Sketch(id=next_sketch_id(), name=sketch_name, workplane_name=workplane_name)
             self.sketches[sketch_name] = sk
             self.narrative.append(f"创建草图 {sketch_name} (在 {workplane_name})")
@@ -272,7 +304,9 @@ class MechKernel:
         sk = self.sketches[sketch_name]
         
         with Transaction(self, "add_circle") as txn:
+            entry = self._record_history("add_circle", sketch_name=sketch_name, center=center, radius=radius, name=name)
             entity_id = next_entity_id()
+            entry["feature_id"] = entity_id
             entity = SketchEntity(
                 id=entity_id, type="circle",
                 params={"center": tuple(center), "radius": float(radius)},
@@ -302,7 +336,9 @@ class MechKernel:
         if self.sketches[sketch_name].closed:
             raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
         sk = self.sketches[sketch_name]
+        entry = self._record_history("add_rectangle", sketch_name=sketch_name, width=width, height=height, center=center, name=name)
         entity_id = next_entity_id()
+        entry["feature_id"] = entity_id
         entity = SketchEntity(
             id=entity_id, type="rectangle",
             params={"width": float(width), "height": float(height), "center": tuple(center)},
@@ -329,11 +365,13 @@ class MechKernel:
         if self.sketches[sketch_name].closed:
             raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
         sk = self.sketches[sketch_name]
+        entry = self._record_history("add_line", sketch_name=sketch_name, start=start, end=end)
         entity_id = next_entity_id()
+        entry["feature_id"] = entity_id
         entity = SketchEntity(
             id=entity_id, type="line",
             params={"start": tuple(start), "end": tuple(end)},
-            semantic_name=f"line_{entity_id}",
+            name=f"line_{entity_id}",
         )
         sk.add_entity(entity)
         self.narrative.append(f"草图 {sketch_name} 添加直线")
@@ -356,6 +394,7 @@ class MechKernel:
             raise InvalidRequestError(f"草图 {sketch_name} 为空，没有图元可关闭")
         
         with Transaction(self, "close_sketch") as txn:
+            entry = self._record_history("close_sketch", sketch_name=sketch_name)
             self.sketches[sketch_name].closed = True
             self.narrative.append(f"关闭草图 {sketch_name}")
             txn.commit()
@@ -382,10 +421,12 @@ class MechKernel:
             raise InvalidRequestError(f"草图 {sketch_name} 未关闭")
         
         with Transaction(self, "extrude") as txn:
+            entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.EXTRUDE,
-                parameters={"sketch_name": sketch_name, "depth": depth, "mode": mode, "name": name},
+                parameters={"sketch_name": sketch_name, "depth": depth, "mode": mode, "direction": direction, "name": name},
                 name=name or f"extrude_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
@@ -398,6 +439,7 @@ class MechKernel:
                 self._current_geometry = self._extrude_add_or_cut(sk, depth, mode, direction=direction)
             self.narrative.append(f"拉伸 {sketch_name} 深度 {depth} → {feature.name}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = self.adaptive_renderer.should_render(
             op="extrude", op_params={"sketch_name": sketch_name, "depth": depth},
@@ -459,7 +501,9 @@ class MechKernel:
             raise InvalidRequestError(f"axis 方向向量为 0")
         
         with Transaction(self, "revolve") as txn:
+            entry = self._record_history("revolve", sketch_name=sketch_name, axis=axis, angle=angle, mode=mode, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.REVOLVE,
                 parameters={"sketch_name": sketch_name, "axis": list(axis), "angle": angle, "mode": mode, "name": name},
@@ -508,6 +552,7 @@ class MechKernel:
             
             self.narrative.append(f"旋转 {sketch_name} 角度 {angle}° → {feature.name}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = self.adaptive_renderer.should_render(
             op="revolve", op_params={"angle": angle},
@@ -562,7 +607,9 @@ class MechKernel:
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
         
         with Transaction(self, "circular_pattern") as txn:
+            entry = self._record_history("circular_pattern", sketch_name=sketch_name, count=count, axis_origin=axis_origin, axis_direction=axis_direction, angle=angle, depth=depth, mode=mode, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.CIRCULAR_PATTERN,
                 parameters={"sketch_name": sketch_name, "count": count, "axis_origin": axis_origin, "axis_direction": axis_direction, "angle": angle, "depth": depth, "mode": mode, "name": name},
@@ -608,6 +655,7 @@ class MechKernel:
             self._current_geometry = new_geom
             self.narrative.append(f"circular pattern {sketch_name} x{count} → {feature.name}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = self.adaptive_renderer.should_render(
             op="pattern", op_params={"count": count},
@@ -687,7 +735,9 @@ class MechKernel:
             return bp.part
         
         with Transaction(self, "boolean") as txn:
+            entry = self._record_history("boolean", target_sketch=target_sketch, tools=tools, operation=operation, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.BOOLEAN,
                 parameters={"target_sketch": target_sketch, "tools": tools, "operation": operation, "name": name},
@@ -721,6 +771,7 @@ class MechKernel:
             
             self.narrative.append(f"boolean {operation} target={target_sketch} tools={tools}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -753,7 +804,9 @@ class MechKernel:
             raise InvalidRequestError(f"radius 必须 > 0（当前 {radius}）")
         
         with Transaction(self, "fillet") as txn:
+            entry = self._record_history("fillet", radius=radius, edges=edges, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.FILLET,
                 parameters={"radius": radius, "edges": edges, "name": name},
@@ -770,6 +823,7 @@ class MechKernel:
             self._current_geometry = self._current_geometry.fillet(radius, edge_list)
             self.narrative.append(f"fillet r={radius} 全部 {len(edge_list)} 边 → {feature.name}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = self.adaptive_renderer.should_render(
             op="fillet", op_params={"radius": radius},
@@ -807,7 +861,9 @@ class MechKernel:
         l2 = length if length2 is None else length2
         
         with Transaction(self, "chamfer") as txn:
+            entry = self._record_history("chamfer", length=length, length2=length2, edges=edges, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.CHAMFER,
                 parameters={"length": length, "length2": l2, "edges": edges, "name": name},
@@ -824,6 +880,7 @@ class MechKernel:
             self._current_geometry = self._current_geometry.chamfer(length, l2, edge_list)
             self.narrative.append(f"chamfer l={length}/{l2} 全部 {len(edge_list)} 边 → {feature.name}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = self.adaptive_renderer.should_render(
             op="chamfer", op_params={"length": length},
@@ -896,7 +953,9 @@ class MechKernel:
         actual_depth = (z_max - z_min) + 10 if depth is None else depth  # +10 保险穿透
         
         with Transaction(self, "hole") as txn:
+            entry = self._record_history("hole", position=position, diameter=diameter, depth=depth, hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.HOLE,
                 parameters={
@@ -951,6 +1010,7 @@ class MechKernel:
             self._current_geometry = self._current_geometry - cutter
             self.narrative.append(f"hole {hole_type} Ø{diameter} @ ({px}, {py}) 深 {actual_depth:.1f}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -1032,7 +1092,9 @@ class MechKernel:
             raise InvalidRequestError(f"没找到匹配 '{face_filter}' 的面")
         
         with Transaction(self, "shell") as txn:
+            entry = self._record_history("shell", thickness=thickness, face_filter=face_filter, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SHELL,
                 parameters={"thickness": thickness, "face_filter": face_filter, "name": name},
@@ -1053,6 +1115,7 @@ class MechKernel:
             self._current_geometry = B3DSolid(builder.Shape())
             self.narrative.append(f"shell t={thickness} 面 {face_filter}（{faces_list.Size()} 个）")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -1116,7 +1179,9 @@ class MechKernel:
         
         sk = self.sketches[sketch_name]
         with Transaction(self, "linear_pattern") as txn:
+            entry = self._record_history("linear_pattern", sketch_name=sketch_name, count=count, direction=direction, spacing=spacing, mode=mode, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.LINEAR_PATTERN,
                 parameters={"sketch_name": sketch_name, "count": count, "direction": list(direction), "spacing": spacing, "mode": mode, "name": name},
@@ -1152,6 +1217,7 @@ class MechKernel:
             
             self.narrative.append(f"linear_pattern {sketch_name} x{count} {direction} 间距 {spacing}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -1203,7 +1269,9 @@ class MechKernel:
         
         sk = self.sketches[sketch_name]
         with Transaction(self, "mirror") as txn:
+            entry = self._record_history("mirror", sketch_name=sketch_name, axis=axis, mode=mode, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.MIRROR,
                 parameters={"sketch_name": sketch_name, "axis": axis, "mode": mode, "name": name},
@@ -1254,6 +1322,7 @@ class MechKernel:
             
             self.narrative.append(f"mirror {sketch_name} 沿 {axis} {mode}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -1303,17 +1372,21 @@ class MechKernel:
             Solid as B3DSolid, Vector,
         )
         
-        # path vector
-        path_vecs = {
-            "x_axis": Vector(length, 0, 0),
-            "y_axis": Vector(0, length, 0),
-            "z_axis": Vector(0, 0, length),
+        # v1.16 修复：path → 草绘平面（profile 垂直于路径，extrude 沿平面法向 = 路径方向）
+        # 注：build123d extrude(dir=...) 要求 dir 不平行于面局部 x 轴，圆形 profile 沿 X 会崩，
+        # 因此改为按路径选平面 + 普通 extrude(amount)。
+        path_planes = {
+            "x_axis": Plane.YZ,
+            "y_axis": Plane.XZ,
+            "z_axis": Plane.XY,
         }
-        if path not in path_vecs:
+        if path not in path_planes:
             raise InvalidRequestError(f"path '{path}' 不支持（x_axis/y_axis/z_axis）")
         
         with Transaction(self, "sweep") as txn:
+            entry = self._record_history("sweep", profile_sketch=profile_sketch, path=path, length=length, name=name)
             feature_id = next_feature_id()
+            entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SWEEP,
                 parameters={"profile_sketch": profile_sketch, "path": path, "length": length, "name": name},
@@ -1322,19 +1395,20 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
-            # BuildPart + BuildSketch + extrude(face, dir=vec)
-            with BuildPart(Plane.XY) as bp:
-                with BuildSketch() as s:
+            # BuildPart + BuildSketch + extrude（沿平面法向 = 路径方向）
+            # 注意：BuildSketch 必须显式传平面，否则默认落在 XY（build123d 行为）
+            with BuildPart(path_planes[path]) as bp:
+                with BuildSketch(path_planes[path]) as s:
                     add(B3DCircle(r))
-                # build123d extrude 沿 dir 矢量
                 from build123d import extrude as b3d_extrude
-                b3d_extrude(amount=length)  # 简化：amount = length
+                b3d_extrude(amount=length)
             
             new_solid = bp.part
             if self._current_geometry is None:
                 self._current_geometry = new_solid
             self.narrative.append(f"sweep {profile_sketch} 沿 {path} 长 {length}")
             txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"
         render_png = None
@@ -1363,14 +1437,21 @@ class MechKernel:
         if what not in ("bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"):
             raise InvalidRequestError(f"what 必须是 bounding_box/volume/centroid/face_count/edge_count/vertex_count（当前 {what}）")
         
-        # 选几何
+        # 选几何（v1.16 修复：支持 feature_id 目标 → 该 feature 完成时的几何）
+        warning = None
         if target == "_current_geometry":
             geom = self._current_geometry
-        else:
-            geom = self._current_geometry
+        elif target in self._feature_geometries:
+            geom = self._feature_geometries[target]
             if geom is None:
-                raise InvalidRequestError(f"目标 {target} 不存在（当前几何为空）")
-        
+                geom = self._current_geometry
+                warning = f"feature {target} 无几何记录，回退到当前几何"
+        elif target in self.feature_graph.nodes:
+            geom = self._feature_geometries.get(target) or self._current_geometry
+            warning = f"feature {target} 无几何记录，回退到当前几何"
+        else:
+            raise InvalidRequestError(f"目标 {target} 不存在（未知 feature，仅支持 _current_geometry 或已记录几何的 feature_id）")
+
         if geom is None:
             raise InvalidRequestError("query 需要先有几何")
         
@@ -1469,6 +1550,8 @@ class MechKernel:
         result.value = result_value
         result.target = target
         result.what = what
+        if warning:
+            result.warning = warning
         return result
     
     def select(self, filter_type: str = "all", face_index: int = None) -> "StepResult":
@@ -1528,6 +1611,7 @@ class MechKernel:
             "total": sum(type_count.values()),
             "by_type": type_count,
             "selected": all_faces,
+            "note": "select 返回面类型与索引元数据（描述性筛选用）；v2.0 前不可直接回喂给 fillet/chamfer/shell 作为实体引用",
         }
         if face_index is not None and 0 <= face_index < len(all_faces):
             result_value["specific"] = all_faces[face_index]
@@ -1572,13 +1656,23 @@ class MechKernel:
         import math
         import re
         
+        def _resolve_shape(target):
+            '''v1.16 修复：feature_id / current 统一解析为几何对象'''
+            if target in ("current", "_current_geometry"):
+                return self._current_geometry
+            if target in self._feature_geometries:
+                geom = self._feature_geometries[target]
+                if geom is not None:
+                    return geom
+            raise InvalidRequestError(
+                f"measure 目标 {target} 无法解析（支持 current / _current_geometry / 已记录几何的 feature_id）"
+            )
+
         def get_center(target):
-            if target == "current" or target == "_current_geometry":
-                shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
-            else:
-                shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            shape = _resolve_shape(target)
             if shape is None:
                 raise InvalidRequestError("measure 需要先有几何")
+            shape = shape.wrapped if hasattr(shape, 'wrapped') else shape
             bbox = Bnd_Box()
             exp = TopExp_Explorer(shape, TopAbs_SOLID)
             if exp.More():
@@ -1588,9 +1682,10 @@ class MechKernel:
                 (bbox.CornerMin().Y() + bbox.CornerMax().Y()) / 2,
                 (bbox.CornerMin().Z() + bbox.CornerMax().Z()) / 2,
             )
-        
+
         def get_volume(target):
-            shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            shape = _resolve_shape(target)
+            shape = shape.wrapped if hasattr(shape, 'wrapped') else shape
             props = GProp_GProps()
             exp = TopExp_Explorer(shape, TopAbs_SOLID)
             v = 0.0
@@ -1599,9 +1694,10 @@ class MechKernel:
                 v += props.Mass()
                 exp.Next()
             return v
-        
+
         def get_area(target):
-            shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
+            shape = _resolve_shape(target)
+            shape = shape.wrapped if hasattr(shape, 'wrapped') else shape
             props = GProp_GProps()
             exp = TopExp_Explorer(shape, TopAbs_FACE)
             a = 0.0
@@ -1612,7 +1708,7 @@ class MechKernel:
             return a
         
         def parse_coord(s):
-            m = re.match(r'\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)', s)
+            m = re.match(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', s)
             if m:
                 return float(m.group(1)), float(m.group(2)), float(m.group(3))
             return None
@@ -1650,22 +1746,36 @@ class MechKernel:
         """
         start = time.time()
         self._step_counter += 1
-        # 简化：只从 graph 移除并 narrative 记录
-        # 不重新计算 _current_geometry（避免 OCC 多次 boolean 累加误差）
-        if feature_id in self.feature_graph.nodes:
-            # 标记 removed
-            self.narrative.append(f"delete_feature {feature_id}（v1.14 简化版：只移除历史记录）")
-            result = make_success(
-                feature_id=f"D_{self._step_counter:03d}",
-                narrative=f"delete {feature_id}",
+        idx = self._find_history_index(feature_id)
+        if idx is None:
+            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
+        if self._has_non_replayable_op:
+            return make_failure(
+                error="会话包含导入/加载操作，delete_feature 重放不可用（会丢失导入几何）",
+                error_kind="RECOVERABLE",
+                suggestion={"action": "新建会话后重新建模，或先导出 STEP 再导入到新会话"},
                 current_narrative=self.narrative.copy(),
-                feature_graph_delta={"deleted": [feature_id]},
                 elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
             )
-            result.value = {"deleted": feature_id, "note": "v1.14 简化：仅移除 history，geometry 不重算"}
-            return result
-        raise InvalidRequestError(f"feature {feature_id} 不存在")
+
+        with Transaction(self, "delete_feature") as txn:
+            # v2.0：只删目标 entry + 全量重放（独立后续保留，SW 式）。
+            # 若后续 op 真依赖被删特征（如 delete 基座后 add/cut 无几何），重放失败 → 整体回滚并报错。
+            del self._op_history[idx]
+            self._replay()
+            txn.commit()
+
+        result = make_success(
+            feature_id=f"D_{self._step_counter:03d}",
+            narrative=f"delete {feature_id}（重放 {len(self._op_history)} 个 op）",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"deleted": [feature_id], "replayed": True},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {"deleted": feature_id, "replayed_ops": len(self._op_history), "geometry_recomputed": True}
+        return result
     
     def update_feature(self, feature_id: str, new_params: dict) -> "StepResult":
         """
@@ -1677,19 +1787,77 @@ class MechKernel:
         """
         start = time.time()
         self._step_counter += 1
-        # 简化：更新 narrative + 返回 ok，不真正修改几何
-        if feature_id not in self.feature_graph.nodes:
-            raise InvalidRequestError(f"feature {feature_id} 不存在")
-        self.narrative.append(f"update_feature {feature_id} -> {new_params}（v1.15 简化：仅记录）")
+        idx = self._find_history_index(feature_id)
+        if idx is None:
+            raise InvalidRequestError(f"feature {feature_id} 不存在（无可重放的历史记录）")
+        if self._has_non_replayable_op:
+            return make_failure(
+                error="会话包含导入/加载操作，update_feature 重放不可用（会丢失导入几何）",
+                error_kind="RECOVERABLE",
+                suggestion={"action": "新建会话后重新建模"},
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+
+        entry = self._op_history[idx]
+        op = entry["op"]
+        merged = dict(entry["args"])
+        merged.update(new_params)
+        cap = self.cap.get(op)
+        if cap is None:
+            raise KernelBugError(f"op {op} 无 schema，无法校验 update 参数")
+        ok, err = cap.validate_inputs(merged)
+        if not ok:
+            raise InvalidRequestError(f"update_feature 参数校验失败: {err}")
+
+        with Transaction(self, "update_feature") as txn:
+            # v2.0：更新历史参数 + 全量重放 → 真实重算几何
+            entry["args"] = merged
+            self._replay()
+            txn.commit()
+
         result = make_success(
             feature_id=f"U_{self._step_counter:03d}",
-            narrative=f"update {feature_id}",
+            narrative=f"update {feature_id}（重放 {len(self._op_history)} 个 op）",
             current_narrative=self.narrative.copy(),
-            feature_graph_delta={"updated": [feature_id, new_params]},
+            feature_graph_delta={"updated": [feature_id, new_params], "replayed": True},
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         )
-        result.value = {"updated": feature_id, "new_params": new_params, "note": "v1.15 简化：仅记录，不重算"}
+        result.value = {"updated": feature_id, "new_params": merged, "geometry_recomputed": True}
+        return result
+
+    def rebuild(self, name: str = "") -> StepResult:
+        """v2.0 公共 op：按 op_history 全量重放，真实重建几何"""
+        start = time.time()
+        if self._has_non_replayable_op:
+            self._step_counter += 1
+            return make_failure(
+                error="会话包含导入/加载操作，参数化重放不可用（会丢失导入几何）",
+                error_kind="RECOVERABLE",
+                suggestion={"action": "新建会话后重新建模，或先导出 STEP 再导入到新会话"},
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+        with Transaction(self, "rebuild") as txn:
+            self._replay()
+            txn.commit()
+
+        feature_count = len(self.feature_graph.nodes)
+        vol = 0.0
+        if self._current_geometry is not None:
+            vol = self.query("_current_geometry", "volume").value  # OCP GProp（build123d 属性不是方法，inspector 读不到）
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"rebuild_{self._step_counter:03d}",
+            narrative=f"rebuild：重放 {len(self._op_history)} 个 op",
+            current_narrative=self.narrative.copy(),
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {"replayed_ops": len(self._op_history), "feature_count": feature_count, "volume": vol}
         return result
     
     def export(self, path: str, format: str = "step") -> StepResult:
@@ -1778,6 +1946,8 @@ class MechKernel:
             
             self.narrative.append(f"导入 STEP ← {path}")
             txn.commit()
+            self._has_non_replayable_op = True  # v2.0: 导入几何不可重放
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"  # v1.5.2: 简单 import 用 iso
         render_png = None
@@ -1868,6 +2038,8 @@ class MechKernel:
             
             self.narrative.append(f"加载项目 ← {base_path}")
             txn.commit()
+            self._has_non_replayable_op = True  # v2.0: 加载项目不可重放
+            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"  # v1.5.4: 简单 load 用 iso
         render_png = None
@@ -1959,6 +2131,10 @@ class MechKernel:
             "workplane_by_name": dict(self.workplanes._by_name) if hasattr(self.workplanes, "_by_name") else {},
             "narrative": list(self.narrative),
             "geometry_revision": self._geometry_revision,
+            "geometry": self._geometry_internal,
+            "feature_geometries": dict(self._feature_geometries),
+            "op_history": copy.deepcopy(self._op_history),
+            "has_non_replayable_op": self._has_non_replayable_op,
         }
     
     def _restore(self, snap: Dict) -> None:
@@ -1970,9 +2146,12 @@ class MechKernel:
             self.workplanes._by_name = dict(snap.get("workplane_by_name", {}))
         # 恢复 narrative 到快照时刻（undo 撤销之前的状态）
         self.narrative = list(snap["narrative"])
-        # P0-V1 修复：undo 后清空 _current_geometry（OCC Part 不可序列化）
-        # 否则 undo 后 _current_geometry 仍是旧对象，state 和视觉不一致
-        self._geometry_internal = None
+        # v1.16 修复：undo/redo 恢复几何对象引用（进程内快照），不再清空模型。
+        # OCC Part 不可序列化，但快照仅用于进程内 undo/redo，保留引用即可。
+        self._geometry_internal = snap.get("geometry")
+        self._feature_geometries = dict(snap.get("feature_geometries", {}))
+        self._op_history = list(snap.get("op_history", []))
+        self._has_non_replayable_op = snap.get("has_non_replayable_op", False)
         # P0-3 修复：undo 后 bump revision（让 renderer 缓存失效）
         self._geometry_revision += 1
         self.renderer.clear_cache()  # undo 后清缓存
@@ -1980,6 +2159,49 @@ class MechKernel:
     def _bump_geometry_revision(self):
         self._geometry_revision += 1
         self.renderer.clear_cache()
+
+    def _record_history(self, op: str, **kwargs) -> dict:
+        """v2.0: 记录一次 op 调用（重放时跳过）。返回 entry 供回填 feature_id。"""
+        entry = {"op": op, "args": copy.deepcopy(kwargs), "feature_id": None}
+        if not self._replaying:
+            self._op_history.append(entry)
+        return entry
+
+    def _find_history_index(self, feature_id: str) -> Optional[int]:
+        """按 feature_id 在 op 历史中定位（几何特征 F_xxxx / 草图实体 E_xxxx）"""
+        for i, entry in enumerate(self._op_history):
+            if entry.get("feature_id") == feature_id:
+                return i
+        return None
+
+    def _replay(self) -> None:
+        """v2.0 参数化重放：清空状态 + 重置 id + 按 op_history 全量重放（不记录）"""
+        self._replaying = True
+        try:
+            self.feature_graph = FeatureGraph()
+            self.workplanes = WorkplaneRegistry()
+            self.sketches = {}
+            self.naming_resolver = PersistentNamingResolver()
+            self._feature_geometries = {}
+            self._geometry_internal = None
+            self.narrative = []
+            self.semantic_state = {}
+            self._step_counter = 0
+            self._last_render_step = -1
+            reset_all_id_generators()
+            for entry in self._op_history:
+                op = entry["op"]
+                args = dict(entry["args"])
+                method = getattr(self, op, None)
+                if method is None:
+                    raise StateCorruptionError(f"重放失败：op {op} 不存在")
+                result = method(**args)
+                if not getattr(result, "success", True):
+                    raise StateCorruptionError(
+                        f"重放失败 op={op} args={args}: {getattr(result, 'error', 'unknown')}"
+                    )
+        finally:
+            self._replaying = False
     
     def _extrude_build123d(self, sketch, depth: float, mode: str = "new_body", direction: str = "Z"):
         """
@@ -1989,7 +2211,7 @@ class MechKernel:
         """
         try:
             from build123d import (
-                BuildPart, BuildSketch, Plane, add,
+                BuildPart, BuildSketch, Plane, add, Location,
                 Circle as B3DCircle, Rectangle as B3DRect, extrude,
             )
             
@@ -2000,23 +2222,31 @@ class MechKernel:
             # v1.2.1: 方向 → plane
             plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
             
-            # 单个圆 → 圆柱
+            # 单个圆 → 圆柱（v1.16 修复：支持 center 偏移）
             if len(sketch.entities) == 1 and sketch.entities[0].type == "circle":
                 e = sketch.entities[0]
                 r = e.params["radius"]
+                c = e.params.get("center", (0, 0))
                 with BuildPart(plane) as bp:
                     with BuildSketch() as s:
-                        add(B3DCircle(r))
+                        if c == (0, 0) or c == [0, 0]:
+                            add(B3DCircle(r))
+                        else:
+                            add(Location((c[0], c[1], 0)) * B3DCircle(r))
                     extrude(amount=depth)
                 return bp.part
             
-            # 单个矩形 → 立方体
+            # 单个矩形 → 立方体（v1.16 修复：支持 center 偏移）
             if len(sketch.entities) == 1 and sketch.entities[0].type == "rectangle":
                 e = sketch.entities[0]
                 w, h = e.params["width"], e.params["height"]
+                c = e.params.get("center", (0, 0))
                 with BuildPart(plane) as bp:
                     with BuildSketch() as s:
-                        add(B3DRect(w, h))
+                        if c == (0, 0) or c == [0, 0]:
+                            add(B3DRect(w, h))
+                        else:
+                            add(Location((c[0], c[1], 0)) * B3DRect(w, h))
                     extrude(amount=depth)
                 return bp.part
             

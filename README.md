@@ -2,24 +2,24 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-175%2F175-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-210%2F210-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![v1.15](https://img.shields.io/badge/version-v2.1%2Bv1.15-blue)]()
+[![v2.0](https://img.shields.io/badge/version-v2.1%2Bv2.0-blue)]()
 
 ## 概述
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
 **核心能力**：
-- **25/25 op 全部真实实现**（100%）— 覆盖所有 capability registry op
+- **26/26 op 全部真实实现**（100%）— 覆盖所有 capability registry op
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean）
-- Capability Registry (25 op JSON Schema) — LLM 知道"能做什么"
+- Capability Registry (26 op JSON Schema) — LLM 知道"能做什么"
 - 5 类类型化错误 + 事务 Savepoint + 撤销/重做
 - 6 种几何属性查询 + 按类型选面 + 3 种度量
 - DeepSeek Vision (v4-flash-vision-exp) + Chat Planner 端到端集成
-- 175/175 测试全过
+- 210/210 测试全过
 
 ## 🎨 实际产出（端到端真实几何）
 
@@ -111,8 +111,8 @@ k.export('flange.step', format='step')
                        ▼
 ┌────────────────────────────────────────────────────────────┐
 │  MechKernel (本项目)                                         │
-│  - 25 op API（100% 真实实现）                                │
-│  - CapabilityRegistry (25 op + JSON Schema)               │
+│  - 26 op API（100% 真实实现）                                │
+│  - CapabilityRegistry (26 op + JSON Schema)               │
 │  - Feature Graph (DAG) + Persistent Naming                 │
 │  - 事务 Savepoint + 撤销栈                                  │
 │  - 5 类类型化错误                                            │
@@ -129,7 +129,7 @@ k.export('flange.step', format='step')
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 25 op 能力图谱（100% 真实）
+## 26 op 能力图谱（100% 真实）
 
 | 类别 | op | 状态 | 实现 | 备注 |
 |------|----|------|------|------|
@@ -148,17 +148,18 @@ k.export('flange.step', format='step')
 | pattern | circular_pattern | ✅ | N 副本绕轴 | |
 | | linear_pattern | ✅ | 沿 direction 复制 N 份 | |
 | | mirror | ✅ | 沿 X/Y 轴镜像 | |
-| query | **query** | ✅ | **OCC Bnd_Box / GProp** | **v1.11 bbox/volume/centroid/face/edge/vertex** |
+| query | **query** | ✅ | **OCC Bnd_Box / GProp** | **v1.11+ v1.16 支持 feature 目标（当时几何）** |
 | | **select** | ✅ | **BRepAdaptor_Surface 分类** | **v1.12 all/plane/cylinder/cone/sphere/torus** |
-| | **measure** | ✅ | **GProp / BRepGProp** | **v1.13 distance/volume/area** |
+| | **measure** | ✅ | **GProp / BRepGProp** | **v1.13+ v1.16 支持负坐标/feature 目标** |
 | I/O | export STEP | ✅ | 真实 STEPControl_Writer | |
 | | import_step | ✅ | 真实 STEPControl_Reader | |
 | | save_project / load_project | ✅ | STEP + JSON | |
 | 事务 | undo / redo | ✅ | | 嵌套深度限制 10 |
-| 编辑 | **delete_feature** | ✅ | **v1.14 简化版** | **仅记录不重算** |
-| | **update_feature** | ✅ | **v1.15 简化版** | **仅记录不重算** |
+| 编辑 | **delete_feature** | ✅ | **v2.0 参数化重放** | **删历史 entry + 重算几何（独立后续保留）** |
+| | **update_feature** | ✅ | **v2.0 参数化重放** | **改参数 + 重算几何（几何特征/草图实体）** |
+| | **rebuild** | ✅ | **v2.0 参数化重放** | **按 op 历史全量重算几何（显式触发）** |
 
-**真实 op：25/25 = 100%**
+**真实 op：26/26 = 100%**（delete/update/rebuild 走参数化重放，几何真实重算）
 
 ## 版本演进
 
@@ -173,6 +174,8 @@ k.export('flange.step', format='step')
 | + v1.7 | 2025-08-27 | + boolean (union/subtract/intersect) | 175 | 11 |
 | + v1.8-1.10 | 2025-08-27 | + hole + mirror + linear_pattern | 175 | 14 |
 | **+ v1.11-1.15** | **2025-08-27** | **+ query/select/measure/delete_feature/update_feature** | **175** | **25** |
+| **+ v1.16** | **2026-08-27** | **正确性修复：registry schema 对齐 + execute() 全 op 可用 / delete/update 诚实化 / undo 恢复几何 / query/measure 目标与负坐标 / sweep 方向 / extrude 偏移圆** | **193** | **25** |
+| **+ v2.0** | **2026-08-28** | **参数化重放引擎：op 历史 + rebuild 公共 op + delete/update 真实重算（几何特征/草图实体）** | **210** | **26** |
 
 ## 安装
 
@@ -180,8 +183,9 @@ k.export('flange.step', format='step')
 # 清华源（无大小限制）
 pip install build123d==0.11.1 cadquery-ocp-novtk==7.9.3.0 \
     webcolors svgpathtools anytree ezdxf ocpsvg ocp_gordon \
-    trianglesolver ipython sympy scikit-learn lib3mf requests \
+    trianglesolver ipython sympy scikit-learn lib3mf requests matplotlib \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
+# matplotlib 为 renderer 渲染/测试必需
 ```
 
 ## 跑测试
@@ -228,7 +232,8 @@ sys.exit(exit_code)
 
 **距离工业生产 1.0**：~3-5 人月（之前 5-7）
 
-详细评估见 `expert_evaluation.md`。
+> 评估小结：26 op 全部真实实现；参数化重放（v2.0）已落地，delete/update 真实重算；下一步缺口为装配/约束/工程图。
+> 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模。
 
 ## 关键文件
 

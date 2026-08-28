@@ -70,6 +70,7 @@ class StepResult:
     api_name: Optional[str] = None
     planned_version: Optional[str] = None
     hint: Optional[str] = None  # 给 AI 的提示（如"用 PUBLIC_OPS 替代内部方法"）
+    warning: Optional[str] = None  # v1.16: 成功但需注意的事项（如"几何未重算"）
     
     # === 渲染策略（专家 C 方案）===
     render_level: RenderLevel = "none"
@@ -108,6 +109,7 @@ class StepResult:
             "suggestion": self.suggestion,
             "api_name": self.api_name,
             "planned_version": self.planned_version,
+            "warning": self.warning,
             "render_level": self.render_level,
             "has_render": self.has_render(),
             "narrative": self.narrative,
@@ -143,6 +145,7 @@ def make_success(
     next_hints: Optional[List[str]] = None,
     semantic_state: Optional[Dict] = None,
     current_narrative: Optional[List[str]] = None,
+    warning: Optional[str] = None,
     feature_graph_delta: Optional[dict] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
@@ -164,6 +167,7 @@ def make_success(
         next_hints=next_hints or [],
         semantic_state=semantic_state or {},
         feature_graph_delta=feature_graph_delta,
+        warning=warning,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )
@@ -181,6 +185,7 @@ def make_failure(
     api_name: Optional[str] = None,
     planned_version: Optional[str] = None,
     hint: Optional[str] = None,
+    warning: Optional[str] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
 ) -> StepResult:
@@ -207,6 +212,7 @@ def make_failure(
         api_name=api_name,
         planned_version=planned_version,
         hint=hint,
+        warning=warning,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )

@@ -82,6 +82,12 @@ def _run_tests(args):
 
 def main(args=None):
     """pytest.main 兼容"""
+    # v1.16 修复：Windows GBK 控制台打印 ✓/✗ 会 UnicodeEncodeError，强制 UTF-8 输出
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if args is None:
         args = sys.argv[1:] or ["mech_kernel/tests"]
     return _run_tests(args)
