@@ -2,24 +2,34 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-227%2F227-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-v2.4%20constraint%20ready-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.1](https://img.shields.io/badge/version-v2.1%2Bv2.1-blue)]()
+[![v2.4](https://img.shields.io/badge/version-v2.4-blue)]()
 
 ## 概述
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
 **核心能力**：
-- **29/29 op 全部真实实现**（100%）— 覆盖所有 capability registry op
+- **33/33 op 全部真实实现**（100%）— 覆盖所有 capability registry op
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean）
-- Capability Registry (29 op JSON Schema) — LLM 知道"能做什么"
+- Capability Registry (33 op JSON Schema) — LLM 知道"能做什么"
 - 5 类类型化错误 + 事务 Savepoint + 撤销/重做
 - 6 种几何属性查询 + 按类型选面 + 3 种度量
 - OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
-- 227/227 测试全过
+- 二维约束、命名参数、确定性重放、持久化与多视角证据
+
+## v2.4 约束参数化与生产力基准
+
+草图约束支持 `coincident`、`horizontal`、`vertical`、`parallel`、`perpendicular`、`distance`、`radius` 和 `equal`。命名尺寸通过 `set_parameter` 修改后会触发全量历史重放；严格模式失败回滚，`best_effort` 返回冲突和欠约束诊断。
+
+项目保存为 STEP、`graph.json` 和 `history.json`。缺少或校验失败的历史不会覆盖已加载的 STEP 几何，而是返回 `RECOVERABLE`。生产力基准运行：
+
+```text
+python -m benchmarks.run --output reports/v2.4.json
+```
 
 ## 🎨 实际产出（端到端真实几何）
 
@@ -111,8 +121,8 @@ k.export('flange.step', format='step')
                        ▼
 ┌────────────────────────────────────────────────────────────┐
 │  MechKernel (本项目)                                         │
-│  - 29 op API（100% 真实实现）                                │
-│  - CapabilityRegistry (29 op + JSON Schema)               │
+│  - 33 op API（100% 真实实现）                                │
+│  - CapabilityRegistry (33 op + JSON Schema)               │
 │  - Feature Graph (DAG) + Persistent Naming                 │
 │  - 事务 Savepoint + 撤销栈                                  │
 │  - 5 类类型化错误                                            │
@@ -129,7 +139,7 @@ k.export('flange.step', format='step')
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 29 op 能力图谱（100% 真实）
+## 33 op 能力图谱（100% 真实）
 
 | 类别 | op | 状态 | 实现 | 备注 |
 |------|----|------|------|------|
@@ -257,7 +267,7 @@ sys.exit(exit_code)
 
 **距离工业生产 1.0**：~3-5 人月（之前 5-7）
 
-> 评估小结：29 op 全部真实实现；参数化重放（v2.0）+ 剖面 revolve/装配（v2.1）已落地，可建模 CD 喷口并整机装配；下一步缺口为约束求解器与自动工程图。
+> 评估小结：33 op 全部真实实现；参数化重放（v2.0）+ 多视角证据（v2.2）+ 二维约束参数化（v2.4）已落地，可建模 CD 喷口并对命名尺寸做确定性重算；工程图和三维装配约束仍在后续范围。
 > 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模。
 
 ## 关键文件

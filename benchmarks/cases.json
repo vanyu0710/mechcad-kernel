@@ -1,0 +1,28 @@
+{
+  "schema_version": "2.4",
+  "standard_parts": [
+    "flange",
+    "stepped_shaft",
+    "l_bracket",
+    "holed_housing",
+    "patterned_plate"
+  ],
+  "complex_parts": [
+    "rocket_motor_shell",
+    "rocket_nozzle",
+    "rocket_closure",
+    "rocket_assembly"
+  ],
+  "tasks": [
+    "create",
+    "modify_named_dimension",
+    "delete_feature",
+    "rebuild",
+    "save_load",
+    "visual_evidence"
+  ],
+  "tolerances": {
+    "basic_relative_volume": 1e-6,
+    "complex_relative_volume": 1e-4
+  }
+}

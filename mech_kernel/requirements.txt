@@ -5,7 +5,9 @@ build123d>=0.8.0
 # 几何指标 + 渲染
 trimesh>=4.0.0
 numpy>=1.24.0
+scipy>=1.10.0
 Pillow>=10.0.0
+requests>=2.31.0
 
 # 可视化（如果需要 matplotlib 渲染）
-# matplotlib>=3.7.0
+matplotlib>=3.7.0

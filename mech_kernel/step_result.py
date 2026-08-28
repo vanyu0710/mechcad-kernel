@@ -78,6 +78,7 @@ class StepResult:
     render_base64: Optional[str] = None
     render_views: Optional[Dict[str, bytes]] = None  # full 时 4 视角
     evidence_manifest: Optional[dict] = None  # v2.3: 投影、截面、预算与图像指纹
+    constraint_diagnostics: Optional[dict] = None  # v2.4: 草图求解状态
     
     # === 结构化数据（默认必有）===
     geometry_summary: Optional[GeometrySummary] = None
@@ -115,6 +116,7 @@ class StepResult:
             "has_render": self.has_render(),
             "views": list(self.render_views.keys()) if self.render_views else [],
             "evidence_manifest": self.evidence_manifest,
+            "constraint_diagnostics": self.constraint_diagnostics,
             "narrative": self.narrative,
             "hints": self.next_hints,
             "geometry_summary": self.geometry_summary.to_dict() if self.geometry_summary else None,
@@ -149,6 +151,7 @@ def make_success(
     semantic_state: Optional[Dict] = None,
     current_narrative: Optional[List[str]] = None,
     warning: Optional[str] = None,
+    constraint_diagnostics: Optional[dict] = None,
     feature_graph_delta: Optional[dict] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
@@ -171,6 +174,7 @@ def make_success(
         semantic_state=semantic_state or {},
         feature_graph_delta=feature_graph_delta,
         warning=warning,
+        constraint_diagnostics=constraint_diagnostics,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )
@@ -189,6 +193,7 @@ def make_failure(
     planned_version: Optional[str] = None,
     hint: Optional[str] = None,
     warning: Optional[str] = None,
+    constraint_diagnostics: Optional[dict] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
 ) -> StepResult:
@@ -216,6 +221,7 @@ def make_failure(
         planned_version=planned_version,
         hint=hint,
         warning=warning,
+        constraint_diagnostics=constraint_diagnostics,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )

@@ -10,7 +10,7 @@
 **MechKernel** 是一个为 AI CAD 设计的"语义几何内核"。
 
 它把脆弱的 `build123d` / `trimesh` 调用，包装成对 LLM 友好的**原子 API**：
-- ✅ **30 个公共操作**（草图、实体、细节、复用、查询、编辑、装配与可视化）
+- ✅ **33 个公共操作**（草图、实体、细节、复用、查询、编辑、装配、约束与可视化）
 - ✅ **5 类类型化错误**（INVALID_REQUEST / KERNEL_BUG / STATE_CORRUPTION / GEOMETRY_FAILURE / RECOVERABLE / NOT_IMPLEMENTED）
 - ✅ **事务 Savepoint**（失败整体回滚，可独立撤销）
 - ✅ **Feature Graph DAG**（持久化命名 + 增量循环检测）
@@ -19,6 +19,8 @@
 - ✅ **AI 截面与转台视图**（真实几何半空间切割，不改变模型）
 - ✅ **视觉证据包**（正交投影、固定像素预算、图像哈希与截面 manifest）
 - ✅ **三态拓扑检查**（valid / invalid / unknown，不伪造 False）
+- ✅ **二维约束参数化**（SciPy 确定性求解、命名尺寸、冲突诊断与历史重放）
+- ✅ **完整项目持久化与生产力基准**（STEP + graph/history JSON）
 
 **核心创新**：每个 API 调用的结果（`StepResult`）包含 `success / error_kind / error / hint / suggestion / geometry_summary / render_png / next_hints`，让 LLM 拿到**可决策的反馈**。
 
@@ -40,7 +42,7 @@
                     │ kernel.execute(op, **args)
                     ▼
 ┌─────────────────────────────────────────────────────┐
-│ L3: MechKernel  ← 30 个公共 API + capability registry│
+│ L3: MechKernel  ← 33 个公共 API + capability registry│
 │     5 类错误 / 事务 / 撤销栈 / 几何缓存              │
 └───────────────────┬─────────────────────────────────┘
                     │ build123d 调用（v1.1 用 MockBox 占位）
@@ -74,9 +76,9 @@
 | **编辑** | `undo` / `redo` / `delete_feature` / `update_feature` / `rebuild` / `export` | ✅ 参数化重放 |
 | **可视化** | `render` | ✅ 多视图、转台、标注、真实截面 |
 
-`delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/加载/装配会话保留外部几何，因此重放返回 `RECOVERABLE`。
+`delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/装配以及缺少有效 history.json 的旧项目保留外部几何，因此重放返回 `RECOVERABLE`。完整的 v2.4 history.json 加载成功后仍可在当前会话重放。
 
-### Visual Evidence（v2.3）
+### Visual Evidence（v2.3+）
 
 `render` 生成的是给 AI 验证的工程证据包，不是调试截图：所有视图采用正交投影、无坐标轴和网格，并将拼图限制在请求的 `size` 像素预算内。结果含 `evidence_manifest`，记录投影、截面、bbox、布局和每张图的 SHA-256 指纹。
 
@@ -156,7 +158,7 @@ r = k.execute('add_circle', sketch_name='sk_1', center=(0, 0), radius=5)
 ```
 
 **特性**：
-- 自动注册（30 个公共 op 都有 schema）
+- 自动注册（33 个公共 op 都有 schema）
 - JSON Schema 风格（type / required / min / max / enum / length）
 - LLM 友好的 op 描述（含 `examples` Few-shot）
 - 权限分级（`public` / `read` / `internal`）
@@ -333,6 +335,9 @@ mech_kernel/
 ├── geometry_inspector.py         # BRep 指标 + 三态拓扑
 ├── renderer.py                   # matplotlib 多视图/拼图 + LRU + 异常隔离
 ├── adaptive_renderer.py          # C 方案策略
+├── constraint_solver.py          # v2.4 二维约束求解器
+├── sketch_renderer.py            # 草图约束证据图
+├── benchmarks/                   # 生产力基准运行器
 ├── ai_orchestrator.py            # PlannerAction + MockPlanner + run_loop
 ├── capability_registry.py        # v1.1.1 自动注册 + JSON Schema
 ├── _pytest_compat.py             # 无 pytest 环境兼容层

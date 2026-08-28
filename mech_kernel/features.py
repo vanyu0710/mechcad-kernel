@@ -51,6 +51,15 @@ class FeatureState(str, Enum):
     SUPPRESSED = "suppressed"
 
 
+class ConstraintStatus(str, Enum):
+    """状态由草图求解器计算，不代表约束本身的类型。"""
+    SOLVED = "solved"
+    UNDER_CONSTRAINED = "under_constrained"
+    OVER_CONSTRAINED = "over_constrained"
+    CONFLICT = "conflict"
+    NOT_SOLVED = "not_solved"
+
+
 # Topology-changing operations（决定是否必渲染）
 TOPOLOGY_CHANGING_OPS = frozenset({
     FeatureType.EXTRUDE,
@@ -128,13 +137,51 @@ class SketchEntity:
 
 
 @dataclass
+class Constraint:
+    """二维草图约束，references 使用稳定的实体 ID 而不是数组索引。"""
+    id: str
+    type: str
+    references: List[Dict[str, Any]] = field(default_factory=list)
+    value: Optional[float] = None
+    parameter_name: str = ""
+    name: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "references": self.references,
+            "value": self.value,
+            "parameter_name": self.parameter_name,
+            "name": self.name,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Constraint":
+        return Constraint(
+            id=data["id"],
+            type=data["type"],
+            references=list(data.get("references", [])),
+            value=data.get("value"),
+            parameter_name=data.get("parameter_name", ""),
+            name=data.get("name", ""),
+        )
+
+
+@dataclass
 class Sketch:
     """草图数据（M0 阶段，物理几何单独存放）"""
     id: str
     name: str
     workplane_name: str
     entities: List[SketchEntity] = field(default_factory=list)
+    constraints: List[Constraint] = field(default_factory=list)
     closed: bool = False
+    solver_status: ConstraintStatus = ConstraintStatus.NOT_SOLVED
+    dof: int = 0
+    conflicting_constraints: List[str] = field(default_factory=list)
+    solver_residual: float = 0.0
+    solver_iterations: int = 0
     _build123d_object: Optional[Any] = field(default=None, repr=False, compare=False)
     
     def add_entity(self, entity: "SketchEntity") -> None:
@@ -146,7 +193,13 @@ class Sketch:
             "name": self.name,
             "workplane_name": self.workplane_name,
             "entities": [{"id": e.id, "type": e.type, "params": e.params, "name": e.name} for e in self.entities],
+            "constraints": [c.to_dict() for c in self.constraints],
             "closed": self.closed,
+            "solver_status": self.solver_status.value if hasattr(self.solver_status, "value") else str(self.solver_status),
+            "dof": self.dof,
+            "conflicting_constraints": list(self.conflicting_constraints),
+            "solver_residual": self.solver_residual,
+            "solver_iterations": self.solver_iterations,
         }
     
     @staticmethod
@@ -154,6 +207,17 @@ class Sketch:
         sk = Sketch(id=d["id"], name=d["name"], workplane_name=d["workplane_name"], closed=d.get("closed", False))
         for e in d.get("entities", []):
             sk.entities.append(SketchEntity(id=e["id"], type=e["type"], params=e.get("params", {}), name=e.get("name", "")))
+        for c in d.get("constraints", []):
+            sk.constraints.append(Constraint.from_dict(c))
+        status = d.get("solver_status", ConstraintStatus.NOT_SOLVED.value)
+        try:
+            sk.solver_status = ConstraintStatus(status)
+        except ValueError:
+            sk.solver_status = ConstraintStatus.NOT_SOLVED
+        sk.dof = int(d.get("dof", 0))
+        sk.conflicting_constraints = list(d.get("conflicting_constraints", []))
+        sk.solver_residual = float(d.get("solver_residual", 0.0))
+        sk.solver_iterations = int(d.get("solver_iterations", 0))
         return sk
 
 
@@ -234,6 +298,7 @@ _feat_id_gen = _IdGenerator("F")
 _sketch_id_gen = _IdGenerator("SK")
 _workplane_id_gen = _IdGenerator("WP")
 _entity_id_gen = _IdGenerator("E")
+_constraint_id_gen = _IdGenerator("C")
 
 
 def next_feature_id() -> str:
@@ -252,13 +317,34 @@ def next_entity_id() -> str:
     return _entity_id_gen.next()
 
 
+def next_constraint_id() -> str:
+    return _constraint_id_gen.next()
+
+
 def reset_all_id_generators():
     """重置所有 ID 生成器（用于测试和 undo）"""
-    global _feat_id_gen, _sketch_id_gen, _workplane_id_gen, _entity_id_gen
+    global _feat_id_gen, _sketch_id_gen, _workplane_id_gen, _entity_id_gen, _constraint_id_gen
     _feat_id_gen = _IdGenerator("F")
     _sketch_id_gen = _IdGenerator("SK")
     _workplane_id_gen = _IdGenerator("WP")
     _entity_id_gen = _IdGenerator("E")
+    _constraint_id_gen = _IdGenerator("C")
+
+
+def seed_id_generators_from_history(history: list) -> None:
+    """Seed replay IDs so histories created after another kernel stay stable."""
+    import re
+    first_seen = {}
+    for entry in history:
+        value = entry.get("feature_id") if isinstance(entry, dict) else None
+        if not isinstance(value, str):
+            continue
+        match = re.match(r"^(F|E|C)_(\d+)$", value)
+        if match and match.group(1) not in first_seen:
+            first_seen[match.group(1)] = int(match.group(2)) - 1
+    generators = {"F": _feat_id_gen, "E": _entity_id_gen, "C": _constraint_id_gen}
+    for prefix, counter in first_seen.items():
+        generators[prefix].counter = max(0, counter)
 
 
 # ============================================================

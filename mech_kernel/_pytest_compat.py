@@ -52,7 +52,7 @@ def _run_tests(args):
                             print(f"  ✗ 加载 {mod_name} 失败: {e}")
                             traceback.print_exc()
         elif os.path.isfile(arg):
-            mod_name = arg[:-3].replace(os.sep, ".")
+            mod_name = arg[:-3].replace("\\", ".").replace("/", ".")
             mod = importlib.import_module(mod_name)
             for name in dir(mod):
                 if name.startswith("test_") and callable(getattr(mod, name)):

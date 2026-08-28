@@ -23,10 +23,11 @@ from .capability_registry import (
 )
 from .features import (
     FeatureType, FeatureState, FeatureNode, Sketch, SketchEntity,
-    Reference, TOPOLOGY_CHANGING_OPS, NON_RENDERING_OPS,
+    Constraint, ConstraintStatus, Reference, TOPOLOGY_CHANGING_OPS, NON_RENDERING_OPS,
     next_feature_id, next_sketch_id, next_workplane_id, next_entity_id,
-    reset_all_id_generators
+    next_constraint_id, reset_all_id_generators, seed_id_generators_from_history
 )
+from .constraint_solver import SUPPORTED_CONSTRAINTS, solve_sketch as solve_sketch_constraints, validate_constraint
 from .feature_graph import FeatureGraph
 from .workplane import Workplane, WorkplaneType, WorkplaneRegistry
 from .persistent_naming import PersistentNamingResolver, PersistentName
@@ -49,6 +50,7 @@ PUBLIC_OPS = frozenset({
     "query", "select", "measure",
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
     "add_polyline", "add_arc", "assemble", "render",
+    "add_constraint", "set_parameter", "solve_sketch",
 })
 
 
@@ -72,6 +74,8 @@ class MechKernel:
         self._op_history: List[Dict] = []  # v2.0: op 历史（参数化重放数据源）
         self._replaying: bool = False  # v2.0: 重放中（禁止再记录）
         self._has_non_replayable_op: bool = False  # v2.0: 会话含导入/加载，禁止重放
+        self._parameters: Dict[str, float] = {}  # v2.4: 命名尺寸参数
+        self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_render_base64: Optional[str] = None
         self._last_render_views: Dict[str, bytes] = {}
         self.geometry_inspector = GeometryInspector()
@@ -262,10 +266,20 @@ class MechKernel:
                        "section": FieldSchema(type="dict", required=False),
                        "turntable": FieldSchema(type="boolean", required=False, default=False),
                        "intent": FieldSchema(type="enum", required=False, default="inspect",
-                                             enum=["inspect", "section", "feature_zoom", "delta"]),
+                                             enum=["inspect", "section", "feature_zoom", "delta", "sketch"]),
                        "target": FieldSchema(type="string", required=False,
                                              description="feature_zoom/delta 的 feature_id"),
                        "name": FieldSchema(type="string", required=False)},
+            "add_constraint": {"sketch_name": FieldSchema(type="string", required=True),
+                                "constraint_type": FieldSchema(type="enum", required=True, enum=sorted(SUPPORTED_CONSTRAINTS)),
+                                "references": FieldSchema(type="list", required=True),
+                                "value": FieldSchema(type="number", required=False, min=0.000001),
+                                "parameter_name": FieldSchema(type="string", required=False),
+                                "name": FieldSchema(type="string", required=False)},
+            "set_parameter": {"name": FieldSchema(type="string", required=True),
+                               "value": FieldSchema(type="number", required=True, min=0.000001)},
+            "solve_sketch": {"sketch_name": FieldSchema(type="string", required=True),
+                              "mode": FieldSchema(type="enum", required=False, default="strict", enum=["strict", "best_effort"])},
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
@@ -282,7 +296,7 @@ class MechKernel:
     def create_workplane(self, name: str, type: str = "XY", **kwargs) -> StepResult:
         start = time.time()
         name = require_non_empty_str("name", name)
-        type = require_in("type", type, ["XY", "YZ", "XZ", "face", "custom"])
+        type = require_in("type", type, ["XY", "YZ", "XZ", "custom"])
         if self.workplanes.has_name(name):
             raise InvalidRequestError(f"工作平面 {name} 已存在")
         
@@ -349,6 +363,7 @@ class MechKernel:
                 name=name or f"circle_{entity_id}",
             )
             sk.add_entity(entity)
+            diagnostic = self._solve_sketch_state(sketch_name, mode="strict") if sk.constraints else None
             self.narrative.append(f"草图 {sketch_name} 添加圆 半径 {radius}")
             txn.commit()
         
@@ -357,6 +372,7 @@ class MechKernel:
             feature_id=entity_id, narrative=f"画圆 r={radius}",
             current_narrative=self.narrative.copy(),
             render_level="none",
+            constraint_diagnostics=diagnostic,
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -372,21 +388,25 @@ class MechKernel:
         if self.sketches[sketch_name].closed:
             raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
         sk = self.sketches[sketch_name]
-        entry = self._record_history("add_rectangle", sketch_name=sketch_name, width=width, height=height, center=center, name=name)
-        entity_id = next_entity_id()
-        entry["feature_id"] = entity_id
-        entity = SketchEntity(
-            id=entity_id, type="rectangle",
-            params={"width": float(width), "height": float(height), "center": tuple(center)},
-            name=name or f"rect_{entity_id}",
-        )
-        sk.add_entity(entity)
-        self.narrative.append(f"草图 {sketch_name} 添加矩形 {width}x{height}")
+        with Transaction(self, "add_rectangle") as txn:
+            entry = self._record_history("add_rectangle", sketch_name=sketch_name, width=width, height=height, center=center, name=name)
+            entity_id = next_entity_id()
+            entry["feature_id"] = entity_id
+            entity = SketchEntity(
+                id=entity_id, type="rectangle",
+                params={"width": float(width), "height": float(height), "center": tuple(center)},
+                name=name or f"rect_{entity_id}",
+            )
+            sk.add_entity(entity)
+            diagnostic = self._solve_sketch_state(sketch_name, mode="strict") if sk.constraints else None
+            self.narrative.append(f"草图 {sketch_name} 添加矩形 {width}x{height}")
+            txn.commit()
         self._step_counter += 1
         return self._wrap_step_result(make_success(
             feature_id=entity_id, narrative=f"画矩形 {width}x{height}",
             current_narrative=self.narrative.copy(),
             render_level="none",
+            constraint_diagnostics=diagnostic,
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -401,21 +421,25 @@ class MechKernel:
         if self.sketches[sketch_name].closed:
             raise InvalidRequestError(f"草图 {sketch_name} 已关闭")
         sk = self.sketches[sketch_name]
-        entry = self._record_history("add_line", sketch_name=sketch_name, start=start, end=end)
-        entity_id = next_entity_id()
-        entry["feature_id"] = entity_id
-        entity = SketchEntity(
-            id=entity_id, type="line",
-            params={"start": tuple(start), "end": tuple(end)},
-            name=f"line_{entity_id}",
-        )
-        sk.add_entity(entity)
-        self.narrative.append(f"草图 {sketch_name} 添加直线")
+        with Transaction(self, "add_line") as txn:
+            entry = self._record_history("add_line", sketch_name=sketch_name, start=start, end=end)
+            entity_id = next_entity_id()
+            entry["feature_id"] = entity_id
+            entity = SketchEntity(
+                id=entity_id, type="line",
+                params={"start": tuple(start), "end": tuple(end)},
+                name=f"line_{entity_id}",
+            )
+            sk.add_entity(entity)
+            diagnostic = self._solve_sketch_state(sketch_name, mode="strict") if sk.constraints else None
+            self.narrative.append(f"草图 {sketch_name} 添加直线")
+            txn.commit()
         self._step_counter += 1
         return self._wrap_step_result(make_success(
             feature_id=entity_id, narrative="画线",
             current_narrative=self.narrative.copy(),
             render_level="none",
+            constraint_diagnostics=diagnostic,
             elapsed_ms=(time.time() - start_t) * 1000,
             step_index=self._step_counter,
         ))
@@ -483,6 +507,168 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
+
+    def _solve_sketch_state(self, sketch_name: str, mode: str = "strict") -> dict:
+        """Solve one sketch and store its compact diagnostic on the sketch."""
+        mode = require_in("mode", mode, ["strict", "best_effort"])
+        sketch = self.sketches.get(sketch_name)
+        if sketch is None:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        solved = solve_sketch_constraints(sketch, self._parameters)
+        diagnostic = solved.to_dict(sketch_name, len(sketch.constraints))
+        sketch.solver_status = solved.status
+        sketch.dof = solved.dof
+        sketch.conflicting_constraints = list(solved.conflicting_constraints)
+        sketch.solver_residual = solved.residual
+        sketch.solver_iterations = solved.iterations
+        if mode == "strict" and solved.status in (ConstraintStatus.CONFLICT, ConstraintStatus.OVER_CONSTRAINED):
+            raise InvalidRequestError(
+                f"草图 {sketch_name} 约束无法满足: {solved.status.value} {solved.conflicting_constraints}",
+                hint="使用 best_effort 查看诊断，或修改/删除冲突约束",
+            )
+        return diagnostic
+
+    def add_constraint(
+        self,
+        sketch_name: str,
+        constraint_type: str,
+        references: list,
+        value: float = None,
+        parameter_name: str = "",
+        name: str = "",
+    ) -> StepResult:
+        """Add a stable-ID 2-D constraint and solve the owning sketch."""
+        start = time.time()
+        sketch_name = require_non_empty_str("sketch_name", sketch_name)
+        constraint_type = require_non_empty_str("constraint_type", constraint_type)
+        if not isinstance(parameter_name, str):
+            raise InvalidRequestError("parameter_name 必须是字符串")
+        parameter_name = parameter_name.strip()
+        if sketch_name not in self.sketches:
+            raise InvalidRequestError(f"草图 {sketch_name} 不存在")
+        if self.sketches[sketch_name].closed:
+            raise InvalidRequestError(f"草图 {sketch_name} 已关闭，不能添加约束")
+        if not isinstance(references, list):
+            raise InvalidRequestError("references 必须是列表")
+        entity_ids = {entity.id for entity in self.sketches[sketch_name].entities}
+        for ref in references:
+            if not isinstance(ref, dict):
+                raise InvalidRequestError("每个引用必须是对象")
+            if ref.get("entity_id") not in entity_ids:
+                raise InvalidRequestError(f"实体不存在: {ref.get('entity_id')}")
+
+        with Transaction(self, "add_constraint") as txn:
+            if parameter_name:
+                replay_value = (
+                    self._replay_parameter_overrides.get(parameter_name)
+                    if self._replaying and self._replay_parameter_overrides
+                    else None
+                )
+                if replay_value is not None:
+                    value = float(replay_value)
+                    self._parameters[parameter_name] = value
+                if value is None and parameter_name not in self._parameters:
+                    raise InvalidRequestError("新参数必须同时提供 value")
+                if value is not None:
+                    value = require_positive("value", value)
+                    existing = self._parameters.get(parameter_name)
+                    if existing is not None and abs(existing - value) > 1e-9:
+                        raise InvalidRequestError(f"参数 {parameter_name} 已存在且数值冲突")
+                    self._parameters[parameter_name] = value
+                value = self._parameters.get(parameter_name, value)
+            if constraint_type in ("distance", "radius"):
+                value = require_positive("value", value)
+            validate_constraint(constraint_type, references, value)
+            entry = self._record_history(
+                "add_constraint", sketch_name=sketch_name, constraint_type=constraint_type,
+                references=references, value=value, parameter_name=parameter_name, name=name,
+            )
+            constraint_id = next_constraint_id()
+            entry["feature_id"] = constraint_id
+            constraint = Constraint(
+                id=constraint_id, type=constraint_type, references=copy.deepcopy(references),
+                value=float(value) if value is not None else None,
+                parameter_name=parameter_name, name=name or f"constraint_{constraint_id}",
+            )
+            self.sketches[sketch_name].constraints.append(constraint)
+            diagnostic = self._solve_sketch_state(sketch_name, mode="strict")
+            txn.commit()
+
+        self._step_counter += 1
+        result = make_success(
+            feature_id=constraint_id, narrative=f"添加约束 {constraint_type}",
+            current_narrative=self.narrative.copy(), render_level="none",
+            feature_graph_delta={"added_constraint": constraint_id},
+            constraint_diagnostics=diagnostic,
+            elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+        )
+        return self._wrap_step_result(result)
+
+    def set_parameter(self, name: str, value: float) -> StepResult:
+        """Set a named dimension and solve every sketch that references it."""
+        start = time.time()
+        name = require_non_empty_str("name", name)
+        value = require_positive("value", value)
+        with Transaction(self, "set_parameter") as txn:
+            entry = self._record_history("set_parameter", name=name, value=value)
+            parameter_id = f"P_{sum(1 for item in self._op_history if item.get('op') == 'set_parameter'):04d}"
+            entry["feature_id"] = parameter_id
+            self._parameters[name] = value
+            diagnostics = []
+            for sketch_name in sorted(self.sketches):
+                if any(c.parameter_name == name for c in self.sketches[sketch_name].constraints):
+                    diagnostics.append(self._solve_sketch_state(sketch_name, mode="strict"))
+            if not self._replaying and diagnostics:
+                # Rebuild all downstream solids after the named dimension has
+                # changed; the history entry is replay-safe and is not nested.
+                self._replay()
+            txn.commit()
+        self._step_counter += 1
+        result = make_success(
+            feature_id=parameter_id, narrative=f"设置参数 {name}={value:g}",
+            current_narrative=self.narrative.copy(), render_level="none",
+            feature_graph_delta={"parameter": name, "value": value},
+            constraint_diagnostics=diagnostics[0] if len(diagnostics) == 1 else {"items": diagnostics},
+            elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+        )
+        result.value = {"name": name, "value": value, "sketches_solved": len(diagnostics)}
+        return self._wrap_step_result(result)
+
+    def solve_sketch(self, sketch_name: str, mode: str = "strict") -> StepResult:
+        """Explicitly solve a sketch and record the solve boundary for replay."""
+        start = time.time()
+        sketch_name = require_non_empty_str("sketch_name", sketch_name)
+        mode = require_in("mode", mode, ["strict", "best_effort"])
+        with Transaction(self, "solve_sketch") as txn:
+            # The explicit solve is intentionally historical so replay keeps
+            # the same user-visible solve boundary and mode.
+            self._record_history("solve_sketch", sketch_name=sketch_name, mode=mode)
+            diagnostic = self._solve_sketch_state(sketch_name, mode=mode)
+            txn.commit()
+        self._step_counter += 1
+        status = diagnostic.get("status")
+        if mode == "best_effort" and status in (
+            ConstraintStatus.CONFLICT.value, ConstraintStatus.OVER_CONSTRAINED.value,
+        ):
+            result = make_failure(
+                error=f"草图 {sketch_name} 求解未完全满足约束: {status}",
+                error_kind="RECOVERABLE",
+                suggestion={"action": "检查 conflicting_constraints 后修改或删除约束"},
+                current_narrative=self.narrative.copy(),
+                constraint_diagnostics=diagnostic,
+                warning="best_effort 已应用最接近解，几何可能仍未满足全部约束",
+                elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+            )
+            result.value = diagnostic
+            return self._wrap_step_result(result)
+        result = make_success(
+            feature_id=f"S_{self._step_counter:04d}", narrative=f"求解草图 {sketch_name}",
+            current_narrative=self.narrative.copy(), render_level="none",
+            constraint_diagnostics=diagnostic,
+            elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+        )
+        result.value = diagnostic
+        return self._wrap_step_result(result)
     
     def close_sketch(self, sketch_name: str) -> StepResult:
         start = time.time()
@@ -1998,7 +2184,7 @@ class MechKernel:
                 state=FeatureState.COMPUTED,
             )
             self.feature_graph.add(feature)
-            export_step(self._current_geometry, path)
+            step_exported = self._export_step_or_adapter(self._current_geometry, path)
             self.narrative.append(f"导出 {format} → {path}")
             txn.commit()
         
@@ -2013,6 +2199,7 @@ class MechKernel:
             narrative=f"导出 {format} → {path} ({size} bytes)",
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=None if step_exported else "当前使用无 OCC 适配器几何，输出为 MechKernel 适配器快照而非标准 STEP",
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -2094,23 +2281,37 @@ class MechKernel:
         
         step_path = f"{base_path}.step"
         json_path = f"{base_path}.graph.json"
+        history_path = f"{base_path}.history.json"
         
         from build123d.exporters3d import export_step
-        export_step(self._current_geometry, step_path)
+        step_exported = self._export_step_or_adapter(self._current_geometry, step_path)
         
         graph_data = self.feature_graph.to_dict()
         graph_data["_project_meta"] = {
-            "version": "v2.1+v1.5",
+            "version": "v2.4",
             "geometry_volume": self._current_geometry.volume if hasattr(self._current_geometry, "volume") else None,
         }
+        graph_data["_sketches"] = {name: sketch.to_dict() for name, sketch in self.sketches.items()}
+        graph_data["_parameters"] = dict(self._parameters)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(graph_data, f, ensure_ascii=False, indent=2)
+        history_data = {
+            "schema_version": "2.4",
+            "replayable": not self._has_non_replayable_op,
+            "op_history": copy.deepcopy(self._op_history),
+            "geometry": self._geometry_summary_for(self._current_geometry).to_dict(),
+        }
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history_data, f, ensure_ascii=False, indent=2)
         
         return {
             "step_path": step_path,
             "step_size": os.path.getsize(step_path),
             "json_path": json_path,
             "json_size": os.path.getsize(json_path),
+            "history_path": history_path,
+            "history_size": os.path.getsize(history_path),
+            "step_exported": step_exported,
         }
     
     def load_project(self, base_path: str, mode: str = "new_body", name: str = "loaded_project") -> StepResult:
@@ -2122,6 +2323,7 @@ class MechKernel:
         import os, json
         step_path = f"{base_path}.step"
         json_path = f"{base_path}.graph.json"
+        history_path = f"{base_path}.history.json"
         
         if not os.path.exists(step_path):
             raise InvalidRequestError(f"项目文件不存在: {step_path}")
@@ -2145,13 +2347,47 @@ class MechKernel:
             # 恢复 Feature Graph (覆盖从 import_step 添加的简单 graph)
             with open(json_path, "r", encoding="utf-8") as f:
                 graph_data = json.load(f)
-            # 移除 _project_meta (这是 meta, 不是 feature)
+            saved_sketches = graph_data.pop("_sketches", {})
+            saved_parameters = graph_data.pop("_parameters", {})
             graph_data.pop("_project_meta", None)
             self.feature_graph.from_dict(graph_data)
+            self.sketches = {name: Sketch.from_dict(data) for name, data in saved_sketches.items()}
+            self._parameters = {name: float(value) for name, value in saved_parameters.items()}
+            replay_message = ""
+            loaded_history_replayable = False
+            if os.path.exists(history_path):
+                with open(history_path, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+                if history_data.get("schema_version") == "2.4" and history_data.get("replayable"):
+                    imported_geometry = self._geometry_internal
+                    imported_snapshot = self._snapshot()
+                    self._op_history = list(history_data.get("op_history", []))
+                    try:
+                        self._has_non_replayable_op = False
+                        self._replay()
+                        expected = history_data.get("geometry", {})
+                        actual = self._geometry_summary_for(self._current_geometry).to_dict()
+                        if expected and abs(float(expected.get("volume", 0.0)) - float(actual.get("volume", 0.0))) > 1e-4:
+                            raise StateCorruptionError("保存项目的历史重放体积校验失败")
+                        loaded_history_replayable = True
+                    except Exception as exc:
+                        self._restore(imported_snapshot)
+                        self._geometry_internal = imported_geometry
+                        self._has_non_replayable_op = True
+                        replay_message = f"历史重放未采用: {type(exc).__name__}"
+                else:
+                    self._has_non_replayable_op = True
+                    replay_message = "历史版本不兼容或项目不可重放"
+            else:
+                self._has_non_replayable_op = True
+                replay_message = "缺少 history.json，按旧项目兼容加载"
             
             self.narrative.append(f"加载项目 ← {base_path}")
             txn.commit()
-            self._has_non_replayable_op = True  # v2.0: 加载项目不可重放
+            # A complete, validated v2.4 history is replayable in this
+            # session.  Legacy/invalid histories intentionally keep the STEP
+            # fallback and remain non-replayable.
+            self._has_non_replayable_op = not loaded_history_replayable
             self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"  # v1.5.4: 简单 load 用 iso
@@ -2160,15 +2396,29 @@ class MechKernel:
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
             render_png = renders.get("iso") or renders.get("default")
         self._step_counter += 1
-        return self._wrap_step_result(make_success(
-            feature_id=feature_id,
-            narrative=f"加载项目 ← {base_path}",
-            render_png=render_png, render_level=render_level,
-            current_narrative=self.narrative.copy(),
-            feature_graph_delta={"added": [feature_id]},
-            elapsed_ms=(time.time() - start) * 1000,
-            step_index=self._step_counter,
-        ))
+        if replay_message:
+            result = make_failure(
+                error=f"项目已加载，但参数化历史不可用: {replay_message}",
+                error_kind="RECOVERABLE",
+                suggestion={"action": "保留当前 STEP 几何；新建会话后重新建模以恢复参数化重放"},
+                feature_id=feature_id,
+                current_narrative=self.narrative.copy(),
+                render_level=render_level,
+                render_png=render_png,
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+        else:
+            result = make_success(
+                feature_id=feature_id,
+                narrative=f"加载项目 ← {base_path}",
+                render_png=render_png, render_level=render_level,
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"added": [feature_id]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+        return self._wrap_step_result(result)
     
     def assemble(self, parts: list, name: str = "") -> StepResult:
         """v2.0: 装配多个 STEP 零件（定位 + 旋转）→ 组合为一个几何（可导出整机 STEP）"""
@@ -2336,6 +2586,72 @@ class MechKernel:
     ) -> StepResult:
         """生成预算受控、可解释的 AI 视觉证据包，不进入参数化历史。"""
         start = time.time()
+        if not isinstance(size, int) or isinstance(size, bool) or size < 64:
+            raise InvalidRequestError("size 必须是 >= 64 的整数")
+        allowed_intents = {"inspect", "section", "feature_zoom", "delta", "sketch"}
+        if intent not in allowed_intents:
+            raise InvalidRequestError(f"intent 必须是 {sorted(allowed_intents)}（当前 {intent}）")
+        if intent == "sketch":
+            if not target:
+                raise InvalidRequestError("render intent=sketch 需要 target=sketch_name")
+            sketch = self.sketches.get(target)
+            if sketch is None:
+                raise InvalidRequestError(f"草图不存在: {target}")
+            from .sketch_renderer import render_sketch
+            actual = render_sketch(sketch, size=size, annotate=annotate)
+            actual.pop("default", None)
+            if not actual:
+                self._step_counter += 1
+                return self._wrap_step_result(make_failure(
+                    error="render 未生成有效草图图像", error_kind="RECOVERABLE",
+                    current_narrative=self.narrative.copy(),
+                    elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+                ))
+            grid = Renderer.compose_grid(actual, cols=1, max_size=size)
+            self._last_render_base64 = base64.b64encode(grid).decode() if grid else None
+            self._last_render_views = dict(actual)
+            self._step_counter += 1
+            result = make_success(
+                feature_id=f"R_{self._step_counter:03d}", narrative=f"render sketch {target}",
+                render_png=actual.get("sketch"), render_views=actual, render_level="full",
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"rendered": ["sketch"], "intent": "sketch", "target": target},
+                constraint_diagnostics={
+                    "sketch": sketch.name,
+                    "status": getattr(sketch.solver_status, "value", str(sketch.solver_status)),
+                    "dof": sketch.dof,
+                    "constraint_count": len(sketch.constraints),
+                    "residual": sketch.solver_residual,
+                    "conflicting_constraints": list(sketch.conflicting_constraints),
+                    "under_constrained_entities": [],
+                    "solver_iterations": sketch.solver_iterations,
+                },
+                elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+            )
+            if grid:
+                result.render_base64 = base64.b64encode(grid).decode()
+            points = []
+            for entity in sketch.entities:
+                if entity.type == "line":
+                    points.extend([entity.params["start"], entity.params["end"]])
+                elif entity.type == "circle":
+                    cx, cy = entity.params["center"]
+                    radius = float(entity.params["radius"])
+                    points.extend([(cx - radius, cy - radius), (cx + radius, cy + radius)])
+            if points:
+                xs, ys = zip(*points)
+                bbox = [min(xs), min(ys), 0.0, max(xs), max(ys), 0.0]
+            else:
+                bbox = [0.0] * 6
+            result.evidence_manifest = {
+                "intent": "sketch", "projection": "orthographic", "views": ["sketch"],
+                "section": None, "target": target, "bbox_mm": bbox,
+                "layout": {"max_size_px": size, "columns": 1, "per_view_size_px": [size, size]},
+                "image_hashes": {"sketch": hashlib.sha256(actual["sketch"]).hexdigest()[:16]},
+            }
+            result.value = {"views": ["sketch"], "target": target, "evidence_manifest": result.evidence_manifest}
+            return self._wrap_step_result(result)
+
         if self._current_geometry is None:
             self._step_counter += 1
             return self._wrap_step_result(make_failure(
@@ -2344,11 +2660,6 @@ class MechKernel:
                 current_narrative=self.narrative.copy(), elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
             ))
-        if not isinstance(size, int) or isinstance(size, bool) or size < 64:
-            raise InvalidRequestError("size 必须是 >= 64 的整数")
-        allowed_intents = {"inspect", "section", "feature_zoom", "delta"}
-        if intent not in allowed_intents:
-            raise InvalidRequestError(f"intent 必须是 {sorted(allowed_intents)}（当前 {intent}）")
         if views is not None:
             if not isinstance(views, list) or not all(isinstance(v, str) for v in views):
                 raise InvalidRequestError("views 必须是字符串列表")
@@ -2384,6 +2695,7 @@ class MechKernel:
                 "section": ["iso", "front", "side"],
                 "feature_zoom": ["iso", "front"],
                 "delta": ["iso", "front"],
+                "sketch": ["sketch"],
             }[intent]
         else:
             requested = views
@@ -2506,6 +2818,47 @@ class MechKernel:
         ))
     
     # ===== 内部辅助 =====
+
+    @staticmethod
+    def _exportable_geometry(geometry: Any) -> Any:
+        """Return a geometry object accepted by the build123d exporter.
+
+        build123d 0.11.1 exports its composite ``Part`` wrapper directly;
+        passing ``Part.wrapped`` changes the node type and makes the exporter
+        look for ``wrapped`` on a raw TopoDS shape.  The in-repo adapter is the
+        only object that must be handled separately and is rejected by the
+        OCC exporter below.
+        """
+        return geometry
+
+    @classmethod
+    def _export_step_or_adapter(cls, geometry: Any, path: str) -> bool:
+        """Export OCC geometry, or persist an explicit adapter snapshot.
+
+        The adapter is deliberately not advertised as STEP.  It exists so
+        graph/history tests and no-OCC development environments can still
+        save and inspect a deterministic project artifact.
+        """
+        from build123d.exporters3d import export_step
+        try:
+            export_step(cls._exportable_geometry(geometry), path)
+            return True
+        except (AttributeError, TypeError, ValueError):
+            wrapped = getattr(geometry, "wrapped", None)
+            if wrapped is not None and wrapped is not geometry:
+                try:
+                    export_step(wrapped, path)
+                    return True
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            if not hasattr(geometry, "to_dict"):
+                raise
+            import json
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"format": "mechkernel-adapter", "geometry": geometry.to_dict()},
+                          stream, ensure_ascii=False, indent=2,
+                          default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value))
+            return False
     
     def _not_implemented(self, api_name: str, planned_version: str) -> StepResult:
         self._step_counter += 1
@@ -2533,6 +2886,7 @@ class MechKernel:
             "feature_geometries": dict(self._feature_geometries),
             "op_history": copy.deepcopy(self._op_history),
             "has_non_replayable_op": self._has_non_replayable_op,
+            "parameters": dict(self._parameters),
         }
     
     def _restore(self, snap: Dict) -> None:
@@ -2550,6 +2904,7 @@ class MechKernel:
         self._feature_geometries = dict(snap.get("feature_geometries", {}))
         self._op_history = list(snap.get("op_history", []))
         self._has_non_replayable_op = snap.get("has_non_replayable_op", False)
+        self._parameters = dict(snap.get("parameters", {}))
         self._last_render_base64 = None
         self._last_render_views = {}
         # P0-3 修复：undo 后 bump revision（让 renderer 缓存失效）
@@ -2693,13 +3048,32 @@ class MechKernel:
             self.naming_resolver = PersistentNamingResolver()
             self._feature_geometries = {}
             self._geometry_internal = None
+            self._parameters = {}
             self.narrative = []
             self.semantic_state = {}
             self._step_counter = 0
             self._last_render_step = -1
             reset_all_id_generators()
+            seed_id_generators_from_history(self._op_history)
+            parameter_overrides = {}
+            for entry in self._op_history:
+                if entry.get("op") == "add_constraint":
+                    args = entry.get("args", {})
+                    pname = args.get("parameter_name", "")
+                    if pname and args.get("value") is not None and pname not in parameter_overrides:
+                        parameter_overrides[pname] = float(args["value"])
+                elif entry.get("op") == "set_parameter":
+                    args = entry.get("args", {})
+                    if args.get("name"):
+                        parameter_overrides[args["name"]] = float(args["value"])
+            self._replay_parameter_overrides = parameter_overrides
+            self._parameters = dict(parameter_overrides)
             for entry in self._op_history:
                 op = entry["op"]
+                if op == "set_parameter":
+                    # Final parameter values were preloaded above so geometry
+                    # features are built with the effective dimensions.
+                    continue
                 args = dict(entry["args"])
                 method = getattr(self, op, None)
                 if method is None:
@@ -2710,6 +3084,7 @@ class MechKernel:
                         f"重放失败 op={op} args={args}: {getattr(result, 'error', 'unknown')}"
                     )
         finally:
+            self._replay_parameter_overrides = None
             self.adaptive_renderer.suspended = was_suspended
             self._replaying = False
     

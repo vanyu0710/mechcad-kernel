@@ -371,6 +371,22 @@ def run_loop(
                 "render_level": result.render_level,
                 "has_render": result.has_render(),
                 "views": list(result.render_views.keys()) if result.render_views else [],
+                "constraint_diagnostics": result.constraint_diagnostics,
+                "dof": (
+                    result.constraint_diagnostics.get("dof")
+                    if isinstance(result.constraint_diagnostics, dict)
+                    else None
+                ),
+                "solver_status": (
+                    result.constraint_diagnostics.get("status")
+                    if isinstance(result.constraint_diagnostics, dict)
+                    else None
+                ),
+                "conflicting_constraints": (
+                    result.constraint_diagnostics.get("conflicting_constraints", [])
+                    if isinstance(result.constraint_diagnostics, dict)
+                    else []
+                ),
                 "elapsed_ms": step_elapsed * 1000,
             },
         })
