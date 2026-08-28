@@ -370,6 +370,7 @@ def run_loop(
                 "error_kind": result.error_kind,
                 "render_level": result.render_level,
                 "has_render": result.has_render(),
+                "views": list(result.render_views.keys()) if result.render_views else [],
                 "elapsed_ms": step_elapsed * 1000,
             },
         })

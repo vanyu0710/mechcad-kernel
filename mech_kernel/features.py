@@ -65,6 +65,7 @@ TOPOLOGY_CHANGING_OPS = frozenset({
     FeatureType.CIRCULAR_PATTERN,
     FeatureType.MIRROR,
     FeatureType.OFFSET_FACE,
+    FeatureType.ASSEMBLY,
 })
 
 

@@ -1,7 +1,7 @@
 """
-MechKernel 主类（v1.1.1 修复版）
+MechKernel 主类（v2.2 修复版）
 
-v1.1 核心：18 个原子 API + 自适应渲染 + 语义引用 + 事务回滚 + 类型化错误
+核心：公共建模 API + 参数化重放 + 多视图/截面渲染 + 事务回滚 + 类型化错误
 """
 from typing import List, Optional, Dict, Any, Tuple, Union
 import copy
@@ -47,7 +47,7 @@ PUBLIC_OPS = frozenset({
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
-    "add_polyline", "add_arc", "assemble",
+    "add_polyline", "add_arc", "assemble", "render",
 })
 
 
@@ -71,6 +71,8 @@ class MechKernel:
         self._op_history: List[Dict] = []  # v2.0: op 历史（参数化重放数据源）
         self._replaying: bool = False  # v2.0: 重放中（禁止再记录）
         self._has_non_replayable_op: bool = False  # v2.0: 会话含导入/加载，禁止重放
+        self._last_render_base64: Optional[str] = None
+        self._last_render_views: Dict[str, bytes] = {}
         self.geometry_inspector = GeometryInspector()
         self.inspector = self.geometry_inspector  # 别名（兼容测试）
         self.renderer = Renderer()
@@ -83,7 +85,7 @@ class MechKernel:
         self._register_op_schemas()
     
     def _register_op_schemas(self):
-        """手动注册 18 op schema（P1-4 v8: 用 set_capability 检测重复）"""
+        """手动注册公共 op schema（P1-4 v8: 用 set_capability 检测重复）"""
         # 草图类 6 个
         self.cap.set_capability(Capability(
             name="create_workplane", category="sketch",
@@ -250,12 +252,25 @@ class MechKernel:
             "assemble": {"parts": FieldSchema(type="list", required=True, items_type="dict",
                                               description="[{path, position:[x,y,z], rotation:[deg,[ax,ay,az]]}]"),
                          "name": FieldSchema(type="string", required=False)},
+            "render": {"views": FieldSchema(type="list", required=False,
+                                              description="iso/front/top/side/rot0/rot90/rot180/rot270"),
+                       "size": FieldSchema(type="integer", required=False, default=640, min=64),
+                       "annotate": FieldSchema(type="boolean", required=False, default=True),
+                       "section": FieldSchema(type="dict", required=False),
+                       "turntable": FieldSchema(type="boolean", required=False, default=False),
+                       "name": FieldSchema(type="string", required=False)},
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
                 name=name, category=name.split("_")[0], description=name,
                 input_schema=schema, permission="public",
             ))
+        # Placeholder schemas are declared after the first binding pass.
+        # Bind all public capabilities once more so registry.call() is usable.
+        for name, cap in self.cap._caps.items():
+            method = getattr(self, name, None)
+            if method is not None and callable(method):
+                cap.func = method
 
     def create_workplane(self, name: str, type: str = "XY", **kwargs) -> StepResult:
         start = time.time()
@@ -847,7 +862,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("boolean", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1086,7 +1101,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("hole", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1191,7 +1206,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("shell", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1295,7 +1310,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("linear_pattern", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1402,7 +1417,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("mirror", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1488,7 +1503,7 @@ class MechKernel:
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("sweep", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -1857,6 +1872,7 @@ class MechKernel:
         result = make_success(
             feature_id=f"D_{self._step_counter:03d}",
             narrative=f"delete {feature_id}（重放 {len(self._op_history)} 个 op）",
+            render_level="full",
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"deleted": [feature_id], "replayed": True},
             elapsed_ms=(time.time() - start) * 1000,
@@ -1908,6 +1924,7 @@ class MechKernel:
         result = make_success(
             feature_id=f"U_{self._step_counter:03d}",
             narrative=f"update {feature_id}（重放 {len(self._op_history)} 个 op）",
+            render_level="full",
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"updated": [feature_id, new_params], "replayed": True},
             elapsed_ms=(time.time() - start) * 1000,
@@ -1941,6 +1958,7 @@ class MechKernel:
         result = make_success(
             feature_id=f"rebuild_{self._step_counter:03d}",
             narrative=f"rebuild：重放 {len(self._op_history)} 个 op",
+            render_level="full",
             current_narrative=self.narrative.copy(),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
@@ -2178,7 +2196,7 @@ class MechKernel:
             self._has_non_replayable_op = True  # 装配依赖外部 STEP，不可重放
             self.narrative.append(f"装配 {len(parts)} 个零件 → {feature.name}")
             txn.commit()
-        render_level = "iso_only"
+        render_level = self.adaptive_renderer.should_render("assemble", has_geometry=self._geometry_internal is not None)
         render_png = None
         if render_level != "none":
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
@@ -2193,6 +2211,111 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
+
+    def _section_half(self, geometry: Any, axis: str, offset: float = None) -> Any:
+        """Return a lower half-space intersection for rendering only."""
+        if geometry is None:
+            raise InvalidRequestError("section 需要先有几何")
+        axis = str(axis).upper()
+        if axis not in ("X", "Y", "Z"):
+            raise InvalidRequestError("section.axis 必须是 X/Y/Z")
+        try:
+            bb = geometry.bounding_box() if callable(getattr(geometry, "bounding_box", None)) else geometry.bounding_box
+            mn, mx = bb.min, bb.max
+            bounds = {
+                "X": (float(mn.X), float(mx.X)),
+                "Y": (float(mn.Y), float(mx.Y)),
+                "Z": (float(mn.Z), float(mx.Z)),
+            }
+            lo, hi = bounds[axis]
+            cut = (lo + hi) / 2.0 if offset is None else float(offset)
+            if cut <= lo or cut >= hi:
+                return geometry
+            spans = {a: max(hi_a - lo_a, 1e-6) for a, (lo_a, hi_a) in bounds.items()}
+            spans[axis] = cut - lo
+            centers = {a: (lo_a + hi_a) / 2.0 for a, (lo_a, hi_a) in bounds.items()}
+            centers[axis] = (lo + cut) / 2.0
+            from build123d import Box, Location
+            section_box = Location((centers["X"], centers["Y"], centers["Z"])) * Box(
+                spans["X"], spans["Y"], spans["Z"]
+            )
+            return geometry & section_box
+        except InvalidRequestError:
+            raise
+        except Exception as exc:
+            raise InvalidRequestError(f"section 无法切割几何: {exc}") from exc
+
+    def render(
+        self,
+        views: list = None,
+        size: int = 640,
+        annotate: bool = True,
+        section: dict = None,
+        turntable: bool = False,
+        name: str = "",
+    ) -> StepResult:
+        """按需生成 AI 可读的多视图/截面渲染，不进入参数化历史。"""
+        start = time.time()
+        if self._current_geometry is None:
+            self._step_counter += 1
+            return self._wrap_step_result(make_failure(
+                error="render 需要先有几何", error_kind="RECOVERABLE",
+                suggestion={"action": "先创建草图并执行 extrude/revolve"},
+                current_narrative=self.narrative.copy(), elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            ))
+        if not isinstance(size, int) or isinstance(size, bool) or size < 64:
+            raise InvalidRequestError("size 必须是 >= 64 的整数")
+        if views is not None:
+            if not isinstance(views, list) or not all(isinstance(v, str) for v in views):
+                raise InvalidRequestError("views 必须是字符串列表")
+            allowed = {"iso", "front", "top", "side", "rot0", "rot90", "rot180", "rot270"}
+            unknown = sorted(set(views) - allowed)
+            if unknown:
+                raise InvalidRequestError(f"不支持的视图: {unknown}")
+        render_geometry = self._current_geometry
+        section_note = None
+        if section is not None:
+            if not isinstance(section, dict):
+                raise InvalidRequestError("section 必须是字典")
+            render_geometry = self._section_half(render_geometry, section.get("axis", "Z"), section.get("offset"))
+            section_note = {"axis": str(section.get("axis", "Z")).upper(), "offset": section.get("offset")}
+        requested = views if views is not None else ["iso", "front", "top", "side"]
+        renders = self.renderer.render(
+            render_geometry, level="full", geometry_revision=self._geometry_revision,
+            views=requested, annotate=annotate, turntable=turntable, image_size=(size, size),
+        )
+        actual = {k: v for k, v in renders.items() if k != "default" and v}
+        if section_note and annotate:
+            suffix = "mid" if section_note["offset"] is None else f"{float(section_note['offset']):g}"
+            actual = {
+                view: self.renderer._annotate_png(png, f"SECTION {section_note['axis']}@{suffix}")
+                for view, png in actual.items()
+            }
+        if not actual:
+            self._step_counter += 1
+            return self._wrap_step_result(make_failure(
+                error="render 未生成有效图像", error_kind="RECOVERABLE",
+                current_narrative=self.narrative.copy(), elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            ))
+        grid = Renderer.compose_grid(actual, cols=2)
+        if grid:
+            self._last_render_base64 = base64.b64encode(grid).decode()
+        self._last_render_views = dict(actual)
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"R_{self._step_counter:03d}", narrative="render 多视图" + ("（截面）" if section_note else ""),
+            render_png=actual.get("iso"), render_views=actual, render_level="full",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"rendered": list(actual), "section": section_note},
+            elapsed_ms=(time.time() - start) * 1000, step_index=self._step_counter,
+        )
+        if grid:
+            result.render_base64 = base64.b64encode(grid).decode()
+        result.render_views = actual
+        result.value = {"views": list(actual), "section": section_note, "name": name}
+        return self._wrap_step_result(result)
     
     def undo(self, steps: int = 1) -> StepResult:
         start = time.time()
@@ -2289,6 +2412,8 @@ class MechKernel:
         self._feature_geometries = dict(snap.get("feature_geometries", {}))
         self._op_history = list(snap.get("op_history", []))
         self._has_non_replayable_op = snap.get("has_non_replayable_op", False)
+        self._last_render_base64 = None
+        self._last_render_views = {}
         # P0-3 修复：undo 后 bump revision（让 renderer 缓存失效）
         self._geometry_revision += 1
         self.renderer.clear_cache()  # undo 后清缓存
@@ -2421,6 +2546,8 @@ class MechKernel:
     def _replay(self) -> None:
         """v2.0 参数化重放：清空状态 + 重置 id + 按 op_history 全量重放（不记录）"""
         self._replaying = True
+        was_suspended = self.adaptive_renderer.suspended
+        self.adaptive_renderer.suspended = True
         try:
             self.feature_graph = FeatureGraph()
             self.workplanes = WorkplaneRegistry()
@@ -2445,6 +2572,7 @@ class MechKernel:
                         f"重放失败 op={op} args={args}: {getattr(result, 'error', 'unknown')}"
                     )
         finally:
+            self.adaptive_renderer.suspended = was_suspended
             self._replaying = False
     
     def _extrude_build123d(self, sketch, depth: float, mode: str = "new_body", direction: str = "Z"):
@@ -2636,6 +2764,7 @@ class MechKernel:
                 hint = "kernel.execute() 只接受 keyword arguments，不用 positional。改用: execute(op, {key1=val1, key2=val2, ...})"
             ok, err = self.cap.validate_call(op, kwargs)
             if not ok:
+                self.adaptive_renderer.mark_failure(op)
                 return make_failure(
                     error=f"参数校验失败: {err}",
                     error_kind="INVALID_REQUEST",
@@ -2656,8 +2785,12 @@ class MechKernel:
                     elapsed_ms=(time.time() - start) * 1000,
                     step_index=self._step_counter,
                 )
-            return method(*args, **kwargs)
+            result = method(*args, **kwargs)
+            if isinstance(result, StepResult) and not result.success:
+                self.adaptive_renderer.mark_failure(op)
+            return result
         except (InvalidRequestError, StateCorruptionError) as e:
+            self.adaptive_renderer.mark_failure(op)
             return make_failure(
                 error=str(e),
                 error_kind="INVALID_REQUEST" if isinstance(e, InvalidRequestError) else "STATE_CORRUPTION",
@@ -2667,6 +2800,7 @@ class MechKernel:
                 step_index=self._step_counter,
             )
         except KernelBugError as e:
+            self.adaptive_renderer.mark_failure(op)
             return make_failure(
                 error=str(e), error_kind="KERNEL_BUG", hint="kernel bug",
                 current_narrative=self.narrative.copy(),
@@ -2674,6 +2808,7 @@ class MechKernel:
                 step_index=self._step_counter,
             )
         except Exception as e:
+            self.adaptive_renderer.mark_failure(op)
             return make_failure(
                 error=f"未预期错误: {e}",
                 error_kind="GEOMETRY_FAILURE",
@@ -2684,10 +2819,30 @@ class MechKernel:
             )
     
     def last_render_base64(self) -> Optional[str]:
-        return None
+        return self._last_render_base64
     
     def _wrap_step_result(self, result: "StepResult") -> "StepResult":
         """自动填充 geometry_summary（如未设置）+ 简单 hints"""
+        # Centralize the visual contract for every topology operation.  Older
+        # ops only retained the iso bytes; regenerate the configured view set
+        # here so full renders reach the vision loop as a single collage.
+        if result.render_level != "none" and result.render_views is None and self._geometry_internal is not None:
+            renders = self.renderer.render(
+                self._geometry_internal,
+                level=result.render_level,
+                geometry_revision=self._geometry_revision,
+                image_size=None,
+            )
+            result.render_views = {k: v for k, v in renders.items() if k != "default" and v}
+            result.render_png = result.render_views.get("iso") or result.render_png
+            if result.render_level == "full" and result.render_views:
+                grid = Renderer.compose_grid(result.render_views, cols=2)
+                if grid:
+                    result.render_base64 = base64.b64encode(grid).decode()
+                    self._last_render_base64 = result.render_base64
+            elif result.render_png:
+                result.render_base64 = base64.b64encode(result.render_png).decode()
+            self._last_render_views = dict(result.render_views)
         if result.geometry_summary is None:
             result.geometry_summary = self._geometry_summary_for(self._geometry_internal)
         # 加 hints（如果没设）
@@ -2758,16 +2913,9 @@ class MechKernel:
         return list(self.narrative)
     
     def get_geometry_summary(self) -> Optional[GeometrySummary]:
-        from .step_result import GeometrySummary
         if self._geometry_internal is None:
             return None
-        return GeometrySummary(
-            bounding_box=(0, 0, 0, 100, 100, 100),
-            volume=1000.0, surface_area=600.0,
-            face_count=6, edge_count=12, vertex_count=8,
-            is_manifold=True, is_watertight=True, is_connected=True,
-            feature_count=len(self.feature_graph.nodes),
-        )
+        return self._geometry_summary_for(self._geometry_internal)
     
     def get_state(self) -> dict:
         wp_count = 0
@@ -2785,4 +2933,4 @@ class MechKernel:
         }
     
     def get_last_render_base64(self) -> Optional[str]:
-        return None
+        return self._last_render_base64

@@ -1,6 +1,6 @@
 """
 Demo 13: 业余探空火箭固体发动机（壳体 + 堵头 + CD 喷口 + 整机装配）
-— MechKernel 生产力实测（v2.1：revolve 线剖面 + assemble）
+— MechKernel 生产力实测（v2.2：revolve 线剖面 + assemble + 多视图截面）
 
 1. 壳体  : Ø60 外径 × 3mm 壁厚 × 300mm 管（同心圆 → 拉伸成环）
 2. 堵头  : Ø60 圆盘 × 15mm + 中心点火孔 Ø8 + 外缘倒角
@@ -12,6 +12,12 @@ import os, sys, math
 from pathlib import Path
 
 from mech_kernel import MechKernel
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 HERE = Path(__file__).parent
 OUT = HERE / "rocket_motor_out"
@@ -50,6 +56,18 @@ def export_step(kernel, name):
     else:
         print(f"  导出失败: {r.error}")
     return str(path)
+
+
+def save_render(result, name):
+    """保存 render op 返回的拼图 PNG。"""
+    import base64
+    if not result.render_base64:
+        print(f"  渲染为空: {name}")
+        return None
+    path = OUT / f"{name}.png"
+    path.write_bytes(base64.b64decode(result.render_base64))
+    print(f"  多视图: {path}")
+    return path
 
 
 # ---------- 1. 壳体 ----------
@@ -104,7 +122,7 @@ def build_assembly(case_step, closure_step, nozzle_step):
 
 def main():
     print("=" * 66)
-    print("Demo 13: 业余探空火箭固体发动机 — MechKernel 生产力实测（v2.1）")
+    print("Demo 13: 业余探空火箭固体发动机 — MechKernel 生产力实测（v2.2）")
     print("=" * 66)
 
     print("\n[1/4] 壳体（Ø60 x 壁厚3 x 长300 管）")
@@ -129,6 +147,10 @@ def main():
     asm = build_assembly(case_step, closure_step, nozzle_step)
     part_report("发动机整机", asm, note="（体积=三件之和）")
     render_part(asm, "motor_assembly")
+    save_render(asm.render(views=["iso", "front", "top", "side"], size=640, annotate=True), "motor_views")
+    save_render(asm.render(turntable=True, size=480, annotate=True), "motor_turntable")
+    # 发动机轴向为 Z；沿 X 保留一半，更适合观察壳体内腔、喷口喉部和堵头。
+    save_render(asm.render(section={"axis": "X", "offset": 0}, size=640, annotate=True), "motor_section")
     export_step(asm, "motor_assembly")
 
     print("\n" + "=" * 66)

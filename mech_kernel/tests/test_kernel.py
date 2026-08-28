@@ -113,7 +113,7 @@ def test_extrude_topology_change_triggers_render():
     k.close_sketch("sk_1")
     r = k.extrude("sk_1", depth=20)
     assert r.success
-    assert r.render_level == "iso_only"  # 拓扑变化
+    assert r.render_level == "full"  # v2.2 拓扑变化使用多视图
 
 
 def test_narrative_accumulates():

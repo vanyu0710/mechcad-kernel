@@ -112,6 +112,7 @@ class StepResult:
             "warning": self.warning,
             "render_level": self.render_level,
             "has_render": self.has_render(),
+            "views": list(self.render_views.keys()) if self.render_views else [],
             "narrative": self.narrative,
             "hints": self.next_hints,
             "geometry_summary": self.geometry_summary.to_dict() if self.geometry_summary else None,

@@ -141,12 +141,12 @@ def test_adaptive_no_geometry_returns_none():
     assert ar.should_render("extrude", has_geometry=False) == "none"
 
 
-def test_adaptive_topology_change_returns_iso():
+def test_adaptive_topology_change_returns_full():
     ar = AdaptiveRenderer()
-    assert ar.should_render("extrude", has_geometry=True) == "iso_only"
-    assert ar.should_render("fillet", has_geometry=True) == "iso_only"
-    assert ar.should_render("boolean", has_geometry=True) == "iso_only"
-    assert ar.should_render("hole", has_geometry=True) == "iso_only"
+    assert ar.should_render("extrude", has_geometry=True) == "full"
+    assert ar.should_render("fillet", has_geometry=True) == "full"
+    assert ar.should_render("boolean", has_geometry=True) == "full"
+    assert ar.should_render("hole", has_geometry=True) == "full"
 
 
 def test_adaptive_sketch_op_returns_none():
@@ -165,14 +165,14 @@ def test_adaptive_interval_triggers_full():
     # 第 2 步
     assert ar.should_render("add_circle", has_geometry=True) == "none"
     # 第 3 步：间隔 3 → full
-    assert ar.should_render("add_circle", has_geometry=True) == "full"
+    assert ar.should_render("add_circle", has_geometry=True) == "iso_only"
 
 
 def test_adaptive_failure_then_recovery():
     ar = AdaptiveRenderer()
     ar.mark_failure()
     # 恢复（相同 op）→ iso
-    assert ar.should_render("fillet", has_geometry=True) == "iso_only"
+    assert ar.should_render("fillet", has_geometry=True) == "full"
     # 后续正常
     assert ar.should_render("add_circle", has_geometry=True) == "none"
 
@@ -270,7 +270,7 @@ def test_kernel_extrude_with_mock_geometry_renders():
     r = k.extrude("sk_1", depth=20)
     
     # M1 阶段：拓扑变化 + 有几何 = iso 渲染
-    assert r.render_level == "iso_only"
+    assert r.render_level == "full"
     # M1 阶段还没接 build123d，所以可能没真实 PNG（这是预期）
     # 但 render_png 不应该 None（mock mesh 可以渲染）
 
@@ -300,4 +300,4 @@ def test_kernel_render_cache_works():
     # 草图阶段不渲染
     assert r1.render_level == "none"
     # 拓扑变化 + 有几何 = iso 渲染
-    assert r2.render_level == "iso_only"
+    assert r2.render_level == "full"

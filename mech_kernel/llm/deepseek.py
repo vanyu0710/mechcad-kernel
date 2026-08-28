@@ -100,6 +100,8 @@ class DeepSeekClient:
 
 VISION_SYSTEM_PROMPT = """你是机械工程师视觉分析助手。
 
+输入图像可能是同一零件的多视图拼图（ISO/FRONT/TOP/SIDE 或转台视图），也可能包含截面。请综合所有视角判断几何，不要把每个格子当成不同零件。
+
 输入：手绘草图（PNG）+ 文字描述
 输出：结构化 JSON
 
@@ -183,7 +185,7 @@ class DeepSeekVisionLLM(DeepSeekClient):
         messages = [
             {"role": "system", "content": system_prompt or VISION_SYSTEM_PROMPT},
             {"role": "user", "content": [
-                {"type": "text", "text": user_prompt},
+                {"type": "text", "text": "这是同一零件的多视图/截面拼图，请综合所有视角。\n" + user_prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
             ]},
         ]

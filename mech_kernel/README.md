@@ -10,12 +10,13 @@
 **MechKernel** 是一个为 AI CAD 设计的"语义几何内核"。
 
 它把脆弱的 `build123d` / `trimesh` 调用，包装成对 LLM 友好的**原子 API**：
-- ✅ **18 个原子操作**（5 草图 + 4 主体 + 4 细节 + 3 复用 + 3 查询 + 5 编辑）
+- ✅ **30 个公共操作**（草图、实体、细节、复用、查询、编辑、装配与可视化）
 - ✅ **5 类类型化错误**（INVALID_REQUEST / KERNEL_BUG / STATE_CORRUPTION / GEOMETRY_FAILURE / RECOVERABLE / NOT_IMPLEMENTED）
 - ✅ **事务 Savepoint**（失败整体回滚，可独立撤销）
 - ✅ **Feature Graph DAG**（持久化命名 + 增量循环检测）
 - ✅ **Capability Registry**（自动注册 + JSON Schema + LLM 友好）
-- ✅ **自适应渲染**（C 方案：默认不渲染，关键节点渲染）
+- ✅ **自适应多视图渲染**（拓扑变化 full 视图，间隔步骤 iso 快照）
+- ✅ **AI 截面与转台视图**（真实几何半空间切割，不改变模型）
 - ✅ **三态拓扑检查**（valid / invalid / unknown，不伪造 False）
 
 **核心创新**：每个 API 调用的结果（`StepResult`）包含 `success / error_kind / error / hint / suggestion / geometry_summary / render_png / next_hints`，让 LLM 拿到**可决策的反馈**。
@@ -38,7 +39,7 @@
                     │ kernel.execute(op, **args)
                     ▼
 ┌─────────────────────────────────────────────────────┐
-│ L3: MechKernel  ← 18 个原子 API + capability registry│
+│ L3: MechKernel  ← 30 个公共 API + capability registry│
 │     5 类错误 / 事务 / 撤销栈 / 几何缓存              │
 └───────────────────┬─────────────────────────────────┘
                     │ build123d 调用（v1.1 用 MockBox 占位）
@@ -60,7 +61,7 @@
 
 ---
 
-## 18 个原子 API
+## 公共 API
 
 | 分类 | API | 状态 |
 |------|------|------|
@@ -69,9 +70,10 @@
 | **细节** | `hole` / `fillet` / `chamfer` / `shell` | ⏳ v1.2 占位 |
 | **复用** | `linear_pattern` / `circular_pattern` / `mirror` | ⏳ v1.2 占位 |
 | **查询** | `query` / `select` / `measure` | ⏳ v1.2 占位 |
-| **编辑** | `undo` / `redo` / `delete_feature` / `update_feature` / `export` | ✅ undo/redo / 3 占位 |
+| **编辑** | `undo` / `redo` / `delete_feature` / `update_feature` / `rebuild` / `export` | ✅ 参数化重放 |
+| **可视化** | `render` | ✅ 多视图、转台、标注、真实截面 |
 
-占位 API 调时返回 `NOT_IMPLEMENTED` 错误（含 `api_name` 和 `planned_version`）。
+`delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/加载/装配会话保留外部几何，因此重放返回 `RECOVERABLE`。
 
 ---
 
@@ -137,7 +139,7 @@ r = k.execute('add_circle', sketch_name='sk_1', center=(0, 0), radius=5)
 ```
 
 **特性**：
-- 自动注册（18 op 都有 schema）
+- 自动注册（30 个公共 op 都有 schema）
 - JSON Schema 风格（type / required / min / max / enum / length）
 - LLM 友好的 op 描述（含 `examples` Few-shot）
 - 权限分级（`public` / `read` / `internal`）
@@ -168,7 +170,7 @@ Pillow>=9.0
 ## 运行测试
 
 ```bash
-# 175 个测试，0 失败
+# 全量测试（v2.2）
 PYTHONPATH=. python3 -c "
 import sys
 sys.path.insert(0, '.')
@@ -206,7 +208,16 @@ PYTHONPATH=. python3 mech_kernel/examples/03_mock_render.py
 
 # 4. M2 端到端：用户说"建一个圆柱" → 几何生成
 PYTHONPATH=. python3 mech_kernel/examples/04_e2e_orchestrator.py
+
+# 13. 固体发动机：装配体多视图、转台和轴向截面
+PYTHONPATH=. python3 mech_kernel/examples/13_rocket_motor.py
 ```
+
+Demo 13 的可视化报告：
+
+- [整机四视图](examples/rocket_motor_out/motor_views.png)
+- [整机转台八视图](examples/rocket_motor_out/motor_turntable.png)
+- [整机 X=0 轴向半截面](examples/rocket_motor_out/motor_section.png)
 
 ---
 
@@ -293,7 +304,7 @@ result = run_loop(k, planner, vision, "建一个法兰盘 Ø100 厚 20，4 个 M
 ```
 mech_kernel/
 ├── __init__.py                   # 导出 MechKernel
-├── kernel.py                     # 主类（18 API + execute + capability）
+├── kernel.py                     # 主类（30 API + execute + capability）
 ├── step_result.py                # StepResult 数据结构
 ├── errors.py                     # 5 类类型化错误
 ├── features.py                   # FeatureNode + Sketch + MockBox/MockMesh
@@ -303,7 +314,7 @@ mech_kernel/
 ├── transaction.py                # Savepoint 事务
 ├── validators.py                 # 参数校验
 ├── geometry_inspector.py         # BRep 指标 + 三态拓扑
-├── renderer.py                   # matplotlib 4 视角 + LRU + 异常隔离
+├── renderer.py                   # matplotlib 多视图/拼图 + LRU + 异常隔离
 ├── adaptive_renderer.py          # C 方案策略
 ├── ai_orchestrator.py            # PlannerAction + MockPlanner + run_loop
 ├── capability_registry.py        # v1.1.1 自动注册 + JSON Schema
@@ -360,22 +371,21 @@ backend/cad_worker/
 
 ---
 
-## 已知限制（v1.1）
+## 已知限制（v2.2）
 
-1. **不接真实几何**：用 `MockBox` 占位，需装 build123d 后替换
-2. **Z 轴 only**：绕路法解决 X/Y 轴拉伸
-3. **fillet/chamfer 不支持**：v1.2 才实现（占位）
-4. **无 web 渲染**：仅 matplotlib 离屏 PNG
-5. **单进程**：无并发安全（Feature Graph 内存态）
+1. **导入/加载/装配会话暂不支持参数化重放**，会返回 `RECOVERABLE`
+2. **截面是渲染用派生几何**，不会改变当前模型或进入历史
+3. **无 web 渲染**：当前为 matplotlib 离屏 PNG
+4. **单进程**：无并发安全（Feature Graph 内存态）
 
 ---
 
-## 下一步 Roadmap
+## 版本演进
 
-- [ ] v1.2: 接 build123d + 实现 fillet/chamfer/hole/pattern/mirror
-- [ ] v1.3: 完整 Feature Engine（18 → 50 个核心 Feature）
-- [ ] v2.0: 接真实 LLM Planner + Vision + Verifier
-- [ ] v2.1: 多 Agent 协作（4 Agent：Vision/Planner/Executor/Verifier）
+- v2.0: 参数化 op 历史、全量重放、真实 delete/update/rebuild
+- v2.1: 剖面实体、STEP 装配与几何查询
+- v2.2: AI 多视图、转台、标注拼图与真实截面
+- 后续：约束、装配语义、WebGPU 渲染与持久化历史
 
 ---
 
@@ -392,5 +402,4 @@ Mavis (MechCAD IDE AI 团队)
 
 ---
 
-**v1.1.1 状态：175/175 测试全过，4 demo 跑通，capability registry 集成完成**  
-**等你装好 build123d + 配置 LLM API，整个系统就 ready for v2** 🚀
+**v2.2 状态：多视图/截面视觉闭环已接入，参数化重放与真实几何能力可用。**

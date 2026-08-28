@@ -57,14 +57,22 @@ class Renderer:
         geometry: Any, 
         level: str = "iso_only",
         geometry_revision: int = 0,
+        views: Optional[List[str]] = None,
+        annotate: bool = True,
+        turntable: bool = False,
+        image_size: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, bytes]:
         """
-        渲染几何到 PNG bytes（P0 修复版）。
+        渲染几何到 PNG bytes（v2.2：多视图 / 标注 / 转台 / 自定义尺寸）。
         
         Args:
             geometry: 几何对象（duck-typed）
             level: "none" | "iso_only" | "full"
             geometry_revision: kernel 维护的版本号（用于缓存键）
+            views: 需要渲染的视角名列表（None = 全部 4 视角）
+            annotate: 是否叠加视图名 + 包围盒尺寸标注
+            turntable: 是否追加 4 个 45° 转台视角（rot0/rot90/rot180/rot270）
+            image_size: 覆盖默认分辨率 (w, h)
         
         Returns:
             {"iso": bytes, "front": bytes, ...}
@@ -72,7 +80,9 @@ class Renderer:
         """
         # P0-4: 异常隔离 - 在函数入口就 try
         try:
-            return self._render_safe(geometry, level, geometry_revision)
+            return self._render_safe(geometry, level, geometry_revision,
+                                     views=views, annotate=annotate,
+                                     turntable=turntable, image_size=image_size)
         except Exception:
             return {"iso": None, "front": None, "top": None, "side": None, "default": None}
     
@@ -81,12 +91,18 @@ class Renderer:
         geometry: Any,
         level: str,
         geometry_revision: int,
+        views: Optional[List[str]] = None,
+        annotate: bool = True,
+        turntable: bool = False,
+        image_size: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, bytes]:
         if level == "none" or geometry is None:
             return {"iso": None, "front": None, "top": None, "side": None, "default": None}
         
-        # P0-1: 缓存键包含 revision 和 level
-        cache_key = self._make_cache_key(geometry, level, geometry_revision, tolerance=0.1)
+        # P0-1: 缓存键包含 revision、level 与渲染配置（视图/标注/转台/尺寸）
+        render_config = (annotate, tuple(sorted(views or [])), turntable, image_size)
+        cache_key = self._make_cache_key(geometry, level, geometry_revision, tolerance=0.1,
+                                         render_config=render_config)
         if self._use_cache and cache_key in self._cache:
             self._cache.move_to_end(cache_key)
             return self._cache[cache_key]
@@ -132,14 +148,31 @@ class Renderer:
             ("top", (cx, cy, cz + lim * 2)),
             ("side", (cx + lim * 2, cy, cz)),
         ]
+        if turntable:
+            view_configs += [
+                ("rot0", (cx + lim, cy, cz + lim)),
+                ("rot90", (cx, cy + lim, cz + lim)),
+                ("rot180", (cx - lim, cy, cz + lim)),
+                ("rot270", (cx, cy - lim, cz + lim)),
+            ]
+        if views is not None:
+            wanted = set(views)
+            if turntable:
+                wanted.update({"rot0", "rot90", "rot180", "rot270"})
+            view_configs = [(n, p) for n, p in view_configs if n in wanted]
+        if level == "iso_only":
+            view_configs = [(n, p) for n, p in view_configs if n == "iso"]
         
+        dims_label = f"{bbox[3]-bbox[0]:.0f}x{bbox[4]-bbox[1]:.0f}x{bbox[5]-bbox[2]:.0f}"
         views = {}
         for view_name, camera_pos in view_configs:
             try:
                 png_bytes = self._render_view(
                     vertices, faces, bbox, camera_pos, view_name,
-                    cx, cy, cz, lim, size,
+                    cx, cy, cz, lim, size, image_size=image_size,
                 )
+                if png_bytes and annotate:
+                    png_bytes = self._annotate_png(png_bytes, f"{view_name.upper()} | {dims_label}")
                 views[view_name] = png_bytes if png_bytes else None
             except Exception:
                 # P0-4: 单个视图失败不影响其他
@@ -156,15 +189,61 @@ class Renderer:
         
         return views
     
+    def _annotate_png(self, png_bytes: bytes, label: str) -> bytes:
+        """v2.2: 在 PNG 左上角叠加视图名 + 尺寸标注（失败则原图返回）"""
+        from PIL import Image, ImageDraw
+        try:
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+            d = ImageDraw.Draw(img)
+            tb = d.textbbox((8, 6), label)
+            d.rectangle([tb[0]-4, tb[1]-2, tb[2]+4, tb[3]+2], fill=(255, 255, 255, 210))
+            d.text((tb[0], tb[1]), label, fill=(15, 15, 15, 255))
+            out = io.BytesIO()
+            img.convert("RGB").save(out, format="PNG")
+            return out.getvalue()
+        except Exception:
+            return png_bytes
+
+    @staticmethod
+    def compose_grid(views: Dict[str, bytes], cols: int = 2) -> Optional[bytes]:
+        """v2.2: 把多张视图拼成带标题网格，供视觉 LLM 一次看多角度（失败返回 None）"""
+        from PIL import Image, ImageDraw
+        try:
+            items = [(k, v) for k, v in views.items() if v]
+            if not items:
+                return None
+            imgs = []
+            for k, v in items:
+                im = Image.open(io.BytesIO(v)).convert("RGB")
+                imgs.append((k, im))
+            w = max(im.width for _, im in imgs)
+            h = max(im.height for _, im in imgs)
+            rows = math.ceil(len(imgs) / cols)
+            pad, title_h = 4, 18
+            grid = Image.new("RGB", (cols*w + (cols+1)*pad, rows*(h+title_h) + (rows+1)*pad), (255, 255, 255))
+            d = ImageDraw.Draw(grid)
+            for idx, (k, im) in enumerate(imgs):
+                r, c = divmod(idx, cols)
+                x = pad + c*(w+pad)
+                y = pad + r*(h+title_h+pad)
+                grid.paste(im, (x, y + title_h))
+                d.text((x + 4, y + 1), k.upper(), fill=(0, 0, 0))
+            out = io.BytesIO()
+            grid.save(out, format="PNG")
+            return out.getvalue()
+        except Exception:
+            return None
+
     def _make_cache_key(
         self, 
         geometry: Any, 
         level: str, 
         geometry_revision: int,
         tolerance: float = 0.1,
+        render_config: tuple = (),
     ) -> Tuple:
         """P0-1 修复：缓存键包含 revision + level + config
-        P1-3（v8）：+ tolerance
+        P1-3（v8）：+ tolerance；v2.2：+ render_config（视图/标注/转台/尺寸）
         """
         return (
             id(geometry),
@@ -172,6 +251,7 @@ class Renderer:
             tolerance,
             level,
             self._config_signature,
+            render_config,
         )
     
     def _extract_mesh(self, geometry: Any, tolerance: float = 0.1) -> Tuple[List, List]:
@@ -322,11 +402,13 @@ class Renderer:
         view_name: str,
         cx: float, cy: float, cz: float,
         lim: float, size: tuple,
+        image_size: Optional[Tuple[int, int]] = None,
     ) -> bytes:
         """渲染单个视角（P0-4: 异常隔离）"""
         try:
+            img_size = image_size or self.image_size
             fig = plt.figure(
-                figsize=(self.image_size[0] / self.dpi, self.image_size[1] / self.dpi),
+                figsize=(img_size[0] / self.dpi, img_size[1] / self.dpi),
                 dpi=self.dpi,
             )
             ax = fig.add_subplot(111, projection="3d")
@@ -352,9 +434,22 @@ class Renderer:
             mesh.set_facecolor((0.6, 0.7, 0.9, 0.7))
             ax.add_collection3d(mesh)
             
-            ax.set_xlim(cx - lim, cx + lim)
-            ax.set_ylim(cy - lim, cy + lim)
-            ax.set_zlim(cz - lim, cz + lim)
+            # Frame orthographic views by their visible dimensions.  Using
+            # the longest part dimension for every axis makes a long motor's
+            # top view collapse to a few pixels.
+            pad = 0.3
+            half = [max(v * (0.5 + pad), 1.0) for v in size]
+            if view_name == "top":
+                xh, yh, zh = half
+            elif view_name == "front":
+                xh, yh, zh = half[0], max(half[0], half[2]), half[2]
+            elif view_name == "side":
+                xh, yh, zh = max(half[1], half[2]), half[1], half[2]
+            else:
+                xh = yh = zh = lim
+            ax.set_xlim(cx - xh, cx + xh)
+            ax.set_ylim(cy - yh, cy + yh)
+            ax.set_zlim(cz - zh, cz + zh)
             
             dx, dy, dz = camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz
             norm = math.sqrt(dx*dx + dy*dy + dz*dz)
