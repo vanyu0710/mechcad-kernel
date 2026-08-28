@@ -408,7 +408,7 @@ backend/cad_worker/
 
 ## 许可证
 
-MIT
+本项目采用 **GNU Affero General Public License v3.0 或更高版本（AGPL-3.0-or-later）**。修改后通过网络提供服务时，必须按 AGPL 第 13 条提供对应源代码。第三方依赖仍遵循其各自许可证。详见仓库根目录 `LICENSE`。
 
 ---
 

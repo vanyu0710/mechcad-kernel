@@ -5,7 +5,7 @@
 [![Tests](https://img.shields.io/badge/tests-227%2F227-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
 [![v2.1](https://img.shields.io/badge/version-v2.1%2Bv2.1-blue)]()
 
 ## 概述
@@ -18,7 +18,7 @@ MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发�
 - Capability Registry (29 op JSON Schema) — LLM 知道"能做什么"
 - 5 类类型化错误 + 事务 Savepoint + 撤销/重做
 - 6 种几何属性查询 + 按类型选面 + 3 种度量
-- DeepSeek Vision (v4-flash-vision-exp) + Chat Planner 端到端集成
+- OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
 - 227/227 测试全过
 
 ## 🎨 实际产出（端到端真实几何）
@@ -103,7 +103,7 @@ k.export('flange.step', format='step')
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  LLM (DeepSeek Vision + Chat Planner)                       │
+│  LLM (OpenAI-compatible Vision + Chat Planner)              │
 │  - Vision: 手绘 PNG → 结构化 JSON (part_type/dimensions)   │
 │  - Planner: 结构化 JSON → op 序列                          │
 └──────────────────────┬─────────────────────────────────────┘
@@ -192,6 +192,27 @@ pip install build123d==0.11.1 cadquery-ocp-novtk==7.9.3.0 \
 # matplotlib 为 renderer 渲染/测试必需
 ```
 
+## 多模型与密钥安全
+
+LLM 客户端支持任何实现 OpenAI `chat/completions` 接口的服务。项目不保存密钥；推荐只在进程环境中配置：
+
+```bash
+export MECHKERNEL_API_KEY="你的私有密钥"
+export MECHKERNEL_BASE_URL="https://api.openai.com/v1"
+export MECHKERNEL_MODEL="你的文本模型"
+export MECHKERNEL_PLANNER_MODEL="你的规划模型"
+export MECHKERNEL_VISION_MODEL="你的视觉模型"
+```
+
+```python
+from mech_kernel.llm import OpenAICompatiblePlannerLLM, OpenAICompatibleVisionLLM
+
+planner = OpenAICompatiblePlannerLLM()
+vision = OpenAICompatibleVisionLLM()
+```
+
+也可以为不同模型显式传入不同的密钥和端点。密钥不会出现在日志、`repr`、异常正文或仓库文件中。DeepSeek 的旧接口继续可用，使用 `DSKEY` 环境变量；`.env.example` 仅是变量名模板，真实 `.env` 已被 Git 忽略。
+
 ## 跑测试
 
 ```bash
@@ -214,7 +235,7 @@ sys.exit(exit_code)
 | 03 | `examples/03_mock_render.py` | 渲染 |
 | 04 | `examples/04_e2e_orchestrator.py` | Mock planner |
 | 05 | `examples/05_real_geometry.py` | 真实 build123d |
-| 06 | `examples/06_end_to_end_llm.py` | DeepSeek 端到端（disk/ring/block） |
+| 06 | `examples/06_end_to_end_llm.py` | OpenAI-compatible / DeepSeek 端到端（disk/ring/block） |
 | 07 | `examples/07_complex_parts.py` | 复杂件（带孔板/键槽/L 形/阶梯轴） |
 | 08 | `examples/08_multistep_parts.py` | 多步骤（沉孔/T槽/6孔法兰/轴向通孔） |
 | 09 | `examples/09_fillet_chamfer.py` | 圆角 + 倒角 |
@@ -243,6 +264,7 @@ sys.exit(exit_code)
 
 - `mech_kernel/kernel.py` (~1200 行) — 主 API
 - `mech_kernel/llm/deepseek.py` — DeepSeek Vision/Chat 客户端
+- `mech_kernel/llm/openai_compatible.py` — 通用 OpenAI-compatible Vision/Planner 客户端（密钥不入库）
 - `mech_kernel/capability_registry.py` — 25 op JSON Schema
 - `mech_kernel/feature_graph.py` — Feature DAG
 - `mech_kernel/transaction.py` — 事务 Savepoint
@@ -250,7 +272,7 @@ sys.exit(exit_code)
 
 ## 许可
 
-MIT License
+本项目采用 **GNU Affero General Public License v3.0 或更高版本（AGPL-3.0-or-later）**。允许使用、修改和分发，但修改后通过网络向用户提供服务时，必须按 AGPL 第 13 条提供对应源代码。详见 [`LICENSE`](LICENSE)；第三方依赖仍遵循其各自许可证。
 
 ## 致谢
 
