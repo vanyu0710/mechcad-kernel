@@ -9,17 +9,14 @@ DeepSeek 通用模型：deepseek-chat
 环境变量：DSKEY（DeepSeek 官方 API key）
 """
 from __future__ import annotations
-import os
 import json
-import logging
 import base64
-import requests
 from typing import List, Dict, Any, Optional
 
-_logger = logging.getLogger("mech_kernel.llm")
+from .openai_compatible import OpenAICompatibleClient
 
 
-class DeepSeekClient:
+class DeepSeekClient(OpenAICompatibleClient):
     """DeepSeek OpenAI 兼容 HTTP 客户端"""
     
     BASE_URL = "https://api.deepseek.com/v1"
@@ -31,69 +28,14 @@ class DeepSeekClient:
         base_url: Optional[str] = None,
         timeout: float = 60.0,
     ):
-        self.api_key = api_key or os.environ.get("DSKEY")
-        if not self.api_key:
-            raise ValueError("DeepSeek API key 未配置（设环境变量 DSKEY）")
-        self.model = model
-        self.base_url = base_url or self.BASE_URL
-        self.timeout = timeout
-    
-    def chat(
-        self,
-        messages: List[Dict[str, Any]],
-        max_tokens: int = 2000,
-        response_format: Optional[Dict[str, str]] = None,
-        temperature: float = 0.0,
-    ) -> Dict[str, Any]:
-        """调用 chat/completions，返回 message dict（含 content/reasoning_content）"""
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": False,
-        }
-        if response_format:
-            body["response_format"] = response_format
-        
-        _logger.info(f"DeepSeek call: model={self.model} max_tokens={max_tokens}")
-        r = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=self.timeout,
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            base_url=base_url or self.BASE_URL,
+            timeout=timeout,
+            api_key_env="DSKEY",
+            provider_name="DeepSeek",
         )
-        if r.status_code != 200:
-            _logger.error(f"DeepSeek error {r.status_code}: {r.text[:500]}")
-            r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]
-    
-    def chat_json(
-        self,
-        messages: List[Dict[str, Any]],
-        max_tokens: int = 2000,
-    ) -> Dict[str, Any]:
-        """调用并自动解析 JSON 返回"""
-        msg = self.chat(
-            messages,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-        )
-        content = msg.get("content", "{}")
-        # DeepSeek reasoning 模式：先 reasoning_content 再 ```json ... ```
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            # 尝试提取 ```json ... ``` 块
-            if "```json" in content:
-                start = content.index("```json") + 7
-                end = content.index("```", start)
-                return json.loads(content[start:end].strip())
-            raise
 
 
 # ====== 系统提示词 ======

@@ -9,7 +9,7 @@ Demo 06: 端到端 Vision LLM + Planner LLM + MechKernel + 真实 build123d 几�
 5. 渲染对比图（手绘草图 vs 真实几何）
 
 运行：PYTHONPATH=/workspace python3 mech_kernel/examples/06_end_to_end_llm.py
-环境：DSKEY（DeepSeek API key）
+环境：默认 DSKEY（DeepSeek API key）；其他 OpenAI-compatible 服务见 README 的 `MECHKERNEL_*` 配置。
 """
 from __future__ import annotations
 import os

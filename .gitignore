@@ -23,3 +23,14 @@ mech_kernel/examples/fillet_out/04_flange_full.png.bak
 *.tmp
 *.bak
 .DS_Store
+
+# Local credentials and provider settings (use .env.example as the safe template)
+.env
+.env.*
+!.env.example
+
+# Local test/benchmark reports
+full-test-output.txt
+one-test.txt
+targeted-output.txt
+reports/
