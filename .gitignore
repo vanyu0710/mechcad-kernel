@@ -45,3 +45,6 @@ mech_kernel/examples/rocket_motor_out/closure.png
 mech_kernel/examples/rocket_motor_out/motor_assembly.png
 mech_kernel/examples/rocket_motor_out/nozzle_cd.png
 mech_kernel/examples/rocket_motor_out/nozzle_section.png
+
+# Generated gearbox demo artifacts (the reproducible script is tracked).
+mech_kernel/examples/gearbox_out/
