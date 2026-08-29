@@ -21,7 +21,8 @@ def test_render_is_public_and_has_schema():
     assert "render" in PUBLIC_OPS
     assert k.cap.has("render")
     assert set(k.cap.get("render").input_schema) == {
-        "views", "size", "annotate", "section", "turntable", "intent", "target", "name"
+        "views", "size", "annotate", "section", "turntable", "intent",
+        "target", "name", "quality", "backend", "show_edges", "highlight",
     }
 
 

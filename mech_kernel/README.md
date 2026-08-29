@@ -1,4 +1,4 @@
-# MechKernel v1.1
+# MechKernel v2.6
 
 > **为 MechCAD（vanyu0710/aicad）打造的几何内核中间层**  
 > 让 AI 像人类工程师一样建模：看 → 想 → 做 → 验
@@ -10,16 +10,18 @@
 **MechKernel** 是一个为 AI CAD 设计的"语义几何内核"。
 
 它把脆弱的 `build123d` / `trimesh` 调用，包装成对 LLM 友好的**原子 API**：
-- ✅ **33 个公共操作**（草图、实体、细节、复用、查询、编辑、装配、约束与可视化）
+- ✅ **36 个公共操作**（草图、实体、细节、复用、查询、编辑、装配、约束与可视化）
 - ✅ **5 类类型化错误**（INVALID_REQUEST / KERNEL_BUG / STATE_CORRUPTION / GEOMETRY_FAILURE / RECOVERABLE / NOT_IMPLEMENTED）
 - ✅ **事务 Savepoint**（失败整体回滚，可独立撤销）
 - ✅ **Feature Graph DAG**（持久化命名 + 增量循环检测）
 - ✅ **Capability Registry**（自动注册 + JSON Schema + LLM 友好）
-- ✅ **自适应多视图渲染**（拓扑变化 full 视图，间隔步骤 iso 快照）
+- ✅ **双后端专业渲染**（OCC 优先，Windows 无头自动回退 matplotlib）
 - ✅ **AI 截面与转台视图**（真实几何半空间切割，不改变模型）
 - ✅ **视觉证据包**（正交投影、固定像素预算、图像哈希与截面 manifest）
 - ✅ **三态拓扑检查**（valid / invalid / unknown，不伪造 False）
 - ✅ **二维约束参数化**（SciPy 确定性求解、命名尺寸、冲突诊断与历史重放）
+- ✅ **实例级装配显示**（分色、隐藏、查询、高亮与持久化）
+- ✅ **几何可靠性验证**（提交前检查、reason code、指纹与严格回滚）
 - ✅ **完整项目持久化与生产力基准**（STEP + graph/history JSON）
 
 **核心创新**：每个 API 调用的结果（`StepResult`）包含 `success / error_kind / error / hint / suggestion / geometry_summary / render_png / next_hints`，让 LLM 拿到**可决策的反馈**。
@@ -42,7 +44,7 @@
                     │ kernel.execute(op, **args)
                     ▼
 ┌─────────────────────────────────────────────────────┐
-│ L3: MechKernel  ← 33 个公共 API + capability registry│
+│ L3: MechKernel  ← 37 个公共 API + capability registry│
 │     5 类错误 / 事务 / 撤销栈 / 几何缓存              │
 └───────────────────┬─────────────────────────────────┘
                     │ build123d 调用（v1.1 用 MockBox 占位）
@@ -76,11 +78,13 @@
 | **编辑** | `undo` / `redo` / `delete_feature` / `update_feature` / `rebuild` / `export` | ✅ 参数化重放 |
 | **可视化** | `render` | ✅ 多视图、转台、标注、真实截面 |
 
-`delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/装配以及缺少有效 history.json 的旧项目保留外部几何，因此重放返回 `RECOVERABLE`。完整的 v2.4 history.json 加载成功后仍可在当前会话重放。
+`delete_feature` / `update_feature` / `rebuild` 会在会话内通过 op 历史全量重放；导入/装配以及缺少有效 history.json 的旧项目保留外部几何，因此重放返回 `RECOVERABLE`。完整的 v2.4/v2.5/v2.6 history.json 加载成功后仍可在当前会话重放。
+
+所有拓扑建模操作在事务提交前执行几何验证。验证失败会严格回滚，并返回 `geometry_validation`、稳定 `reason_codes` 与修复建议。`validate_geometry(target, level)` 可显式检查当前几何或指定 feature。
 
 ### Visual Evidence（v2.3+）
 
-`render` 生成的是给 AI 验证的工程证据包，不是调试截图：所有视图采用正交投影、无坐标轴和网格，并将拼图限制在请求的 `size` 像素预算内。结果含 `evidence_manifest`，记录投影、截面、bbox、布局和每张图的 SHA-256 指纹。
+`render` 生成的是给 AI 验证的工程证据包，不是调试截图：所有视图采用正交投影、无坐标轴和网格，并将拼图限制在请求的 `size` 像素预算内。`backend="auto"` 优先探测 OCC，无法建立图形上下文时回退到 matplotlib。结果含 `evidence_manifest`，记录后端、回退 warning、投影、截面、实例、bbox、布局和每张图的 SHA-256 指纹。
 
 ```python
 # 默认：ISO + 3 个正交视图
@@ -333,7 +337,9 @@ mech_kernel/
 ├── transaction.py                # Savepoint 事务
 ├── validators.py                 # 参数校验
 ├── geometry_inspector.py         # BRep 指标 + 三态拓扑
-├── renderer.py                   # matplotlib 多视图/拼图 + LRU + 异常隔离
+├── renderer.py                   # OCC 优先、matplotlib 回退的多视图/拼图
+├── occ_renderer.py               # OCC AIS/V3d 离屏能力探测与回退边界
+├── assembly.py                   # 实例级装配显示元数据
 ├── adaptive_renderer.py          # C 方案策略
 ├── constraint_solver.py          # v2.4 二维约束求解器
 ├── sketch_renderer.py            # 草图约束证据图

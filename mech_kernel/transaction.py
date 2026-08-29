@@ -112,6 +112,11 @@ class Transaction:
         if self._rolled_back:
             raise KernelBugError("事务已 rollback，不能 commit")
         
+        # Validate before publishing the state. If this raises, __exit__
+        # restores the transaction snapshot automatically.
+        if hasattr(self.kernel, "_validate_transaction_state"):
+            self.kernel._validate_transaction_state(self.description)
+
         self._committed = True
         
         # 入 undo 的条件：

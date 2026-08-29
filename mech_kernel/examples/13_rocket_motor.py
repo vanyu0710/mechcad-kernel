@@ -4,12 +4,18 @@ Demo 13: 业余探空火箭固体发动机（壳体 + 堵头 + CD 喷口 + 整�
 
 1. 壳体  : Ø60 外径 × 3mm 壁厚 × 300mm 管（同心圆 → 拉伸成环）
 2. 堵头  : Ø60 圆盘 × 15mm + 中心点火孔 Ø8 + 外缘倒角
-3. 喷口  : 收敛-扩张(CD)喷口 —— line 闭合半剖面绕 Y 轴 revolve
+3. 喷口  : 带内流道和喉部的收敛-扩张(CD)喷口 —— 壁厚半剖面绕 Y 轴 revolve
 4. 装配  : 三件按坐标 assemble → 整机 STEP
 """
 from __future__ import annotations
 import os, sys, math
 from pathlib import Path
+
+# Make direct execution work from any current directory:
+# python mech_kernel/examples/13_rocket_motor.py
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from mech_kernel import MechKernel
 
@@ -95,14 +101,26 @@ def build_closure():
     return k
 
 
-# ---------- 3. CD 喷口（line 闭合半剖面 revolve）----------
+# ---------- 3. CD 喷口（带内流道的壁厚半剖面 revolve）----------
 def build_cd_nozzle():
     k = MechKernel()
     k.create_workplane("XY", "XY")
     k.new_sketch("XY", "cd_profile")
-    # 半剖面（绕 Y 轴）：轴心(0,0)→入口唇(22,0)→收敛(8,20)→喉部(8,30)→扩张(16,50)→轴心(0,50)→闭合
-    for seg in [((0, 0), (22, 0)), ((22, 0), (8, 20)), ((8, 20), (8, 30)),
-                ((8, 30), (16, 50)), ((16, 50), (0, 50)), ((0, 50), (0, 0))]:
+    # 壁厚半剖面（绕 Y 轴）：
+    # 外轮廓：入口 R22 -> 外喉 R10 -> 出口 R18
+    # 内流道：入口 R19 -> 内喉 R7 -> 出口 R14
+    # 不连接旋转轴，revolve 后入口、喉部和出口均保持贯通。
+    profile = [
+        ((22, 0), (10, 20)),
+        ((10, 20), (10, 30)),
+        ((10, 30), (18, 50)),
+        ((18, 50), (14, 50)),
+        ((14, 50), (7, 30)),
+        ((7, 30), (7, 20)),
+        ((7, 20), (19, 0)),
+        ((19, 0), (22, 0)),
+    ]
+    for seg in profile:
         k.add_line("cd_profile", start=seg[0], end=seg[1])
     k.close_sketch("cd_profile")
     k.revolve("cd_profile", axis=[0, 0, 0, 0, 1, 0], angle=360, mode="new_body", name="cd_nozzle")
@@ -141,6 +159,10 @@ def main():
     nozzle = build_cd_nozzle()
     part_report("喷口", nozzle)
     render_part(nozzle, "nozzle_cd")
+    save_render(
+        nozzle.render(intent="section", section={"axis": "X", "offset": 0}, size=640, annotate=True),
+        "nozzle_section",
+    )
     nozzle_step = export_step(nozzle, "nozzle_cd")
 
     print("\n[4/4] 整机装配（壳体 + 堵头 + 喷口）")

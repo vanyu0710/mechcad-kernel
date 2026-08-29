@@ -2,24 +2,34 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-v2.4%20constraint%20ready-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-v2.6%20geometry%20validated-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.4](https://img.shields.io/badge/version-v2.4-blue)]()
+[![v2.6](https://img.shields.io/badge/version-v2.6-blue)]()
 
 ## 概述
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
 **核心能力**：
-- **33/33 op 全部真实实现**（100%）— 覆盖所有 capability registry op
+- **37/37 op 全部真实实现**（100%）— 覆盖所有 capability registry op
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean）
 - Capability Registry (33 op JSON Schema) — LLM 知道"能做什么"
 - 5 类类型化错误 + 事务 Savepoint + 撤销/重做
 - 6 种几何属性查询 + 按类型选面 + 3 种度量
 - OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
 - 二维约束、命名参数、确定性重放、持久化与多视角证据
+
+## v2.6 几何可靠性验证与严格回滚
+
+所有拓扑操作在事务提交前进行几何验证；无效候选结果严格回滚，不留下 feature 或历史记录。`validate_geometry(target, level)` 支持 `basic`、`standard` 和 `strict`，结果包含稳定 `reason_codes`、几何摘要和确定性 fingerprint。history 文件保存验证结果，重放/加载时校验体积和 fingerprint。
+
+## v2.5 专业渲染与实例级装配
+
+渲染支持 `backend="auto"|"occ"|"matplotlib"`、evidence/presentation 质量、分色装配实例、隐藏/高亮、四视图/转台和真实截面。Windows 无头环境无法建立 OCC 图形上下文时自动回退 matplotlib，并在 `evidence_manifest` 中保留 warning，不伪造 OCC 成功。
+
+装配保留融合后的 STEP 几何，同时保存实例级 `id/name/color/visible/bbox` 元数据。`query_assembly`、`set_instance_visibility` 和 `set_instance_color` 只影响视觉场景，不改变 `_current_geometry`，也不进入参数化重放历史。
 
 ## v2.4 约束参数化与生产力基准
 
@@ -190,11 +200,25 @@ k.export('flange.step', format='step')
 | **+ v1.16** | **2026-08-27** | **正确性修复：registry schema 对齐 + execute() 全 op 可用 / delete/update 诚实化 / undo 恢复几何 / query/measure 目标与负坐标 / sweep 方向 / extrude 偏移圆** | **193** | **25** |
 | **+ v2.0** | **2026-08-28** | **参数化重放引擎：op 历史 + rebuild 公共 op + delete/update 真实重算（几何特征/草图实体）** | **210** | **26** |
 | **+ v2.1** | **2026-08-28** | **剖面与装配：revolve 支持 line/polyline/arc 闭合剖面（CD 喷口）+ add_polyline/add_arc + assemble 多件装配；add/cut/boolean 统一剖面支持；bbox 取全部 solid 并集；修复幻影原点圆柱** | **227** | **29** |
+| **+ v2.4** | **2026-08-29** | **二维约束、命名参数、SciPy 确定性诊断、graph/history 持久化** | **244** | **33** |
+| **+ v2.5** | **2026-08-29** | **OCC 优先双渲染后端、无头回退、实例级装配显示控制、分色/隐藏/高亮与场景 manifest** | **248+** | **36** |
+| **+ v2.6** | **2026-08-29** | **提交前几何验证、严格事务回滚、稳定 reason code、确定性几何指纹与 history 校验** | **253+** | **37** |
 
 ## 安装
 
+项目的真实 OCC 和渲染链要求 Python 3.12（Windows x64）。请使用仓库内独立虚拟环境，不要依赖 Codex 或系统 Python 的临时 site-packages：
+
+```powershell
+$py = "C:\\Path\\To\\Python312\\python.exe"
+& $py -m venv .venv
+\.venv\\Scripts\\python.exe -m pip install -r mech_kernel\\requirements.txt
+\.venv\\Scripts\\python.exe -c "import mech_kernel; import build123d, OCP, scipy, matplotlib; print('MechCAD runtime OK')"
+```
+
+如果使用本机已有的 Python 3.12，只需替换 `$py`；依赖会固定使用 `build123d==0.11.1` 与 `cadquery-ocp-novtk==7.9.3.0`，避免 OCC API 漂移。
+
 ```bash
-# 清华源（无大小限制）
+# 镜像安装（网络不稳定时可追加 --extra-index-url https://pypi.org/simple）
 pip install build123d==0.11.1 cadquery-ocp-novtk==7.9.3.0 \
     webcolors svgpathtools anytree ezdxf ocpsvg ocp_gordon \
     trianglesolver ipython sympy scikit-learn lib3mf requests matplotlib \
@@ -267,7 +291,7 @@ sys.exit(exit_code)
 
 **距离工业生产 1.0**：~3-5 人月（之前 5-7）
 
-> 评估小结：33 op 全部真实实现；参数化重放（v2.0）+ 多视角证据（v2.2）+ 二维约束参数化（v2.4）已落地，可建模 CD 喷口并对命名尺寸做确定性重算；工程图和三维装配约束仍在后续范围。
+> 评估小结：37 op 全部真实实现；v2.6 增加提交前验证、严格回滚和几何指纹。OCC 原生离屏显示依赖图形驱动；无头 Windows 下使用带明确 fallback manifest 的 matplotlib。
 > 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模。
 
 ## 关键文件
@@ -275,10 +299,13 @@ sys.exit(exit_code)
 - `mech_kernel/kernel.py` (~1200 行) — 主 API
 - `mech_kernel/llm/deepseek.py` — DeepSeek Vision/Chat 客户端
 - `mech_kernel/llm/openai_compatible.py` — 通用 OpenAI-compatible Vision/Planner 客户端（密钥不入库）
-- `mech_kernel/capability_registry.py` — 25 op JSON Schema
+- `mech_kernel/capability_registry.py` — 37 op JSON Schema
 - `mech_kernel/feature_graph.py` — Feature DAG
 - `mech_kernel/transaction.py` — 事务 Savepoint
-- `mech_kernel/renderer.py` — matplotlib 渲染
+- `mech_kernel/renderer.py` — OCC 优先、matplotlib 回退的专业证据渲染
+- `mech_kernel/occ_renderer.py` — OCC AIS/V3d 后端边界
+- `mech_kernel/assembly.py` — 实例级装配显示元数据
+- `mech_kernel/geometry_inspector.py` — 几何摘要、验证和指纹
 
 ## 许可
 

@@ -6,6 +6,8 @@ __pycache__/
 .Python
 *.egg-info/
 .pytest_cache/
+.venv/
+venv/
 
 # IDE
 .vscode/
@@ -34,3 +36,12 @@ full-test-output.txt
 one-test.txt
 targeted-output.txt
 reports/
+
+# Generated rocket motor demo artifacts (the three checked-in evidence images
+# remain tracked; local STEP/part outputs are reproducible).
+mech_kernel/examples/rocket_motor_out/*.step
+mech_kernel/examples/rocket_motor_out/case.png
+mech_kernel/examples/rocket_motor_out/closure.png
+mech_kernel/examples/rocket_motor_out/motor_assembly.png
+mech_kernel/examples/rocket_motor_out/nozzle_cd.png
+mech_kernel/examples/rocket_motor_out/nozzle_section.png

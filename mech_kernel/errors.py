@@ -38,6 +38,14 @@ class StateCorruptionError(MechKernelError):
     pass
 
 
+class GeometryValidationError(MechKernelError):
+    """Candidate geometry failed the kernel validation contract."""
+
+    def __init__(self, message: str, validation: Optional[dict] = None):
+        super().__init__(message)
+        self.validation = validation or {}
+
+
 class DeprecatedInternalAPIError(KernelBugError):
     """内部 API 已弃用。用于标记不该被调用的方法（如 _push_undo）。"""
     pass

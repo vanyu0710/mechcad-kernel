@@ -124,7 +124,7 @@ def test_sketch_render_and_persistence_include_constraints():
         assert os.path.exists(paths["history_path"])
         with open(paths["history_path"], encoding="utf-8") as stream:
             history = json.load(stream)
-        assert history["schema_version"] == "2.4"
+            assert history["schema_version"] == "2.6"
         assert any(item["op"] == "add_constraint" for item in history["op_history"])
 
 

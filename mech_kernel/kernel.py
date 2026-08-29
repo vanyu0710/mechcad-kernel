@@ -11,6 +11,7 @@ import hashlib
 
 from .errors import (
     MechKernelError, InvalidRequestError, KernelBugError, StateCorruptionError,
+    GeometryValidationError,
     make_geometry_failure, make_recoverable, GeometryFailureReason,
     DeprecatedInternalAPIError
 )
@@ -27,6 +28,7 @@ from .features import (
     next_feature_id, next_sketch_id, next_workplane_id, next_entity_id,
     next_constraint_id, reset_all_id_generators, seed_id_generators_from_history
 )
+from .assembly import AssemblyInstance
 from .constraint_solver import SUPPORTED_CONSTRAINTS, solve_sketch as solve_sketch_constraints, validate_constraint
 from .feature_graph import FeatureGraph
 from .workplane import Workplane, WorkplaneType, WorkplaneRegistry
@@ -51,6 +53,8 @@ PUBLIC_OPS = frozenset({
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
     "add_polyline", "add_arc", "assemble", "render",
     "add_constraint", "set_parameter", "solve_sketch",
+    "validate_geometry",
+    "query_assembly", "set_instance_visibility", "set_instance_color",
 })
 
 
@@ -75,6 +79,7 @@ class MechKernel:
         self._replaying: bool = False  # v2.0: 重放中（禁止再记录）
         self._has_non_replayable_op: bool = False  # v2.0: 会话含导入/加载，禁止重放
         self._parameters: Dict[str, float] = {}  # v2.4: 命名尺寸参数
+        self._assembly_instances: Dict[str, AssemblyInstance] = {}
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_render_base64: Optional[str] = None
         self._last_render_views: Dict[str, bytes] = {}
@@ -82,7 +87,7 @@ class MechKernel:
         self.inspector = self.geometry_inspector  # 别名（兼容测试）
         # Automatic visual checks use a compact evidence budget. Explicit
         # render(size=...) calls can request a larger final packet.
-        self.renderer = Renderer(image_size=(320, 320))
+        self.renderer = Renderer(image_size=(320, 320), backend="auto")
         self.adaptive_renderer = AdaptiveRenderer(interval=5)  # v1.5 修复：Renderer 不是 interval
         self._undo_stack: List[Dict] = []
         self._redo_stack: List[Dict] = []
@@ -267,9 +272,20 @@ class MechKernel:
                        "turntable": FieldSchema(type="boolean", required=False, default=False),
                        "intent": FieldSchema(type="enum", required=False, default="inspect",
                                              enum=["inspect", "section", "feature_zoom", "delta", "sketch"]),
+                       "quality": FieldSchema(type="enum", required=False, default="evidence",
+                                              enum=["evidence", "presentation"]),
+                       "backend": FieldSchema(type="enum", required=False, default="auto",
+                                              enum=["auto", "occ", "matplotlib"]),
+                       "show_edges": FieldSchema(type="boolean", required=False, default=False),
+                       "highlight": FieldSchema(type="list", required=False),
                        "target": FieldSchema(type="string", required=False,
                                              description="feature_zoom/delta 的 feature_id"),
                        "name": FieldSchema(type="string", required=False)},
+            "query_assembly": {"name": FieldSchema(type="string", required=False)},
+            "set_instance_visibility": {"instance_id": FieldSchema(type="string", required=True),
+                                         "visible": FieldSchema(type="boolean", required=True)},
+            "set_instance_color": {"instance_id": FieldSchema(type="string", required=True),
+                                    "color": FieldSchema(type="tuple", required=True, items_type="number", length=3)},
             "add_constraint": {"sketch_name": FieldSchema(type="string", required=True),
                                 "constraint_type": FieldSchema(type="enum", required=True, enum=sorted(SUPPORTED_CONSTRAINTS)),
                                 "references": FieldSchema(type="list", required=True),
@@ -280,6 +296,9 @@ class MechKernel:
                                "value": FieldSchema(type="number", required=True, min=0.000001)},
             "solve_sketch": {"sketch_name": FieldSchema(type="string", required=True),
                               "mode": FieldSchema(type="enum", required=False, default="strict", enum=["strict", "best_effort"])},
+            "validate_geometry": {"target": FieldSchema(type="string", required=False, default="_current_geometry"),
+                                   "level": FieldSchema(type="enum", required=False, default="standard",
+                                                         enum=["basic", "standard", "strict"])},
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
@@ -1711,6 +1730,33 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
+    def validate_geometry(self, target: str = "_current_geometry", level: str = "standard") -> StepResult:
+        """Validate a current or feature-scoped geometry without changing state."""
+        if target in ("current", "_current_geometry"):
+            geometry = self._current_geometry
+        else:
+            if target not in self._feature_geometries:
+                raise InvalidRequestError(f"validate_geometry target 不存在: {target}")
+            geometry = self._feature_geometries[target]
+        if level not in ("basic", "standard", "strict"):
+            raise InvalidRequestError("level 必须是 basic、standard 或 strict")
+        validation = self.geometry_inspector.validate_geometry(
+            geometry, level=level, feature_count=len(self.feature_graph.nodes)
+        ).to_dict()
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"V_{self._step_counter:03d}",
+            narrative=f"验证几何 {target} ({level})",
+            geometry_summary=self._geometry_summary_for(geometry),
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"validated": [target]},
+            elapsed_ms=0.0,
+            step_index=self._step_counter,
+            geometry_validation=validation,
+        )
+        result.value = validation
+        return result
+
     def query(self, target: str, what: str = "bounding_box") -> "StepResult":
         """
         v1.11 真实 query（查询几何属性）— 用 OCC Bnd_Box / TopExp 提取
@@ -1740,8 +1786,97 @@ class MechKernel:
 
         if geom is None:
             raise InvalidRequestError("query 需要先有几何")
-        
-        from OCP.BRepBndLib import BRepBndLib
+
+        # Adapter/mock geometry has no TopoDS wrapper.  Use the same public
+        # summary contract instead of passing it to OCP TopExp_Explorer.
+        if not hasattr(geom, "wrapped"):
+            summary = self._geometry_summary_for(geom)
+            if what == "bounding_box":
+                bb = summary.bounding_box
+                result_value = {
+                    "xmin": bb[0], "ymin": bb[1], "zmin": bb[2],
+                    "xmax": bb[3], "ymax": bb[4], "zmax": bb[5],
+                    "size_x": bb[3] - bb[0], "size_y": bb[4] - bb[1],
+                    "size_z": bb[5] - bb[2],
+                }
+            elif what == "volume":
+                result_value = summary.volume
+            elif what == "centroid":
+                bb = summary.bounding_box
+                result_value = {"x": (bb[0] + bb[3]) / 2,
+                                "y": (bb[1] + bb[4]) / 2,
+                                "z": (bb[2] + bb[5]) / 2}
+            elif what == "face_count":
+                result_value = summary.face_count
+            elif what == "edge_count":
+                result_value = summary.edge_count
+            else:
+                result_value = summary.vertex_count
+            self._step_counter += 1
+            result = make_success(
+                feature_id=f"Q_{self._step_counter:03d}",
+                narrative=f"query {target} {what}",
+                geometry_summary=summary,
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"queried": [target, what]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+            result.value = result_value
+            result.target = target
+            result.what = what
+            result.warning = warning
+            return result
+
+        try:
+            from OCP.BRepBndLib import BRepBndLib
+        except ImportError:
+            bbox = getattr(geom, "bounding_box", getattr(geom, "bbox", None))
+            if callable(bbox):
+                bbox = bbox()
+            if bbox is None or len(bbox) != 6:
+                raise InvalidRequestError("query 当前几何没有可用包围盒")
+            bbox = tuple(float(value) for value in bbox)
+            if what == "bounding_box":
+                result_value = {
+                    "xmin": bbox[0], "ymin": bbox[1], "zmin": bbox[2],
+                    "xmax": bbox[3], "ymax": bbox[4], "zmax": bbox[5],
+                    "size_x": bbox[3] - bbox[0], "size_y": bbox[4] - bbox[1],
+                    "size_z": bbox[5] - bbox[2],
+                }
+            elif what == "volume":
+                result_value = float(getattr(geom, "volume", 0.0))
+            elif what == "centroid":
+                result_value = {
+                    "x": (bbox[0] + bbox[3]) / 2,
+                    "y": (bbox[1] + bbox[4]) / 2,
+                    "z": (bbox[2] + bbox[5]) / 2,
+                }
+            elif what == "face_count":
+                value = getattr(geom, "face_count", None)
+                result_value = int(value if value is not None else len(getattr(geom, "faces", [])))
+            elif what == "edge_count":
+                value = getattr(geom, "edge_count", None)
+                result_value = int(value if value is not None else 0)
+            else:
+                value = getattr(geom, "vertex_count", None)
+                result_value = int(value if value is not None else len(getattr(geom, "vertices", [])))
+            self._step_counter += 1
+            result = make_success(
+                feature_id=f"Q_{self._step_counter:03d}",
+                narrative=f"query {target} {what}",
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"queried": [target, what]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+            result.value = result_value
+            result.target = target
+            result.what = what
+            if warning:
+                result.warning = warning
+            return result
+
         from OCP.Bnd import Bnd_Box
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX, TopAbs_SOLID
@@ -2288,18 +2423,24 @@ class MechKernel:
         
         graph_data = self.feature_graph.to_dict()
         graph_data["_project_meta"] = {
-            "version": "v2.4",
+            "version": "v2.6",
             "geometry_volume": self._current_geometry.volume if hasattr(self._current_geometry, "volume") else None,
         }
         graph_data["_sketches"] = {name: sketch.to_dict() for name, sketch in self.sketches.items()}
         graph_data["_parameters"] = dict(self._parameters)
+        graph_data["_assembly_instances"] = {
+            key: value.to_dict() for key, value in self._assembly_instances.items()
+        }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(graph_data, f, ensure_ascii=False, indent=2)
         history_data = {
-            "schema_version": "2.4",
+            "schema_version": "2.6",
             "replayable": not self._has_non_replayable_op,
             "op_history": copy.deepcopy(self._op_history),
             "geometry": self._geometry_summary_for(self._current_geometry).to_dict(),
+            "geometry_validation": self.geometry_inspector.validate_geometry(
+                self._current_geometry, level="standard", feature_count=len(self.feature_graph.nodes)
+            ).to_dict(),
         }
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history_data, f, ensure_ascii=False, indent=2)
@@ -2349,16 +2490,21 @@ class MechKernel:
                 graph_data = json.load(f)
             saved_sketches = graph_data.pop("_sketches", {})
             saved_parameters = graph_data.pop("_parameters", {})
+            saved_assembly = graph_data.pop("_assembly_instances", {})
             graph_data.pop("_project_meta", None)
             self.feature_graph.from_dict(graph_data)
             self.sketches = {name: Sketch.from_dict(data) for name, data in saved_sketches.items()}
             self._parameters = {name: float(value) for name, value in saved_parameters.items()}
+            self._assembly_instances = {
+                key: AssemblyInstance.from_dict(value) for key, value in saved_assembly.items()
+            }
+            assembly_warning = self._restore_assembly_geometries()
             replay_message = ""
             loaded_history_replayable = False
             if os.path.exists(history_path):
                 with open(history_path, "r", encoding="utf-8") as f:
                     history_data = json.load(f)
-                if history_data.get("schema_version") == "2.4" and history_data.get("replayable"):
+                if history_data.get("schema_version") in ("2.4", "2.5", "2.6") and history_data.get("replayable"):
                     imported_geometry = self._geometry_internal
                     imported_snapshot = self._snapshot()
                     self._op_history = list(history_data.get("op_history", []))
@@ -2369,6 +2515,11 @@ class MechKernel:
                         actual = self._geometry_summary_for(self._current_geometry).to_dict()
                         if expected and abs(float(expected.get("volume", 0.0)) - float(actual.get("volume", 0.0))) > 1e-4:
                             raise StateCorruptionError("保存项目的历史重放体积校验失败")
+                        expected_validation = history_data.get("geometry_validation", {})
+                        if expected_validation.get("fingerprint"):
+                            actual_fingerprint = self.geometry_inspector.fingerprint(self._current_geometry)
+                            if actual_fingerprint != expected_validation["fingerprint"]:
+                                raise StateCorruptionError("保存项目的历史重放指纹校验失败")
                         loaded_history_replayable = True
                     except Exception as exc:
                         self._restore(imported_snapshot)
@@ -2381,6 +2532,8 @@ class MechKernel:
             else:
                 self._has_non_replayable_op = True
                 replay_message = "缺少 history.json，按旧项目兼容加载"
+            if assembly_warning:
+                replay_message = f"{replay_message + '；' if replay_message else ''}{assembly_warning}"
             
             self.narrative.append(f"加载项目 ← {base_path}")
             txn.commit()
@@ -2388,7 +2541,6 @@ class MechKernel:
             # session.  Legacy/invalid histories intentionally keep the STEP
             # fallback and remain non-replayable.
             self._has_non_replayable_op = not loaded_history_replayable
-            self._feature_geometries[feature_id] = self._current_geometry
         
         render_level = "iso_only"  # v1.5.4: 简单 load 用 iso
         render_png = None
@@ -2438,17 +2590,47 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             assembled = None
-            for item in parts:
+            self._assembly_instances = {}
+            palette = ([0.36, 0.56, 0.76], [0.78, 0.42, 0.22], [0.42, 0.68, 0.48], [0.62, 0.46, 0.76])
+            for index, item in enumerate(parts, start=1):
+                if not isinstance(item, dict):
+                    raise InvalidRequestError("装配实例必须是字典")
                 path = item["path"]
                 if not os.path.exists(path):
                     raise InvalidRequestError(f"零件 STEP 不存在: {path}")
-                part = b3d_import_step(path)
+                position = item.get("position", [0, 0, 0])
+                if not isinstance(position, (list, tuple)) or len(position) != 3:
+                    raise InvalidRequestError("装配实例 position 必须是长度为 3 的数组")
+                if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in position):
+                    raise InvalidRequestError("装配实例 position 必须全部是数字")
                 rot = item.get("rotation")
                 if rot is not None:
+                    if (not isinstance(rot, (list, tuple)) or len(rot) != 2 or
+                            not isinstance(rot[0], (int, float)) or
+                            not isinstance(rot[1], (list, tuple)) or len(rot[1]) != 3):
+                        raise InvalidRequestError("装配实例 rotation 必须是 [角度, [x,y,z]]")
+                part = b3d_import_step(path)
+                if rot is not None:
                     part = part.rotate(Axis((0, 0, 0), tuple(rot[1])), rot[0])
-                pos = item.get("position", [0, 0, 0])
-                part = part.translate(Vector(*pos))
+                part = part.translate(Vector(*position))
                 assembled = part if assembled is None else assembled + part
+                color = item.get("color", palette[(index - 1) % len(palette)])
+                if not isinstance(color, (list, tuple)) or len(color) != 3:
+                    raise InvalidRequestError("装配实例 color 必须是长度为 3 的 RGB 数组")
+                if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1 for value in color):
+                    raise InvalidRequestError("装配实例 color 每个分量必须在 0 到 1 之间")
+                instance_id = f"A_{index:04d}"
+                self._assembly_instances[instance_id] = AssemblyInstance(
+                    id=instance_id,
+                    name=str(item.get("name", os.path.splitext(os.path.basename(path))[0])),
+                    path=path,
+                    position=[float(value) for value in position],
+                    rotation=rot,
+                    color=[float(value) for value in color],
+                    visible=bool(item.get("visible", True)),
+                    bbox=list(self._geometry_summary_for(part).bounding_box),
+                    geometry=part,
+                )
             self._current_geometry = assembled
             self._has_non_replayable_op = True  # 装配依赖外部 STEP，不可重放
             self.narrative.append(f"装配 {len(parts)} 个零件 → {feature.name}")
@@ -2468,6 +2650,92 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
+
+    def query_assembly(self, name: str = "") -> StepResult:
+        """Return instance-level assembly metadata without changing geometry."""
+        start = time.time()
+        matches = [item for item in self._assembly_instances.values() if not name or item.name == name or item.id == name]
+        if name and not matches:
+            raise InvalidRequestError(f"装配实例不存在: {name}")
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"Q_{self._step_counter:03d}",
+            narrative=f"查询装配实例 {name or '全部'}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"queried": [item.id for item in matches]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {"instances": [item.to_dict() for item in matches], "count": len(matches)}
+        result.scene_manifest = self._scene_manifest()
+        return result
+
+    def set_instance_visibility(self, instance_id: str, visible: bool) -> StepResult:
+        """Change display visibility only; fused geometry remains unchanged."""
+        if instance_id not in self._assembly_instances:
+            raise InvalidRequestError(f"装配实例不存在: {instance_id}")
+        if not isinstance(visible, bool):
+            raise InvalidRequestError("visible 必须是 boolean")
+        self._assembly_instances[instance_id].visible = visible
+        self.renderer.clear_cache()
+        self._step_counter += 1
+        result = make_success(
+            feature_id=instance_id, narrative=f"装配实例 {instance_id} {'显示' if visible else '隐藏'}",
+            current_narrative=self.narrative.copy(), feature_graph_delta={"updated": [instance_id]},
+            elapsed_ms=0.0, step_index=self._step_counter,
+        )
+        result.value = {"instance_id": instance_id, "visible": visible, "geometry_unchanged": True}
+        result.scene_manifest = self._scene_manifest()
+        return result
+
+    def set_instance_color(self, instance_id: str, color: tuple) -> StepResult:
+        """Change display color only; values are normalized RGB components."""
+        if instance_id not in self._assembly_instances:
+            raise InvalidRequestError(f"装配实例不存在: {instance_id}")
+        if not isinstance(color, (list, tuple)) or len(color) != 3:
+            raise InvalidRequestError("color 必须是长度为 3 的 RGB 数组")
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1 for value in color):
+            raise InvalidRequestError("color 每个分量必须在 0 到 1 之间")
+        self._assembly_instances[instance_id].color = [float(value) for value in color]
+        self.renderer.clear_cache()
+        self._step_counter += 1
+        result = make_success(
+            feature_id=instance_id, narrative=f"设置装配实例 {instance_id} 颜色",
+            current_narrative=self.narrative.copy(), feature_graph_delta={"updated": [instance_id]},
+            elapsed_ms=0.0, step_index=self._step_counter,
+        )
+        result.value = {"instance_id": instance_id, "color": list(color), "geometry_unchanged": True}
+        result.scene_manifest = self._scene_manifest()
+        return result
+
+    def _scene_manifest(self) -> dict:
+        return {
+            "instances": [item.to_dict() for item in self._assembly_instances.values()],
+            "instance_ids": list(self._assembly_instances),
+        }
+
+    def _restore_assembly_geometries(self) -> Optional[str]:
+        """Reload source STEP instances for display; keep fused STEP as fallback."""
+        import os
+        if not self._assembly_instances:
+            return None
+        try:
+            from build123d import Axis, Vector
+            from build123d.importers import import_step as b3d_import_step
+            missing = []
+            for item in self._assembly_instances.values():
+                if not item.path or not os.path.exists(item.path):
+                    missing.append(item.id)
+                    continue
+                part = b3d_import_step(item.path)
+                if item.rotation is not None:
+                    part = part.rotate(Axis((0, 0, 0), tuple(item.rotation[1])), item.rotation[0])
+                part = part.translate(Vector(*item.position))
+                item.geometry = part
+                item.bbox = list(self._geometry_summary_for(part).bounding_box)
+            return f"装配源零件缺失: {missing}" if missing else None
+        except Exception as exc:
+            return f"装配实例恢复失败: {type(exc).__name__}"
 
     def _section_half(self, geometry: Any, axis: str, offset: float = None) -> Any:
         """Return a lower half-space intersection for rendering only."""
@@ -2531,6 +2799,11 @@ class MechKernel:
         size: int,
         annotate: bool,
         turntable: bool = False,
+        quality: str = "evidence",
+        backend: str = "auto",
+        show_edges: bool = False,
+        highlight: Optional[List[str]] = None,
+        scene: Any = None,
     ) -> Tuple[Dict[str, bytes], Optional[bytes], int, Tuple[int, int]]:
         turntable_views = {"rot0", "rot90", "rot180", "rot270"} if turntable else set()
         view_count = len(set(requested) | turntable_views)
@@ -2538,6 +2811,8 @@ class MechKernel:
         renders = self.renderer.render(
             geometry, level="full", geometry_revision=self._geometry_revision,
             views=requested, annotate=annotate, turntable=turntable, image_size=per_view_size,
+            quality=quality, backend=backend, show_edges=show_edges,
+            highlight=highlight, scene=scene,
         )
         actual = {key: value for key, value in renders.items() if key != "default" and value}
         grid = Renderer.compose_grid(actual, cols=cols, include_titles=not annotate, max_size=size)
@@ -2553,6 +2828,11 @@ class MechKernel:
         section: Optional[dict] = None,
         target: str = "",
         geometry: Any = None,
+        backend_requested: str = "auto",
+        backend_used: Optional[str] = None,
+        quality: str = "evidence",
+        highlighted: Optional[List[str]] = None,
+        scene_manifest: Optional[dict] = None,
     ) -> dict:
         summary = self._geometry_summary_for(geometry if geometry is not None else self._current_geometry)
         return {
@@ -2561,12 +2841,22 @@ class MechKernel:
             "views": list(views),
             "section": section,
             "target": target or None,
+            "backend_requested": backend_requested,
+            "backend_used": backend_used or self.renderer.last_backend_used,
+            "fallback": backend_requested != (backend_used or self.renderer.last_backend_used),
+            "warnings": list(self.renderer.last_warnings),
+            "quality": quality,
+            "highlighted": list(highlighted or []),
+            "scene_manifest": scene_manifest,
+            "instance_ids": list((scene_manifest or {}).get("instance_ids", [])),
             "bbox_mm": list(summary.bounding_box),
             "layout": {
                 "max_size_px": size,
+                "pixel_budget": size,
                 "columns": cols,
                 "per_view_size_px": list(per_view_size),
             },
+            "actual_size": [size, size],
             "image_hashes": {
                 view: hashlib.sha256(png).hexdigest()[:16]
                 for view, png in views.items()
@@ -2583,6 +2873,10 @@ class MechKernel:
         intent: str = "inspect",
         target: str = "",
         name: str = "",
+        quality: str = "evidence",
+        backend: str = "auto",
+        show_edges: bool = False,
+        highlight: list = None,
     ) -> StepResult:
         """生成预算受控、可解释的 AI 视觉证据包，不进入参数化历史。"""
         start = time.time()
@@ -2591,6 +2885,12 @@ class MechKernel:
         allowed_intents = {"inspect", "section", "feature_zoom", "delta", "sketch"}
         if intent not in allowed_intents:
             raise InvalidRequestError(f"intent 必须是 {sorted(allowed_intents)}（当前 {intent}）")
+        if quality not in ("evidence", "presentation"):
+            raise InvalidRequestError("quality 必须是 evidence 或 presentation")
+        if backend not in ("auto", "occ", "matplotlib"):
+            raise InvalidRequestError("backend 必须是 auto、occ 或 matplotlib")
+        if highlight is not None and (not isinstance(highlight, list) or not all(isinstance(item, str) for item in highlight)):
+            raise InvalidRequestError("highlight 必须是字符串列表")
         if intent == "sketch":
             if not target:
                 raise InvalidRequestError("render intent=sketch 需要 target=sketch_name")
@@ -2680,6 +2980,8 @@ class MechKernel:
             raise InvalidRequestError(f"render intent={intent} 需要有效 target feature_id")
 
         render_geometry = target_geometry if intent == "feature_zoom" else self._current_geometry
+        scene = self._assembly_instances if self._assembly_instances and intent != "feature_zoom" else None
+        scene_manifest = self._scene_manifest() if scene else None
         section_note = None
         if intent == "section" and section is None:
             section = {"axis": self._preferred_section_axis(render_geometry)}
@@ -2706,9 +3008,13 @@ class MechKernel:
                 before_geometry = self._section_half(before_geometry, section_note["axis"], section_note["offset"])
             before, _, _, _ = self._render_evidence_views(
                 before_geometry, requested, size, annotate, turntable=False,
+                quality=quality, backend=backend, show_edges=show_edges,
+                highlight=highlight, scene=scene,
             )
             after, _, _, _ = self._render_evidence_views(
                 render_geometry, requested, size, annotate, turntable=False,
+                quality=quality, backend=backend, show_edges=show_edges,
+                highlight=highlight, scene=scene,
             )
             actual = {f"before_{key}": value for key, value in before.items()}
             actual.update({f"after_{key}": value for key, value in after.items()})
@@ -2724,6 +3030,8 @@ class MechKernel:
         else:
             actual, grid, cols, per_view_size = self._render_evidence_views(
                 render_geometry, requested, size, annotate and section_note is None, turntable=turntable,
+                quality=quality, backend=backend, show_edges=show_edges,
+                highlight=highlight, scene=scene,
             )
         if section_note and annotate:
             suffix = "mid" if section_note["offset"] is None else f"{float(section_note['offset']):g}"
@@ -2760,7 +3068,12 @@ class MechKernel:
         result.render_views = actual
         result.evidence_manifest = self._make_evidence_manifest(
             intent, actual, size, cols, per_view_size, section_note, target, render_geometry,
+            backend_requested=backend, backend_used=self.renderer.last_backend_used,
+            quality=quality, highlighted=highlight, scene_manifest=scene_manifest,
         )
+        result.backend_used = self.renderer.last_backend_used
+        result.quality = quality
+        result.scene_manifest = scene_manifest
         result.value = {
             "views": list(actual), "section": section_note, "intent": intent,
             "target": target or None, "name": name, "evidence_manifest": result.evidence_manifest,
@@ -2887,6 +3200,7 @@ class MechKernel:
             "op_history": copy.deepcopy(self._op_history),
             "has_non_replayable_op": self._has_non_replayable_op,
             "parameters": dict(self._parameters),
+            "assembly_instances": {key: copy.copy(value) for key, value in self._assembly_instances.items()},
         }
     
     def _restore(self, snap: Dict) -> None:
@@ -2905,6 +3219,7 @@ class MechKernel:
         self._op_history = list(snap.get("op_history", []))
         self._has_non_replayable_op = snap.get("has_non_replayable_op", False)
         self._parameters = dict(snap.get("parameters", {}))
+        self._assembly_instances = {key: copy.copy(value) for key, value in snap.get("assembly_instances", {}).items()}
         self._last_render_base64 = None
         self._last_render_views = {}
         # P0-3 修复：undo 后 bump revision（让 renderer 缓存失效）
@@ -2914,6 +3229,25 @@ class MechKernel:
     def _bump_geometry_revision(self):
         self._geometry_revision += 1
         self.renderer.clear_cache()
+
+    def _validate_transaction_state(self, description: str) -> None:
+        """Reject invalid topology candidates before a transaction is published."""
+        validated_ops = {
+            "extrude", "revolve", "sweep", "boolean", "hole", "fillet",
+            "chamfer", "shell", "linear_pattern", "circular_pattern", "mirror",
+            "assemble", "import_step", "load_project",
+        }
+        if description not in validated_ops or self._current_geometry is None:
+            return
+        validation = self.geometry_inspector.validate_geometry(
+            self._current_geometry, level="strict", feature_count=len(self.feature_graph.nodes)
+        )
+        if not validation.valid:
+            details = ", ".join(validation.reason_codes) or "INVALID_GEOMETRY"
+            raise GeometryValidationError(
+                f"{description} 生成的几何未通过验证: {details}",
+                validation.to_dict(),
+            )
 
     def _record_history(self, op: str, **kwargs) -> dict:
         """v2.0: 记录一次 op 调用（重放时跳过）。返回 entry 供回填 feature_id。"""
@@ -3302,6 +3636,18 @@ class MechKernel:
             if isinstance(result, StepResult) and not result.success:
                 self.adaptive_renderer.mark_failure(op)
             return result
+        except GeometryValidationError as e:
+            self.adaptive_renderer.mark_failure(op)
+            return make_failure(
+                error=str(e),
+                error_kind="GEOMETRY_FAILURE",
+                suggestion={"action": "检查操作参数或回退到上一个有效特征"},
+                geometry_summary=self._geometry_summary_for(self._current_geometry),
+                geometry_validation=e.validation,
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
         except (InvalidRequestError, StateCorruptionError) as e:
             self.adaptive_renderer.mark_failure(op)
             return make_failure(
@@ -3336,6 +3682,10 @@ class MechKernel:
     
     def _wrap_step_result(self, result: "StepResult") -> "StepResult":
         """自动填充 geometry_summary（如未设置）+ 简单 hints"""
+        if result.success and result.geometry_validation is None and self._geometry_internal is not None:
+            result.geometry_validation = self.geometry_inspector.validate_geometry(
+                self._geometry_internal, level="standard", feature_count=len(self.feature_graph.nodes)
+            ).to_dict()
         # Centralize the visual contract for every topology operation.  Older
         # ops only retained the iso bytes; regenerate the configured view set
         # here so full renders reach the vision loop as a single collage.
@@ -3345,6 +3695,9 @@ class MechKernel:
                 level=result.render_level,
                 geometry_revision=self._geometry_revision,
                 image_size=None,
+                quality="evidence",
+                backend="auto",
+                scene=self._assembly_instances or None,
             )
             result.render_views = {k: v for k, v in renders.items() if k != "default" and v}
             result.render_png = result.render_views.get("iso") or result.render_png
@@ -3356,12 +3709,17 @@ class MechKernel:
             elif result.render_png:
                 result.render_base64 = base64.b64encode(result.render_png).decode()
             self._last_render_views = dict(result.render_views)
+            result.backend_used = self.renderer.last_backend_used
+            result.quality = "evidence"
+            result.scene_manifest = self._scene_manifest() if self._assembly_instances else None
         if result.geometry_summary is None:
             result.geometry_summary = self._geometry_summary_for(self._geometry_internal)
         if result.render_views and result.evidence_manifest is None:
             cols = 1 if len(result.render_views) == 1 else (2 if len(result.render_views) <= 4 else 4)
             result.evidence_manifest = self._make_evidence_manifest(
                 "automatic", result.render_views, 640, cols, (320, 320), geometry=self._geometry_internal,
+                backend_requested="auto", backend_used=self.renderer.last_backend_used,
+                quality="evidence", scene_manifest=result.scene_manifest,
             )
         # 加 hints（如果没设）
         if not result.next_hints:
@@ -3398,7 +3756,7 @@ class MechKernel:
             )
         # 优先用 geometry_inspector
         try:
-            return self.geometry_inspector.compute(geometry, feature_count=len(self.feature_graph.nodes))
+            return self.geometry_inspector.summary(geometry, feature_count=len(self.feature_graph.nodes))
         except Exception:
             bb = (0, 0, 0, 100, 100, 100)
             if hasattr(geometry, "bounding_box"):

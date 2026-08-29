@@ -33,6 +33,8 @@ class BenchmarkRecord:
     volume_after: Optional[float] = None
     volume_relative_error: Optional[float] = None
     bbox_error: Optional[float] = None
+    validation_status: Optional[str] = None
+    geometry_fingerprint: Optional[str] = None
     error: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
 
@@ -54,12 +56,18 @@ def _bbox(kernel: MechKernel) -> Optional[List[float]]:
         return None
 
 
-def _build_cylinder(kernel: MechKernel, radius: float = 20.0, depth: float = 40.0) -> str:
+def _build_cylinder(
+    kernel: MechKernel, radius: float = 20.0, depth: float = 40.0,
+    named: bool = True,
+) -> str:
     kernel.create_workplane("base")
     kernel.new_sketch("base", "main")
     circle = kernel.add_circle("main", (0, 0), radius, name="outer_radius")
-    kernel.add_constraint("main", "radius", [{"entity_id": circle.feature_id, "role": "circle"}],
-                          value=radius, parameter_name="outer_radius")
+    if named:
+        # Constraint solving is optional for geometry-only benchmark runs.
+        # Complex examples must still run in lightweight/no-SciPy installs.
+        kernel.add_constraint("main", "radius", [{"entity_id": circle.feature_id, "role": "circle"}],
+                              value=radius, parameter_name="outer_radius")
     kernel.close_sketch("main")
     feature = kernel.extrude("main", depth, name="body")
     return feature.feature_id
@@ -111,9 +119,9 @@ BUILDERS: Dict[str, Callable[[MechKernel], str]] = {
     "l_bracket": _build_l_bracket,
     "holed_housing": _build_holed_housing,
     "patterned_plate": _build_patterned_plate,
-    "rocket_motor_shell": lambda k: _build_cylinder(k, 30, 120),
-    "rocket_nozzle": lambda k: _build_cylinder(k, 24, 35),
-    "rocket_closure": lambda k: _build_cylinder(k, 30, 15),
+    "rocket_motor_shell": lambda k: _build_cylinder(k, 30, 120, named=False),
+    "rocket_nozzle": lambda k: _build_cylinder(k, 24, 35, named=False),
+    "rocket_closure": lambda k: _build_cylinder(k, 30, 15, named=False),
 }
 
 
@@ -160,6 +168,11 @@ def _run_one(part: str, task: str) -> BenchmarkRecord:
             result = kernel.render(size=256)
             _record_visual(record, result)
             record.details["views"] = list(result.render_views or {})
+        elif task == "validate":
+            result = kernel.validate_geometry(level="strict")
+            validation = result.geometry_validation or {}
+            record.validation_status = validation.get("status")
+            record.geometry_fingerprint = validation.get("fingerprint")
         else:
             raise ValueError(f"unknown task {task}")
 
@@ -173,6 +186,14 @@ def _run_one(part: str, task: str) -> BenchmarkRecord:
         if original_bbox and _bbox(kernel):
             record.bbox_error = max(abs(a - b) for a, b in zip(original_bbox, _bbox(kernel)))
         record.op_count = max(record.op_count, len(kernel._op_history))
+        if record.geometry_fingerprint is None:
+            validation = getattr(result, "geometry_validation", None) or {}
+            if not validation and kernel._current_geometry is not None:
+                validation = kernel.geometry_inspector.validate_geometry(
+                    kernel._current_geometry, level="standard"
+                ).to_dict()
+            record.validation_status = validation.get("status")
+            record.geometry_fingerprint = validation.get("fingerprint")
         record.solve_ms = float(getattr(result, "elapsed_ms", 0.0)) if task == "modify_named_dimension" else 0.0
     except Exception as exc:
         record.error = f"{type(exc).__name__}: {exc}"
@@ -199,10 +220,10 @@ def _aggregate(records: Iterable[BenchmarkRecord]) -> Dict[str, Any]:
 def run_suite(parts: Optional[Iterable[str]] = None, tasks: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Run the public-API productivity suite and return JSON-safe results."""
     selected_parts = list(parts or BUILDERS.keys())
-    selected_tasks = list(tasks or ("create", "modify_named_dimension", "delete_feature", "rebuild", "save_load", "visual_evidence"))
+    selected_tasks = list(tasks or ("create", "modify_named_dimension", "delete_feature", "rebuild", "save_load", "visual_evidence", "validate"))
     records = [_run_one(part, task) for part in selected_parts for task in selected_tasks]
     return {
-        "schema_version": "2.4",
+        "schema_version": "2.6",
         "records": [asdict(record) for record in records],
         "summary": _aggregate(records),
     }

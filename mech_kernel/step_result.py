@@ -79,6 +79,10 @@ class StepResult:
     render_views: Optional[Dict[str, bytes]] = None  # full 时 4 视角
     evidence_manifest: Optional[dict] = None  # v2.3: 投影、截面、预算与图像指纹
     constraint_diagnostics: Optional[dict] = None  # v2.4: 草图求解状态
+    geometry_validation: Optional[dict] = None  # v2.6: 候选几何验证
+    backend_used: Optional[str] = None  # v2.5: actual renderer backend
+    quality: Optional[str] = None  # v2.5: evidence or presentation
+    scene_manifest: Optional[dict] = None  # v2.5: instance-level assembly evidence
     
     # === 结构化数据（默认必有）===
     geometry_summary: Optional[GeometrySummary] = None
@@ -117,6 +121,10 @@ class StepResult:
             "views": list(self.render_views.keys()) if self.render_views else [],
             "evidence_manifest": self.evidence_manifest,
             "constraint_diagnostics": self.constraint_diagnostics,
+            "geometry_validation": self.geometry_validation,
+            "backend_used": self.backend_used,
+            "quality": self.quality,
+            "scene_manifest": self.scene_manifest,
             "narrative": self.narrative,
             "hints": self.next_hints,
             "geometry_summary": self.geometry_summary.to_dict() if self.geometry_summary else None,
@@ -152,6 +160,10 @@ def make_success(
     current_narrative: Optional[List[str]] = None,
     warning: Optional[str] = None,
     constraint_diagnostics: Optional[dict] = None,
+    backend_used: Optional[str] = None,
+    quality: Optional[str] = None,
+    scene_manifest: Optional[dict] = None,
+    geometry_validation: Optional[dict] = None,
     feature_graph_delta: Optional[dict] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
@@ -175,6 +187,10 @@ def make_success(
         feature_graph_delta=feature_graph_delta,
         warning=warning,
         constraint_diagnostics=constraint_diagnostics,
+        geometry_validation=geometry_validation,
+        backend_used=backend_used,
+        quality=quality,
+        scene_manifest=scene_manifest,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )
@@ -194,6 +210,10 @@ def make_failure(
     hint: Optional[str] = None,
     warning: Optional[str] = None,
     constraint_diagnostics: Optional[dict] = None,
+    backend_used: Optional[str] = None,
+    quality: Optional[str] = None,
+    scene_manifest: Optional[dict] = None,
+    geometry_validation: Optional[dict] = None,
     elapsed_ms: float = 0.0,
     step_index: int = 0,
 ) -> StepResult:
@@ -222,6 +242,10 @@ def make_failure(
         hint=hint,
         warning=warning,
         constraint_diagnostics=constraint_diagnostics,
+        geometry_validation=geometry_validation,
+        backend_used=backend_used,
+        quality=quality,
+        scene_manifest=scene_manifest,
         elapsed_ms=elapsed_ms,
         step_index=step_index,
     )
