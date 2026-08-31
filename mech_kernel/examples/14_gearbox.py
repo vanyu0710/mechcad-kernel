@@ -86,14 +86,14 @@ def compute_geometry() -> dict:
         "bore_intermediate": 20 + p["bore_clearance"],
         "bore_output": 24 + p["bore_clearance"],
 
-        # housing
-        "housing_length": 180.0,
-        "housing_width": 120.0,
+        # housing (足够大, 覆盖 input shaft -100~100 + output shaft -50~150)
+        "housing_length": 300.0,    # X: 覆盖 input + output 总 span
+        "housing_width": 180.0,     # Y: 容纳 intermediate Y=57 + gear radius 62 + buffer
         "housing_height": 90.0,
         "wall_thickness": 6.0,
 
-        # shafts
-        "shaft_length": 198.0,
+        # shafts (200mm, 居中)
+        "shaft_length": 200.0,
         "shaft_input_d": 16.0,
         "shaft_intermediate_d": 20.0,
         "shaft_output_d": 24.0,
@@ -278,35 +278,50 @@ def build_end_cap(geom: dict) -> MechKernel:
 # 中心距 (center_distance_stage2) 决定 intermediate ↔ output
 
 def setup_reference_frames(kernel: MechKernel, geom: dict) -> dict:
-    """在 kernel 内创建一组 reference plane, 返回 frame 名称字典."""
+    """在 kernel 内创建一组 reference plane, 返回 frame 名称字典.
+
+    Inline 2 段减速器布局 (3 根轴都沿 X 方向, 但 X 位置不同):
+      - input_shaft  : (0,        0, z_floor) 沿 X
+      - intermediate : (X_mid,  Y_offset, z_floor) 沿 X  (中间轴偏置)
+      - output_shaft : (X_end,    0, z_floor) 沿 X
+
+    几何推导:
+      X_mid² + Y_offset² = cd1² = 80² = 6400   (input ↔ intermediate)
+      (X_mid - X_end)² + Y_offset² = cd2² = 72² = 5184  (intermediate ↔ output)
+
+      选 X_end = 100, 解: X_mid = 56.08, Y_offset = 57.06
+    """
+    import math as _math
     p = GEAR_PARAMS
-    m = p["module"]
-    cd1 = geom["center_distance_stage1"]
-    cd2 = geom["center_distance_stage2"]
+    cd1 = geom["center_distance_stage1"]   # 80
+    cd2 = geom["center_distance_stage2"]   # 72
 
-    # 输入轴: X 起点附近
-    input_x = 10.0
-    # 中间轴: input + 中心距 (在 Y 方向分开)
-    inter_x = input_x + cd1 * 0.5
-    inter_y = cd1 * 0.866  # 60 度分布
-    # 输出轴: intermediate + 中心距 (沿 X 方向)
-    output_x = inter_x + cd2 * 0.4
-    output_y = inter_y + cd2 * 0.92
+    # 选 X_end (output 距 input 的 X 距离), 解 X_mid 和 Y_offset
+    # 选 X_end=60, 中间轴在 X_mid=36.7, Y=70.6 (更紧凑)
+    X_end = 60.0
+    # X_mid² - (X_mid - X_end)² = cd1² - cd2²
+    X_mid = (cd1**2 - cd2**2 + X_end**2) / (2 * X_end)
+    Y_offset = _math.sqrt(cd1**2 - X_mid**2)
 
-    z_bottom = geom["wall_thickness"] + 10  # 留出 floor 上面空间
-    input_z = z_bottom
-    inter_z = z_bottom
-    output_z = z_bottom
+    input_x = 0.0
+    inter_x = X_mid
+    inter_y = Y_offset
+    output_x = X_end
+
+    z_floor = geom["wall_thickness"] + 10
+    shaft_z = z_floor
+    input_z = shaft_z
+    inter_z = shaft_z
+    output_z = shaft_z
 
     # World root
     kernel.create_reference_plane("world", origin=(0, 0, 0), normal=(0, 1, 0), x_axis=(1, 0, 0),
                                   metadata={"role": "root"})
-    # housing mount plane (XZ 平面, normal=Y)
     kernel.create_reference_plane("housing_mount_plane",
                                   origin=(0, 0, 0), normal=(0, 1, 0), x_axis=(1, 0, 0),
                                   parent="world",
                                   metadata={"role": "housing_datum"})
-    # 三根轴 axis frame (X 方向)
+    # 三根轴 axis frame (沿 X 方向)
     kernel.create_reference_plane("input_shaft_axis",
                                   origin=(input_x, 0, input_z),
                                   normal=(1, 0, 0), x_axis=(0, 0, 1),
@@ -316,9 +331,10 @@ def setup_reference_frames(kernel: MechKernel, geom: dict) -> dict:
                                   origin=(inter_x, inter_y, inter_z),
                                   normal=(1, 0, 0), x_axis=(0, 0, 1),
                                   parent="housing_mount_plane",
-                                  metadata={"role": "axis", "shaft": "intermediate"})
+                                  metadata={"role": "axis", "shaft": "intermediate",
+                                            "y_offset": inter_y, "x_offset": inter_x})
     kernel.create_reference_plane("output_shaft_axis",
-                                  origin=(output_x, output_y, output_z),
+                                  origin=(output_x, 0, output_z),
                                   normal=(1, 0, 0), x_axis=(0, 0, 1),
                                   parent="housing_mount_plane",
                                   metadata={"role": "axis", "shaft": "output"})
@@ -326,7 +342,9 @@ def setup_reference_frames(kernel: MechKernel, geom: dict) -> dict:
     return {
         "input_x": input_x,
         "inter_x": inter_x, "inter_y": inter_y,
-        "output_x": output_x, "output_y": output_y,
+        "output_x": output_x,
+        "input_y": 0, "output_y": 0,
+        "shaft_z": shaft_z,
         "input_z": input_z, "inter_z": inter_z, "output_z": output_z,
     }
 
@@ -377,12 +395,12 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
         "mount_normal_offset": geom["housing_height"] - geom["wall_thickness"],
     })
 
-    # 3. Input shaft: 沿 input_shaft_axis 的 +normal 方向放
-    # source shaft 是沿 Z 方向 (extrude Z). 我们需要把它的轴对齐到 frame.normal=(1,0,0)
-    # 即绕 (0,1,0) 旋转 90°
+    # 3. Input shaft: 沿 input_shaft_axis 居中放置 (normal_offset=0)
+    # source shaft 是沿 Z 方向. 旋转 90° 让它沿 frame.normal (世界 X) 方向.
+    # normal_offset=0 表示 shaft 中心在 frame origin, shaft 沿 ±shaft_len/2 方向
     input_shaft_pos, _ = _placement_from_frame(
         kernel, "input_shaft_axis",
-        uv=(0, 0), normal_offset=shaft_len / 2,
+        uv=(0, 0), normal_offset=0,
         rotation=(90, (0, 1, 0)),
     )
     parts.append({
@@ -395,10 +413,10 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
         "mount_frame": "input_shaft_axis",
     })
 
-    # 4. Intermediate shaft
+    # 4. Intermediate shaft (居中)
     inter_shaft_pos, _ = _placement_from_frame(
         kernel, "intermediate_shaft_axis",
-        uv=(0, 0), normal_offset=shaft_len / 2,
+        uv=(0, 0), normal_offset=0,
         rotation=(90, (0, 1, 0)),
     )
     parts.append({
@@ -411,10 +429,10 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
         "mount_frame": "intermediate_shaft_axis",
     })
 
-    # 5. Output shaft
+    # 5. Output shaft (居中)
     output_shaft_pos, _ = _placement_from_frame(
         kernel, "output_shaft_axis",
-        uv=(0, 0), normal_offset=shaft_len / 2,
+        uv=(0, 0), normal_offset=0,
         rotation=(90, (0, 1, 0)),
     )
     parts.append({
@@ -428,12 +446,14 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
     })
 
     # 6-9. 4 个齿轮（与轴同 frame, 不同 normal_offset 决定轴向位置）
-    # Gear 沿 axis frame 的 +normal 方向放, 但齿轮在轴上更靠中间
+    # 啮合对 X 位置必须相同:
+    #   input gear ↔ intermediate_large (X=30)
+    #   intermediate_small ↔ output gear (X=90)
     for gear_name, axis_frame, axis_offset in [
         ("gear_input", "input_shaft_axis", 30.0),
         ("gear_intermediate_large", "intermediate_shaft_axis", 30.0),
         ("gear_intermediate_small", "intermediate_shaft_axis", 90.0),
-        ("gear_output", "output_shaft_axis", 30.0),
+        ("gear_output", "output_shaft_axis", 90.0),
     ]:
         pos, _ = _placement_from_frame(
             kernel, axis_frame, uv=(0, 0), normal_offset=axis_offset,
@@ -449,11 +469,11 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
             "mount_frame": axis_frame,
         })
 
-    # 10-12. 3 套轴承（每根轴 2 个, 但我们只放 1 个代表性, 在轴起点附近）
+    # 10-12. 3 套轴承（每根轴 1 个, 在轴末端附近, 但仍在 shaft 上）
     for bearing_name, axis_frame, axis_offset in [
-        ("bearing_input", "input_shaft_axis", 150.0),
-        ("bearing_intermediate", "intermediate_shaft_axis", 150.0),
-        ("bearing_output", "output_shaft_axis", 150.0),
+        ("bearing_input", "input_shaft_axis", 80.0),
+        ("bearing_intermediate", "intermediate_shaft_axis", 80.0),
+        ("bearing_output", "output_shaft_axis", 80.0),
     ]:
         pos, _ = _placement_from_frame(
             kernel, axis_frame, uv=(0, 0), normal_offset=axis_offset,
