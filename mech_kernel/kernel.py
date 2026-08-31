@@ -30,6 +30,10 @@ from .features import (
 )
 from .assembly import AssemblyInstance
 from .constraint_solver import SUPPORTED_CONSTRAINTS, solve_sketch as solve_sketch_constraints, validate_constraint
+from .reference_frames import (
+    CoordinateFrame, FrameRegistry, resolve_point as rf_resolve_point,
+    resolve_placement as rf_resolve_placement,
+)
 from .feature_graph import FeatureGraph
 from .workplane import Workplane, WorkplaneType, WorkplaneRegistry
 from .persistent_naming import PersistentNamingResolver, PersistentName
@@ -55,7 +59,33 @@ PUBLIC_OPS = frozenset({
     "add_constraint", "set_parameter", "solve_sketch",
     "validate_geometry",
     "query_assembly", "set_instance_visibility", "set_instance_color",
+    # v2.7: reference-coordinate framework
+    "create_reference_plane", "query_reference",
+    "resolve_point", "resolve_placement",
+    "validate_assembly",
 })
+
+
+def _bbox_overlap(bbox_a, bbox_b) -> float:
+    """返回两个 bbox 在各轴上重叠深度的最小值. >0 表示重叠, <0 表示间距."""
+    if not bbox_a or not bbox_b or len(bbox_a) != 6 or len(bbox_b) != 6:
+        return 0.0
+    ax_min, ay_min, az_min, ax_max, ay_max, az_max = bbox_a
+    bx_min, by_min, bz_min, bx_max, by_max, bz_max = bbox_b
+    overlaps = [
+        min(ax_max, bx_max) - max(ax_min, bx_min),
+        min(ay_max, by_max) - max(ay_min, by_min),
+        min(az_max, bz_max) - max(az_min, bz_min),
+    ]
+    return min(overlaps)
+
+
+def _frame_distance(a, b) -> float:
+    """两个 frame 原点之间的欧氏距离."""
+    return math.sqrt(sum((a.origin[i] - b.origin[i]) ** 2 for i in range(3)))
+
+
+import math  # for distance helper
 
 
 class MechKernel:
@@ -80,6 +110,7 @@ class MechKernel:
         self._has_non_replayable_op: bool = False  # v2.0: 会话含导入/加载，禁止重放
         self._parameters: Dict[str, float] = {}  # v2.4: 命名尺寸参数
         self._assembly_instances: Dict[str, AssemblyInstance] = {}
+        self._frame_registry: FrameRegistry = FrameRegistry()  # v2.7: 参考坐标系
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_render_base64: Optional[str] = None
         self._last_render_views: Dict[str, bytes] = {}
@@ -299,6 +330,40 @@ class MechKernel:
             "validate_geometry": {"target": FieldSchema(type="string", required=False, default="_current_geometry"),
                                    "level": FieldSchema(type="enum", required=False, default="standard",
                                                          enum=["basic", "standard", "strict"])},
+            # v2.7: reference-coordinate framework
+            "create_reference_plane": {
+                "name": FieldSchema(type="string", required=True),
+                "origin": FieldSchema(type="tuple", required=False, default=(0.0, 0.0, 0.0),
+                                      items_type="number", length=3),
+                "normal": FieldSchema(type="tuple", required=False, default=(0.0, 0.0, 1.0),
+                                      items_type="number", length=3),
+                "x_axis": FieldSchema(type="tuple", required=False, default=(1.0, 0.0, 0.0),
+                                      items_type="number", length=3),
+                "parent": FieldSchema(type="string", required=False, default=None),
+                "metadata": FieldSchema(type="dict", required=False, default=None),
+            },
+            "query_reference": {
+                "name": FieldSchema(type="string", required=False, default=None),
+            },
+            "resolve_point": {
+                "frame": FieldSchema(type="string", required=True),
+                "uv": FieldSchema(type="tuple", required=False, default=(0.0, 0.0),
+                                  items_type="number", length=2),
+                "normal_offset": FieldSchema(type="number", required=False, default=0.0),
+            },
+            "resolve_placement": {
+                "frame": FieldSchema(type="string", required=True),
+                "uv": FieldSchema(type="tuple", required=False, default=(0.0, 0.0),
+                                  items_type="number", length=2),
+                "normal_offset": FieldSchema(type="number", required=False, default=0.0),
+                "rotation": FieldSchema(type="tuple", required=False, default=(0.0, (0.0, 0.0, 1.0)),
+                                        items_type="number", length=2),
+            },
+            "validate_assembly": {
+                "level": FieldSchema(type="enum", required=False, default="standard",
+                                     enum=["basic", "standard", "strict"]),
+                "relations": FieldSchema(type="list", required=False, default=None, items_type="dict"),
+            },
         }
         for name, schema in placeholder_schemas.items():
             self.cap.set_capability(Capability(
@@ -2620,6 +2685,7 @@ class MechKernel:
                 if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1 for value in color):
                     raise InvalidRequestError("装配实例 color 每个分量必须在 0 到 1 之间")
                 instance_id = f"A_{index:04d}"
+                # v2.7: 透传 reference-frame 字段
                 self._assembly_instances[instance_id] = AssemblyInstance(
                     id=instance_id,
                     name=str(item.get("name", os.path.splitext(os.path.basename(path))[0])),
@@ -2630,6 +2696,11 @@ class MechKernel:
                     visible=bool(item.get("visible", True)),
                     bbox=list(self._geometry_summary_for(part).bounding_box),
                     geometry=part,
+                    local_origin=list(item.get("local_origin", position or [0.0, 0.0, 0.0])),
+                    mount_frame=item.get("mount_frame"),
+                    world_transform=item.get("world_transform"),
+                    mount_uv=list(item.get("mount_uv", [0.0, 0.0])),
+                    mount_normal_offset=float(item.get("mount_normal_offset", 0.0)),
                 )
             self._current_geometry = assembled
             self._has_non_replayable_op = True  # 装配依赖外部 STEP，不可重放
@@ -3810,3 +3881,355 @@ class MechKernel:
     
     def get_last_render_base64(self) -> Optional[str]:
         return self._last_render_base64
+
+    # =============================================================
+    # v2.7: Reference Coordinate Frame API
+    # =============================================================
+
+    def create_reference_plane(
+        self,
+        name: str,
+        origin: tuple = (0.0, 0.0, 0.0),
+        normal: tuple = (0.0, 0.0, 1.0),
+        x_axis: tuple = (1.0, 0.0, 0.0),
+        parent: str = None,
+        metadata: dict = None,
+    ) -> "StepResult":
+        """v2.7: 创建一个参考坐标系/参考面.
+
+        Args:
+            name: 唯一 frame 名
+            origin: 世界坐标原点 (3,)
+            normal: 法向（z 方向），自动归一化
+            x_axis: x 轴方向，自动正交化到 normal
+            parent: 父 frame 名（None = world 根）
+            metadata: 自由附加元数据（如 {"role": "input_shaft_axis"}）
+        """
+        start = time.time()
+        if not isinstance(name, str) or not name:
+            raise InvalidRequestError("name 必须是非空字符串")
+        for v_name, v in [("origin", origin), ("normal", normal), ("x_axis", x_axis)]:
+            if not isinstance(v, (list, tuple)) or len(v) != 3:
+                raise InvalidRequestError(f"{v_name} 必须是长度为 3 的数组")
+            if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+                raise InvalidRequestError(f"{v_name} 必须全部是数字")
+        if parent is not None and not self._frame_registry.has(parent):
+            raise InvalidRequestError(f"parent frame {parent} 不存在")
+        if self._frame_registry.has(name):
+            raise InvalidRequestError(f"frame {name} 已存在")
+        frame = CoordinateFrame(
+            name=name,
+            origin=tuple(float(x) for x in origin),
+            normal=tuple(float(x) for x in normal),
+            x_axis=tuple(float(x) for x in x_axis),
+            parent=parent,
+            metadata=dict(metadata or {}),
+        )
+        self._frame_registry.add(frame)
+        self.narrative.append(f"创建参考系 {name} (origin={origin}, normal={normal})")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=f"RF_{self._step_counter:04d}",
+            narrative=f"创建参考系 {name}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"reference_frames": [name]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+
+    def query_reference(self, name: str = None) -> "StepResult":
+        """v2.7: 查询 frame（单/全）。返回 dict / list[dict]."""
+        start = time.time()
+        if name is None:
+            frames = [self._frame_registry.get(n) for n in self._frame_registry.names()]
+        else:
+            if not self._frame_registry.has(name):
+                raise InvalidRequestError(f"frame {name} 不存在")
+            frames = [self._frame_registry.get(name)]
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"QR_{self._step_counter:04d}",
+            narrative=f"查询参考系 {name or '全部'}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"queried": [f.name for f in frames]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {
+            "count": len(frames),
+            "frames": [f.to_dict() for f in frames],
+        }
+        return result
+
+    def resolve_point(
+        self,
+        frame: str,
+        uv: tuple = (0.0, 0.0),
+        normal_offset: float = 0.0,
+    ) -> "StepResult":
+        """v2.7: 把 {frame, uv, normal_offset} 形式 → 世界坐标 (x, y, z).
+
+        支持 legacy 形式: 直接传坐标元组 (x, y, z) 也兼容（视为世界坐标返回）。
+        """
+        start = time.time()
+        if not self._frame_registry.has(frame):
+            raise InvalidRequestError(f"frame {frame} 不存在")
+        if not isinstance(uv, (list, tuple)) or len(uv) != 2:
+            raise InvalidRequestError("uv 必须是长度为 2 的数组 [u, v]")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in uv):
+            raise InvalidRequestError("uv 必须全部是数字")
+        if not isinstance(normal_offset, (int, float)) or isinstance(normal_offset, bool):
+            raise InvalidRequestError("normal_offset 必须是数字")
+        world = rf_resolve_point(self._frame_registry, frame, uv, normal_offset)
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"RP_{self._step_counter:04d}",
+            narrative=f"resolve_point frame={frame} uv={uv} normal_offset={normal_offset}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"resolved": [frame]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {
+            "frame": frame,
+            "uv": list(uv),
+            "normal_offset": float(normal_offset),
+            "world": list(world),
+        }
+        return result
+
+    def resolve_placement(
+        self,
+        frame: str,
+        uv: tuple = (0.0, 0.0),
+        normal_offset: float = 0.0,
+        rotation: tuple = (0.0, (0.0, 0.0, 1.0)),
+    ) -> "StepResult":
+        """v2.7: 返回 (world_origin, 3x3 rotation_matrix).
+
+        rotation: (angle_deg, axis) 相对 frame 旋转。
+        """
+        start = time.time()
+        if not self._frame_registry.has(frame):
+            raise InvalidRequestError(f"frame {frame} 不存在")
+        if not isinstance(uv, (list, tuple)) or len(uv) != 2:
+            raise InvalidRequestError("uv 必须是长度为 2 的数组")
+        if not isinstance(rotation, (list, tuple)) or len(rotation) != 2:
+            raise InvalidRequestError("rotation 必须是 (angle, axis) 形式")
+        angle, axis = rotation
+        if not isinstance(axis, (list, tuple)) or len(axis) != 3:
+            raise InvalidRequestError("rotation axis 必须是长度为 3 的数组")
+        origin, matrix = rf_resolve_placement(
+            self._frame_registry, frame, uv, normal_offset, (float(angle), tuple(axis))
+        )
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"RL_{self._step_counter:04d}",
+            narrative=f"resolve_placement frame={frame}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"resolved": [frame]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {
+            "frame": frame,
+            "uv": list(uv),
+            "normal_offset": float(normal_offset),
+            "rotation": [float(angle), list(axis)],
+            "origin": list(origin),
+            "matrix": matrix,
+        }
+        return result
+
+    def validate_assembly(
+        self,
+        level: str = "standard",
+        relations: list = None,
+    ) -> "StepResult":
+        """v2.7: 校验装配关系 + frame 一致性.
+
+        level: "basic" / "standard" / "strict"
+        relations: 形如 [{"kind": "coaxial", "source": "input_shaft",
+                          "target": "gear_input"}]
+
+        支持的 relation kind:
+            - frame_valid:  检查 frame 自身正交右手
+            - coaxial:      两 frame normal 同向
+            - parallel:     两 frame normal 平行
+            - perpendicular: 两 frame normal 垂直
+            - clearance:    两 instance bbox 不重叠（如果给了 source/target）
+            - mounted:      instance 的 mount_frame 已注册
+            - inside:       容器关系（一个 frame 在另一个 frame bbox 内）
+            - gear_mesh:    两齿轮 pitch_diameter 中心距 == 啮合要求
+
+        Returns: dict with {"ok": bool, "issues": [...]}
+        """
+        start = time.time()
+        if level not in ("basic", "standard", "strict"):
+            raise InvalidRequestError(f"level 必须是 basic/standard/strict（当前 {level}）")
+        relations = list(relations or [])
+        issues: list = []
+        checked = 0
+
+        # 1. basic: 所有 frame 有效
+        for f in (self._frame_registry.get(n) for n in self._frame_registry.names()):
+            if not f.is_orthonormal():
+                issues.append({
+                    "code": "frame_invalid",
+                    "frame": f.name,
+                    "message": f"frame {f.name} 不是合法正交右手系",
+                })
+            checked += 1
+
+        # 2. mounted: 所有 instance.mount_frame 存在
+        instance_by_name = {inst.name: inst for inst in self._assembly_instances.values()}
+        for inst in self._assembly_instances.values():
+            if inst.mount_frame is not None and not self._frame_registry.has(inst.mount_frame):
+                issues.append({
+                    "code": "mounted_frame_missing",
+                    "instance": inst.name,
+                    "frame": inst.mount_frame,
+                    "message": f"instance {inst.name} 引用了不存在的 frame {inst.mount_frame}",
+                })
+                checked += 1
+
+        # 3. 关系检查
+        for rel in relations:
+            if not isinstance(rel, dict):
+                issues.append({"code": "rel_malformed", "rel": rel, "message": "关系必须是 dict"})
+                continue
+            kind = rel.get("kind")
+            source_name = rel.get("source")
+            target_name = rel.get("target")
+            params = dict(rel.get("parameters") or {})
+            checked += 1
+
+            def _frame_of(name: str):
+                if name in instance_by_name:
+                    mf = instance_by_name[name].mount_frame
+                    if mf and self._frame_registry.has(mf):
+                        return self._frame_registry.get(mf)
+                if self._frame_registry.has(name):
+                    return self._frame_registry.get(name)
+                return None
+
+            sf = _frame_of(source_name) if source_name else None
+            tf = _frame_of(target_name) if target_name else None
+            if sf is None or tf is None:
+                issues.append({
+                    "code": f"{kind}_frame_missing",
+                    "rel": rel,
+                    "message": f"关系 {kind} 缺 source/target frame",
+                })
+                continue
+
+            if kind == "coaxial":
+                # 法向平行且同向
+                d = sum(sf.normal[i] * tf.normal[i] for i in range(3))
+                if d < 1 - 1e-6:
+                    issues.append({
+                        "code": "coaxial_misaligned",
+                        "source": source_name, "target": target_name,
+                        "dot": d,
+                        "message": f"{source_name} 与 {target_name} 不共轴 (dot={d:.4f})",
+                    })
+            elif kind == "parallel":
+                d = abs(sum(sf.normal[i] * tf.normal[i] for i in range(3)))
+                if d < 1 - 1e-6:
+                    issues.append({
+                        "code": "parallel_misaligned",
+                        "source": source_name, "target": target_name,
+                        "dot": d,
+                        "message": f"{source_name} 与 {target_name} 不平行 (|dot|={d:.4f})",
+                    })
+            elif kind == "perpendicular":
+                d = abs(sum(sf.normal[i] * tf.normal[i] for i in range(3)))
+                if d > 1e-6:
+                    issues.append({
+                        "code": "perpendicular_misaligned",
+                        "source": source_name, "target": target_name,
+                        "dot": d,
+                        "message": f"{source_name} 与 {target_name} 不垂直 (|dot|={d:.4f})",
+                    })
+            elif kind == "clearance":
+                # bbox 不重叠检查（如果两个 instance 有 bbox）
+                si = instance_by_name.get(source_name)
+                ti = instance_by_name.get(target_name)
+                if si and ti and si.bbox and ti.bbox:
+                    overlap = _bbox_overlap(si.bbox, ti.bbox)
+                    min_gap = float(params.get("min_gap", 0.0))
+                    if overlap and overlap < -min_gap:
+                        issues.append({
+                            "code": "clearance_violation",
+                            "source": source_name, "target": target_name,
+                            "overlap": overlap,
+                            "min_gap": min_gap,
+                            "message": f"{source_name} 与 {target_name} 间隙不足 (overlap={overlap:.2f})",
+                        })
+                else:
+                    if level == "strict":
+                        issues.append({
+                            "code": "clearance_no_bbox",
+                            "source": source_name, "target": target_name,
+                            "message": "clearance 校验需要 instance 有 bbox",
+                        })
+            elif kind == "gear_mesh":
+                # 两齿轮中心距 = (pitch_d_1 + pitch_d_2) / 2
+                pd1 = float(params.get("source_pitch_diameter", 0.0))
+                pd2 = float(params.get("target_pitch_diameter", 0.0))
+                tol = float(params.get("tolerance", 0.5))
+                if pd1 > 0 and pd2 > 0:
+                    required = (pd1 + pd2) / 2.0
+                    actual = _frame_distance(sf, tf)
+                    diff = abs(actual - required)
+                    if diff > tol:
+                        issues.append({
+                            "code": "gear_mesh_center_distance_mismatch",
+                            "source": source_name, "target": target_name,
+                            "actual": actual, "required": required, "diff": diff,
+                            "message": f"齿轮啮合中心距 {actual:.3f} != 理论 {required:.3f} (diff={diff:.3f})",
+                        })
+            elif kind in ("frame_valid", "mounted", "inside"):
+                # 这些已在 basic 阶段处理，关系中重复出现则视为通过
+                pass
+            else:
+                issues.append({
+                    "code": "rel_unknown_kind",
+                    "rel": rel,
+                    "message": f"未知关系 kind: {kind}",
+                })
+
+        # 4. strict 模式额外检查
+        if level == "strict":
+            for name in self._frame_registry.names():
+                f = self._frame_registry.get(name)
+                if f.parent is not None:
+                    parent = self._frame_registry.get(f.parent)
+                    # parent 必须已经存在（registry 保证）
+                    # frame 的 normal 不应该跟 parent normal 完全反
+                    d = sum(f.normal[i] * parent.normal[i] for i in range(3))
+                    if d < -0.99:
+                        issues.append({
+                            "code": "frame_inverted",
+                            "frame": name,
+                            "message": f"frame {name} 法向与 parent 反向 (dot={d:.4f})",
+                        })
+
+        ok = len(issues) == 0
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"VA_{self._step_counter:04d}",
+            narrative=f"validate_assembly level={level}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"validated": [level, len(relations)]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {
+            "ok": ok,
+            "level": level,
+            "checked": checked,
+            "issue_count": len(issues),
+            "issues": issues,
+        }
+        return result

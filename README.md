@@ -68,6 +68,37 @@ python -m benchmarks.run --output reports/v2.4.json
 
 > **0% 体积误差**（单次 boolean）— 所有 demo 体积与理论值高度一致
 
+## v2.7 参考坐标系与装配验证
+
+新增 5 个公开 op，把 demo 14 升到语义化装配：
+
+| op | 作用 |
+|----|------|
+| `create_reference_plane(name, origin, normal, x_axis, parent, metadata)` | 创建命名右手坐标系；自动正交化、parent 链校验 |
+| `query_reference(name=None)` | 查询单/全部 frame |
+| `resolve_point(frame, uv, normal_offset)` | `{frame, uv, normal_offset}` 形式 → 世界坐标 |
+| `resolve_placement(frame, uv, normal_offset, rotation)` | 返回 (world_origin, 3x3 rotation_matrix) |
+| `validate_assembly(level, relations)` | 校验共轴/平行/垂直/齿轮啮合/装配完整性 |
+
+支持的关系 kind：`coaxial` / `parallel` / `perpendicular` / `clearance` / `mounted` / `inside` / `gear_mesh`。
+
+### Demo 14 重写：齿轮中心距由 module/齿数自动算
+
+```
+input(z=20) ─── center=80 ─── intermediate_large(z=60)
+intermediate_small(z=18) ─── center=72 ─── output(z=54)
+```
+
+5 个 reference frame（`world` / `housing_mount_plane` / 三根 `*_shaft_axis`），
+所有 13 个装配实例都通过 `mount_frame` + `resolve_placement` 放置，
+不再是硬编码坐标。
+
+`validate_assembly(level="standard", relations=10)` → `ok=True issues=0`。
+
+![gearbox_full_evidence](docs/images/gearbox_full_evidence.png)
+![gearbox_interior_evidence](docs/images/gearbox_interior_evidence.png)
+![gearbox_presentation](docs/images/gearbox_presentation.png)
+
 ## 快速开始
 
 ```python
