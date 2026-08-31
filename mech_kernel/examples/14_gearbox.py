@@ -86,10 +86,10 @@ def compute_geometry() -> dict:
         "bore_intermediate": 20 + p["bore_clearance"],
         "bore_output": 24 + p["bore_clearance"],
 
-        # housing (足够大, 覆盖 input shaft -100~100 + output shaft -50~150)
+        # housing (足够大, 覆盖所有部件)
         "housing_length": 300.0,    # X: 覆盖 input + output 总 span
-        "housing_width": 180.0,     # Y: 容纳 intermediate Y=57 + gear radius 62 + buffer
-        "housing_height": 90.0,
+        "housing_width": 200.0,     # Y: 中间轴 Y=70 + 大齿轮 radius 62 = 132, 加 buffer → 200
+        "housing_height": 100.0,
         "wall_thickness": 6.0,
 
         # shafts (200mm, 居中)
@@ -445,16 +445,21 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
         "mount_frame": "output_shaft_axis",
     })
 
-    # 6-9. 4 个齿轮（与轴同 frame, 不同 normal_offset 决定轴向位置）
-    # 啮合对 X 位置必须相同:
-    #   input gear ↔ intermediate_large (X=30)
-    #   intermediate_small ↔ output gear (X=90)
-    for gear_name, axis_frame, axis_offset in [
-        ("gear_input", "input_shaft_axis", 30.0),
-        ("gear_intermediate_large", "intermediate_shaft_axis", 30.0),
-        ("gear_intermediate_small", "intermediate_shaft_axis", 90.0),
-        ("gear_output", "output_shaft_axis", 90.0),
-    ]:
+    # 6-9. 4 个齿轮（与轴同 frame, 不同 axis_offset 决定 X 位置）
+    # 啮合对必须 X 相同 (平行轴齿轮啮合条件):
+    #   pair 1 (cd1=80): gear_input (X=0)  ↔  gear_intermediate_large (X=0)
+    #   pair 2 (cd2=72): gear_intermediate_small (X=40)  ↔  gear_output (X=40)
+    # axis_offset = gear_X - frame_X
+    # input_shaft_axis 中心 X=0
+    # intermediate_shaft_axis 中心 X=X_mid=40
+    # output_shaft_axis 中心 X=X_end=60
+    gear_positions = [
+        ("gear_input", "input_shaft_axis", 0.0),                    # X = 0
+        ("gear_intermediate_large", "intermediate_shaft_axis", -40.0),  # X = 0
+        ("gear_intermediate_small", "intermediate_shaft_axis", 0.0),  # X = 40
+        ("gear_output", "output_shaft_axis", -20.0),              # X = 40
+    ]
+    for gear_name, axis_frame, axis_offset in gear_positions:
         pos, _ = _placement_from_frame(
             kernel, axis_frame, uv=(0, 0), normal_offset=axis_offset,
             rotation=(90, (0, 1, 0)),
