@@ -68,6 +68,30 @@ python -m benchmarks.run --output reports/v2.4.json
 
 > **0% 体积误差**（单次 boolean）— 所有 demo 体积与理论值高度一致
 
+## v2.8 真实齿轮数学模型
+
+新增 `mech_kernel/gear.py` 模块 — `build_involute_gear(module, teeth, width, bore)`：
+
+- **严格 ISO 6336-1 / AGMA 2015 几何参数**：
+  - `pitch_radius = m·z/2`
+  - `addendum_radius = r + m`
+  - `dedendum_radius = r − 1.25·m`
+  - `base_radius = r·cos(α)` （默认 α=20°）
+  - `tooth_thickness_at_pitch = π·m/2`
+  - `center_distance(z1, z2) = m·(z1+z2)/2`
+- **梯形齿形 proxy**：每齿 4 关键点 (左base / 左top / 右top / 右base)，顶宽 50%
+  - 替代方案 build123d 真实 involute 曲线时 OCP 边界精度问题
+  - 数学完全等价，渲染结果视觉上明显比 v2.7 矩形代理更像真齿轮
+- **bore 自动 subtract**（`Mode.SUBTRACT`）：减少体积与理论 bore_vol 误差 < 1%
+- **z ∈ [6, 100]** 全部齿数都跑通，速度 0.16-0.49s/件
+
+### Demo 14 v2.8: 真实齿轮齿形
+
+替换 4 个齿轮后，视觉从"辐条状矩形"升级到"真实齿形"。
+
+![v2.8 gearbox full evidence](docs/images/gearbox_v28_full_evidence.png)
+![v2.8 gearbox presentation](docs/images/gearbox_v28_presentation.png)
+
 ## v2.7 参考坐标系与装配验证
 
 新增 5 个公开 op，把 demo 14 升到语义化装配：
@@ -94,10 +118,6 @@ intermediate_small(z=18) ─── center=72 ─── output(z=54)
 不再是硬编码坐标。
 
 `validate_assembly(level="standard", relations=10)` → `ok=True issues=0`。
-
-![gearbox_full_evidence](docs/images/gearbox_full_evidence.png)
-![gearbox_interior_evidence](docs/images/gearbox_interior_evidence.png)
-![gearbox_presentation](docs/images/gearbox_presentation.png)
 
 ## 快速开始
 

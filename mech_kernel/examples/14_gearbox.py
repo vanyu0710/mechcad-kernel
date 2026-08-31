@@ -225,33 +225,29 @@ def build_bearing(geom: dict, name: str) -> MechKernel:
 
 
 def build_gear(module: float, teeth: int, width: float, bore: float, name: str) -> MechKernel:
-    """简化 spur-gear 视觉代理: pitch blank + repeated 矩形齿."""
-    k = _kernel()
-    pitch_r = _pitch_radius(module, teeth)
-    root_r = pitch_r * 0.92
-    _sketch(k, f"{name}_blank")
-    k.add_circle(f"{name}_blank", center=(0, 0), radius=root_r)
-    k.add_circle(f"{name}_blank", center=(0, 0), radius=bore / 2)
-    k.close_sketch(f"{name}_blank")
-    k.extrude(f"{name}_blank", depth=width, mode="new_body", name=f"{name}_blank")
+    """v2.8 真实数学齿轮 (trapezoidal proxy + 正确 ISO 几何参数).
 
-    _sketch(k, f"{name}_teeth")
-    tooth_depth = max(3.0, root_r * 0.12)
-    tooth_width = max(2.5, 3.14159 * root_r / teeth * 0.65)
-    tooth_center = root_r + tooth_depth * 0.5
-    for index in range(teeth):
-        angle = 2.0 * math.pi * index / teeth
-        cx = tooth_center * math.cos(angle)
-        cy = tooth_center * math.sin(angle)
-        k.add_rectangle(
-            f"{name}_teeth",
-            width=tooth_depth,
-            height=tooth_width,
-            center=(cx, cy),
-            name=f"{name}_tooth_{index + 1:02d}",
-        )
-    k.close_sketch(f"{name}_teeth")
-    k.extrude(f"{name}_teeth", depth=width, mode="add", name=f"{name}_teeth")
+    使用 build_involute_gear(module, teeth, width, bore):
+    - pitch_radius = m*z/2 (ISO 6336-1)
+    - addendum_radius = r + m
+    - dedendum_radius = r - 1.25m
+    - tooth 形: 梯形 (顶宽 50% 全宽, 跟宽 100%)
+    """
+    from mech_kernel.gear import build_involute_gear as _gen
+    from mech_kernel.features import FeatureNode, FeatureType, FeatureState, next_feature_id
+    part = _gen(module=module, teeth=teeth, width=width, bore=bore)
+
+    k = _kernel()
+    # 简化: 直接设 _current_geometry, 跳过 kernel 内 API
+    k._current_geometry = part
+    fid = next_feature_id()
+    feat = FeatureNode(
+        id=fid, type=FeatureType.EXTRUDE,
+        parameters={"module": module, "teeth": teeth, "width": width, "bore": bore, "source": "build_involute_gear"},
+        name=f"{name}_involute", state=FeatureState.COMPUTED,
+    )
+    k.feature_graph.add(feat)
+    k.narrative.append(f"build_involute_gear module={module} teeth={teeth} width={width} bore={bore}")
     return k
 
 
