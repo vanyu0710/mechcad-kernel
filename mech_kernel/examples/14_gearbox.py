@@ -43,10 +43,11 @@ GEAR_PARAMS = {
     "bore_clearance": 1.0,            # 齿轮孔 vs 轴的间隙
 
     # 各级齿数 (input, intermediate, output)
+    # 两段都用 (20, 60) 配对, 中心距都是 80, layout 更干净
     "z_input": 20,
     "z_intermediate_large": 60,
-    "z_intermediate_small": 18,
-    "z_output": 54,
+    "z_intermediate_small": 60,
+    "z_output": 20,
 
     # 轴中心距
     # 第一级: input shaft ↔ intermediate shaft
@@ -87,8 +88,8 @@ def compute_geometry() -> dict:
         "bore_output": 24 + p["bore_clearance"],
 
         # housing (足够大, 覆盖所有部件)
-        "housing_length": 300.0,    # X: 覆盖 input + output 总 span
-        "housing_width": 200.0,     # Y: 中间轴 Y=70 + 大齿轮 radius 62 = 132, 加 buffer → 200
+        "housing_length": 320.0,    # X: 覆盖 input + output 总 span
+        "housing_width": 280.0,     # Y: 中间轴 Y=70 + 大齿轮 radius 62 = 132, 中心对齐 → 280
         "housing_height": 100.0,
         "wall_thickness": 6.0,
 
@@ -294,14 +295,13 @@ def setup_reference_frames(kernel: MechKernel, geom: dict) -> dict:
     import math as _math
     p = GEAR_PARAMS
     cd1 = geom["center_distance_stage1"]   # 80
-    cd2 = geom["center_distance_stage2"]   # 72
+    cd2 = geom["center_distance_stage2"]   # 80 (same as cd1 now)
 
-    # 选 X_end (output 距 input 的 X 距离), 解 X_mid 和 Y_offset
-    # 选 X_end=60, 中间轴在 X_mid=36.7, Y=70.6 (更紧凑)
-    X_end = 60.0
-    # X_mid² - (X_mid - X_end)² = cd1² - cd2²
-    X_mid = (cd1**2 - cd2**2 + X_end**2) / (2 * X_end)
-    Y_offset = _math.sqrt(cd1**2 - X_mid**2)
+    # 统一中心距 (cd1 = cd2 = 80) → 中间轴 Y_offset = 80, X_mid = X_end / 2
+    # 三根轴布局: input (0,0), intermediate (X_mid, 80), output (X_end, 0)
+    X_end = 50.0
+    X_mid = X_end / 2.0
+    Y_offset = cd1  # 80
 
     input_x = 0.0
     inter_x = X_mid
@@ -448,16 +448,16 @@ def build_assembly(kernel: MechKernel, paths: dict, geom: dict, layout: dict) ->
     # 6-9. 4 个齿轮（与轴同 frame, 不同 axis_offset 决定 X 位置）
     # 啮合对必须 X 相同 (平行轴齿轮啮合条件):
     #   pair 1 (cd1=80): gear_input (X=0)  ↔  gear_intermediate_large (X=0)
-    #   pair 2 (cd2=72): gear_intermediate_small (X=40)  ↔  gear_output (X=40)
+    #   pair 2 (cd2=80): gear_intermediate_small (X=50)  ↔  gear_output (X=50)
     # axis_offset = gear_X - frame_X
     # input_shaft_axis 中心 X=0
-    # intermediate_shaft_axis 中心 X=X_mid=40
-    # output_shaft_axis 中心 X=X_end=60
+    # intermediate_shaft_axis 中心 X=X_mid=25
+    # output_shaft_axis 中心 X=X_end=50
     gear_positions = [
         ("gear_input", "input_shaft_axis", 0.0),                    # X = 0
-        ("gear_intermediate_large", "intermediate_shaft_axis", -40.0),  # X = 0
-        ("gear_intermediate_small", "intermediate_shaft_axis", 0.0),  # X = 40
-        ("gear_output", "output_shaft_axis", -20.0),              # X = 40
+        ("gear_intermediate_large", "intermediate_shaft_axis", -25.0),  # X = 0
+        ("gear_intermediate_small", "intermediate_shaft_axis", 25.0),  # X = 50
+        ("gear_output", "output_shaft_axis", 0.0),              # X = 50
     ]
     for gear_name, axis_frame, axis_offset in gear_positions:
         pos, _ = _placement_from_frame(
