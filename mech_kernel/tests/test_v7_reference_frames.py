@@ -250,6 +250,57 @@ def test_kernel_validate_assembly_coaxial_aligned_strict():
     print("  ✓ test_kernel_validate_assembly_coaxial_aligned_strict")
 
 
+def test_kernel_validate_assembly_axis_misalign():
+    """v2.9.2: axis_misalign 查两 frame 中心距"""
+    k = MechKernel()
+    # 同一原点 → 中心距 0
+    k.create_reference_plane("frame_a", origin=(0, 0, 0), normal=(0, 0, 1))
+    k.create_reference_plane("frame_b", origin=(0, 0, 0), normal=(0, 0, 1))
+    # 不同原点 → 中心距 50
+    k.create_reference_plane("frame_c", origin=(50, 0, 0), normal=(0, 0, 1))
+    r = k.validate_assembly(
+        level="standard",
+        relations=[
+            {"kind": "axis_misalign", "source": "frame_a", "target": "frame_b"},  # 0
+            {"kind": "axis_misalign", "source": "frame_a", "target": "frame_c"},  # 50
+        ],
+    )
+    assert r.success
+    assert r.value["ok"] is False  # frame_a↔frame_c 应 fail
+    codes = [i["code"] for i in r.value["issues"]]
+    assert "axis_misalign" in codes
+    # 检查 frame_a↔frame_c 报
+    misalign = [i for i in r.value["issues"] if i["code"] == "axis_misalign"]
+    assert abs(misalign[0]["distance"] - 50.0) < 0.01
+    print("  ✓ test_kernel_validate_assembly_axis_misalign")
+
+
+def test_kernel_validate_assembly_axis_misalign_with_tolerance():
+    """v2.9.2: axis_misalign 自定义 tolerance"""
+    k = MechKernel()
+    k.create_reference_plane("a", origin=(0, 0, 0), normal=(0, 0, 1))
+    k.create_reference_plane("b", origin=(0.05, 0, 0), normal=(0, 0, 1))  # 距离 0.05
+    # tolerance=0.1 应通过
+    r = k.validate_assembly(
+        level="standard",
+        relations=[
+            {"kind": "axis_misalign", "source": "a", "target": "b",
+             "parameters": {"tolerance": 0.1}},
+        ],
+    )
+    assert r.value["ok"] is True, f"tol=0.1 应通过: {r.value['issues']}"
+    # tolerance=0.01 应失败
+    r2 = k.validate_assembly(
+        level="standard",
+        relations=[
+            {"kind": "axis_misalign", "source": "a", "target": "b",
+             "parameters": {"tolerance": 0.01}},
+        ],
+    )
+    assert r2.value["ok"] is False
+    print("  ✓ test_kernel_validate_assembly_axis_misalign_with_tolerance")
+
+
 def test_resolve_placement_rotation_world_axis():
     """v2.7.1: 验证 rotation 语义 (axis 是世界轴, R @ base)"""
     reg = FrameRegistry()

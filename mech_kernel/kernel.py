@@ -126,8 +126,10 @@ class MechKernel:
         self._redo_stack: List[Dict] = []
         self._max_undo_depth = 50
         self.cap = CapabilityRegistry()
-        self.PUBLIC_OPS = PUBLIC_OPS  # 挂到 instance 上（兼容测试）
         self._register_op_schemas()
+        # v2.9.2: PUBLIC_OPS 自动从 cap 派生 (消除 2 个 source-of-truth drift)
+        # module-level PUBLIC_OPS 仍保留, 供 `from mech_kernel.kernel import PUBLIC_OPS` 兼容
+        self.PUBLIC_OPS = frozenset(c["name"] for c in self.cap.list_public())
     
     def _register_op_schemas(self):
         """手动注册公共 op schema（P1-4 v8: 用 set_capability 检测重复）"""
@@ -3351,6 +3353,11 @@ class MechKernel:
     def _bump_geometry_revision(self):
         self._geometry_revision += 1
         self.renderer.clear_cache()
+        # v2.9.2: kernel 自己的 last-render 缓存也清, 防 stale
+        # (renderer.clear_cache 只清 OrderedDict, 不碰 _last_render_base64 / _last_render_views)
+        self._last_render_base64 = None
+        self._last_render_views = {}
+        self._last_render_step = -1
 
     def _validate_transaction_state(self, description: str) -> None:
         """Reject invalid topology candidates before a transaction is published."""
@@ -4109,6 +4116,7 @@ class MechKernel:
             - coaxial_aligned:    两 frame normal 同向 (dot > 1-eps)
             - parallel:     两 frame normal 平行 (|dot| > 1-eps)
             - perpendicular: 两 frame normal 垂直
+            - axis_misalign: 两 frame 中心距不在容差内 (v2.9.2)
             - clearance:    两 instance bbox 不重叠（如果给了 source/target）
             - mounted:      instance 的 mount_frame 已注册
             - inside:       容器关系（一个 frame 在另一个 frame bbox 内）
@@ -4212,6 +4220,18 @@ class MechKernel:
                         "source": source_name, "target": target_name,
                         "dot": d,
                         "message": f"{source_name} 与 {target_name} 不垂直 (|dot|={d:.4f})",
+                    })
+            elif kind == "axis_misalign":
+                # v2.9.2: 两 frame 中心点应共线 (v2.6 baseline 提的 axis mismatch 简化版)
+                # 不查 normal 方向 (coaxial 已查), 只查 origin 中心距
+                tol = float(params.get("tolerance", 1e-3))
+                d = _frame_distance(sf, tf)
+                if d > tol:
+                    issues.append({
+                        "code": "axis_misalign",
+                        "source": source_name, "target": target_name,
+                        "distance": d, "tolerance": tol,
+                        "message": f"{source_name} 与 {target_name} 中心距 {d:.6f} > tolerance {tol}",
                     })
             elif kind == "clearance":
                 # bbox 不重叠检查（如果两个 instance 有 bbox）
