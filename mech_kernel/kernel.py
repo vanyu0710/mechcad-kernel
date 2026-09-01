@@ -129,6 +129,7 @@ class MechKernel:
         self._frame_registry: FrameRegistry = FrameRegistry()  # v2.7: 参考坐标系
         self._topo_cache: TopologyCache = TopologyCache()  # v2.11: face/edge 引用缓存
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
+        self._last_profile_fallback: Optional[str] = None  # v2.11: 真弧线剖面回退提示
         self._last_render_base64: Optional[str] = None
         self._last_render_views: Dict[str, bytes] = {}
         self.geometry_inspector = GeometryInspector()
@@ -978,6 +979,7 @@ class MechKernel:
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=self._take_profile_fallback_warning(),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -1057,10 +1059,19 @@ class MechKernel:
             self.feature_graph.add(feature)
             
             # v2.0: line/polyline/arc 剖面 → 闭合线框 → make_face → revolve（解锁 CD 喷口等）
+            # v2.11: 优先真弧线 wire，失败回退采样折线
             profile = None
             profile_wires = None
             if any(e.type in ("line", "polyline", "arc") for e in sk.entities):
-                profile = self._collect_closed_profile(sk)
+                self._last_profile_fallback = None
+                try:
+                    segments = self._collect_profile_segments(sk)
+                    profile_wires = self._profile_wire_from_segments(segments)
+                except (InvalidRequestError, RefStaleError, RefFormatError):
+                    raise
+                except Exception:
+                    self._last_profile_fallback = "真弧线剖面构建失败，已回退为采样折线（轮廓为近似）"
+                    profile = self._collect_closed_profile(sk)
             if profile is not None:
                 # 注意：BuildLine 不能嵌在 BuildPart/BuildSketch 上下文内
                 with BuildLine() as bl:
@@ -1125,6 +1136,7 @@ class MechKernel:
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=self._take_profile_fallback_warning(),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -3729,9 +3741,127 @@ class MechKernel:
                 return i
         return None
 
+    def _collect_profile_segments(self, sk) -> List[dict]:
+        """v2.11: 把 line/polyline/arc 实体收集成有序闭合段列表（保留真弧参数）。
+
+        每段: {"kind": "line", "p1": (x,y), "p2": (x,y)}
+            或 {"kind": "arc", "center", "radius", "a0", "a1", "p1", "p2"}
+        连通性检查用 6 位小数吸附坐标；段保持原始方向（wire 构建时处理反转）。
+        """
+        import math
+
+        def _snap(pt):
+            return (0.0 if abs(pt[0]) < 1e-9 else round(pt[0], 6),
+                    0.0 if abs(pt[1]) < 1e-9 else round(pt[1], 6))
+
+        segs = []
+        for e in sk.entities:
+            if e.type == "line":
+                p1, p2 = tuple(e.params["start"]), tuple(e.params["end"])
+                segs.append({"kind": "line", "p1": p1, "p2": p2,
+                             "_s": _snap(p1), "_e": _snap(p2)})
+            elif e.type == "polyline":
+                pts = [tuple(p) for p in e.params["points"]]
+                if _snap(pts[0]) != _snap(pts[-1]):
+                    pts = pts + [pts[0]]
+                for i in range(len(pts) - 1):
+                    p1, p2 = pts[i], pts[i + 1]
+                    segs.append({"kind": "line", "p1": p1, "p2": p2,
+                                 "_s": _snap(p1), "_e": _snap(p2)})
+            elif e.type == "arc":
+                c = tuple(e.params["center"])
+                r = float(e.params["radius"])
+                a0, a1 = float(e.params["start_angle"]), float(e.params["end_angle"])
+                if a1 < a0:
+                    a1 += 360.0
+                p1 = (c[0] + r * math.cos(math.radians(a0)), c[1] + r * math.sin(math.radians(a0)))
+                p2 = (c[0] + r * math.cos(math.radians(a1)), c[1] + r * math.sin(math.radians(a1)))
+                segs.append({"kind": "arc", "center": c, "radius": r, "a0": a0, "a1": a1,
+                             "p1": p1, "p2": p2, "_s": _snap(p1), "_e": _snap(p2)})
+            else:
+                raise InvalidRequestError(f"剖面不支持 entity type={e.type}")
+        if not segs:
+            raise InvalidRequestError("剖面为空")
+
+        # 链式排序：先按旧语义前向链（只匹配段起点，精确复现 分叉/断点 报错），
+        # 失败再试双向链（容忍用户把某段方向写反）；两者都失败时保留旧报错
+        try:
+            return self._walk_profile_segments(list(segs), allow_reversed=False)
+        except InvalidRequestError as forward_err:
+            try:
+                return self._walk_profile_segments(list(segs), allow_reversed=True)
+            except InvalidRequestError:
+                raise forward_err
+
+    def _walk_profile_segments(self, remaining: List[dict], allow_reversed: bool) -> List[dict]:
+        if not remaining:
+            raise InvalidRequestError("剖面为空")
+        ordered = [remaining.pop(0)]
+        cur = ordered[0]["_e"]
+        start_pt = ordered[0]["_s"]
+        broke = False
+        while remaining and cur != start_pt:
+            nxt_i = None
+            forward = True
+            n_forward = 0
+            for i, s in enumerate(remaining):
+                if s["_s"] == cur:
+                    n_forward += 1
+                    if nxt_i is None:
+                        nxt_i, forward = i, True
+                elif allow_reversed and nxt_i is None and s["_e"] == cur:
+                    nxt_i, forward = i, False
+            if nxt_i is None:
+                broke = True
+                break
+            if n_forward > 1:
+                raise InvalidRequestError("剖面分叉（一个点引出多条线）")
+            seg = remaining.pop(nxt_i)
+            if not forward:
+                seg = {**seg, "p1": seg["p2"], "p2": seg["p1"], "_s": seg["_e"], "_e": seg["_s"]}
+                if seg["kind"] == "arc":
+                    # 反向遍历同一条弧：a0' = 原 a1（已含 360 展开），a1' = 原 a0 + 360
+                    a0n, a1n = seg["a1"], seg["a0"] + 360.0
+                    seg = {**seg, "a0": a0n, "a1": a1n}
+            ordered.append(seg)
+            cur = seg["_e"]
+        if cur != start_pt:
+            # 交给后置分类：剩余段共起点（或接回起点）= 分叉；否则 = 断点
+            starts = [s["_s"] for s in remaining]
+            if remaining and (len(starts) != len(set(starts))
+                              or any(p == start_pt for p in starts)):
+                raise InvalidRequestError("剖面分叉（一个点引出多条线）")
+            raise InvalidRequestError("剖面不连续（存在断点）")
+        if remaining:
+            # 链已闭合但还有剩余段：若它们共享任何已见起点 → 分叉，否则多余子环
+            starts = [s["_s"] for s in remaining]
+            if len(starts) != len(set(starts)):
+                raise InvalidRequestError("剖面分叉（一个点引出多条线）")
+            raise InvalidRequestError("剖面存在重复点/子环（未整体闭合）")
+        return ordered
+
+    def _profile_wire_from_segments(self, segments):
+        """v2.11: 段列表 → build123d Wire（line→Line, arc→ThreePointArc 真弧线）。
+
+        失败抛异常，调用方负责回退采样折线。
+        """
+        import math
+        from build123d import BuildLine, Line as B3DLine, ThreePointArc as B3DThreePointArc
+
+        with BuildLine() as bl:
+            for seg in segments:
+                if seg["kind"] == "line":
+                    B3DLine(seg["p1"], seg["p2"])
+                else:
+                    c, r = seg["center"], seg["radius"]
+                    a0, a1 = seg["a0"], seg["a1"]
+                    mid_ang = math.radians(a0 + (a1 - a0) / 2.0)
+                    mid = (c[0] + r * math.cos(mid_ang), c[1] + r * math.sin(mid_ang))
+                    B3DThreePointArc(seg["p1"], mid, seg["p2"])
+        return bl.wires()
+
     def _collect_closed_profile(self, sk) -> List[Tuple[float, float]]:
-        """v2.0: 把 line/polyline/arc 实体收集成闭合剖面点列（revolve / extrude 用）。
-        arc 按 ~5°/段采样成折线。返回闭合环（不含重复首点）。"""
+        """v2.0: 把 line/polyline/arc 实体收集成闭合剖面点列（回退路径，arc 采样折线）。"""
         import math
 
         def _snap(pt):
@@ -3832,8 +3962,15 @@ class MechKernel:
             return None
         return B3DPlane(origin=tuple(wp.origin), x_dir=tuple(wp.x_dir), z_dir=tuple(wp.normal))
 
+    def _take_profile_fallback_warning(self) -> Optional[str]:
+        """v2.11: 取走真弧线剖面回退提示（一次性）"""
+        w = self._last_profile_fallback
+        self._last_profile_fallback = None
+        return w
+
     def _extrude_sketch_solid(self, sketch, depth, plane):
-        """v2.1: 把草图拉伸成 Part（circle/rectangle/line/polyline/arc 统一支持）。"""
+        """v2.1: 把草图拉伸成 Part（circle/rectangle/line/polyline/arc 统一支持）。
+        v2.11: 混合剖面优先真弧线 wire，失败回退采样折线（记入 _last_profile_fallback）。"""
         from build123d import BuildPart, BuildSketch, add, extrude
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
         from build123d import BuildLine, Polyline as B3DPolyline, make_face
@@ -3841,6 +3978,20 @@ class MechKernel:
 
         profile = None
         if any(e.type in ("line", "polyline", "arc") for e in sketch.entities):
+            # v2.11: 先试真弧线 wire（ThreePointArc，非采样）
+            self._last_profile_fallback = None
+            try:
+                segments = self._collect_profile_segments(sketch)
+                profile_wires = self._profile_wire_from_segments(segments)
+                with BuildPart(plane) as bp:
+                    with BuildSketch() as s:
+                        make_face(profile_wires)
+                    extrude(amount=depth)
+                return bp.part
+            except (InvalidRequestError, RefStaleError, RefFormatError):
+                raise
+            except Exception:
+                self._last_profile_fallback = "真弧线剖面构建失败，已回退为采样折线（轮廓为近似）"
             profile = self._collect_closed_profile(sketch)
         if profile is not None:
             with BuildLine() as bl:
@@ -3999,9 +4150,23 @@ class MechKernel:
                         return bp.part
             
             # v2.0: line/polyline/arc 闭合剖面 → face → extrude
+            # v2.11: 优先真弧线 wire，失败回退采样折线
             if any(e.type in ("line", "polyline", "arc") for e in sketch.entities):
-                profile = self._collect_closed_profile(sketch)
                 from build123d import BuildLine, Polyline as B3DPolyline, make_face
+                self._last_profile_fallback = None
+                try:
+                    segments = self._collect_profile_segments(sketch)
+                    profile_wires = self._profile_wire_from_segments(segments)
+                    with BuildPart(plane) as bp:
+                        with BuildSketch() as s:
+                            make_face(profile_wires)
+                        extrude(amount=depth)
+                    return bp.part
+                except (InvalidRequestError, RefStaleError, RefFormatError):
+                    raise
+                except Exception:
+                    self._last_profile_fallback = "真弧线剖面构建失败，已回退为采样折线（轮廓为近似）"
+                profile = self._collect_closed_profile(sketch)
                 with BuildLine() as bl:
                     B3DPolyline(*profile, close=True)
                 profile_wires = bl.wires()
