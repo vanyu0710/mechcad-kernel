@@ -45,8 +45,11 @@ def test_capability_schema_matches_signatures():
     """每个 PUBLIC_OP 的注册 schema 必须与真实方法签名一致（键集合 + 必填）"""
     k = MechKernel()
     reg_names = set(k.cap._caps.keys())
-    assert reg_names == set(PUBLIC_OPS), f"registry 与 PUBLIC_OPS 不一致: {sorted(reg_names ^ set(PUBLIC_OPS))}"
-    for op in PUBLIC_OPS:
+    from mech_kernel.kernel import EXPERIMENTAL_OPS
+    assert reg_names == set(PUBLIC_OPS) | set(EXPERIMENTAL_OPS), (
+        f"registry 与 PUBLIC_OPS+EXPERIMENTAL_OPS 不一致: {sorted(reg_names ^ (set(PUBLIC_OPS) | set(EXPERIMENTAL_OPS)))}"
+    )
+    for op in reg_names:
         method = getattr(k, op, None)
         assert method is not None and callable(method), f"{op} 没有对应方法"
         schema = k.cap.get(op).input_schema

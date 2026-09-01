@@ -280,71 +280,100 @@ class FeatureNode:
         )
 
 
-# ID 生成器（简单的全局计数器）
+# ID 生成器（v2.11: 每个 MechKernel 实例私有一组；模块级默认组仅供外部兼容）
 class _IdGenerator:
     def __init__(self, prefix: str = "feat"):
         self.prefix = prefix
         self.counter = 0
-    
+
     def next(self) -> str:
         self.counter += 1
         return f"{self.prefix}_{self.counter:04d}"
-    
+
     def reset(self):
         self.counter = 0
 
 
-_feat_id_gen = _IdGenerator("F")
-_sketch_id_gen = _IdGenerator("SK")
-_workplane_id_gen = _IdGenerator("WP")
-_entity_id_gen = _IdGenerator("E")
-_constraint_id_gen = _IdGenerator("C")
+class IdGeneratorSet:
+    """一个 kernel 实例私有的 ID 生成器组。
+
+    v2.11 之前是模块级全局单例：同进程多个 MechKernel 实例共享计数器，
+    且 _replay() 的全局重置会互相污染。现在每个实例持有独立一组。
+    """
+
+    def __init__(self):
+        self.feature = _IdGenerator("F")
+        self.sketch = _IdGenerator("SK")
+        self.workplane = _IdGenerator("WP")
+        self.entity = _IdGenerator("E")
+        self.constraint = _IdGenerator("C")
+
+    def next_feature_id(self) -> str:
+        return self.feature.next()
+
+    def next_sketch_id(self) -> str:
+        return self.sketch.next()
+
+    def next_workplane_id(self) -> str:
+        return self.workplane.next()
+
+    def next_entity_id(self) -> str:
+        return self.entity.next()
+
+    def next_constraint_id(self) -> str:
+        return self.constraint.next()
+
+    def reset(self):
+        for gen in (self.feature, self.sketch, self.workplane, self.entity, self.constraint):
+            gen.reset()
+
+    def seed_from_history(self, history: list) -> None:
+        """Seed replay IDs so histories created after another kernel stay stable."""
+        import re
+        first_seen = {}
+        for entry in history:
+            value = entry.get("feature_id") if isinstance(entry, dict) else None
+            if not isinstance(value, str):
+                continue
+            match = re.match(r"^(F|E|C)_(\d+)$", value)
+            if match and match.group(1) not in first_seen:
+                first_seen[match.group(1)] = int(match.group(2)) - 1
+        generators = {"F": self.feature, "E": self.entity, "C": self.constraint}
+        for prefix, counter in first_seen.items():
+            generators[prefix].counter = max(0, counter)
+
+
+_default_ids = IdGeneratorSet()
 
 
 def next_feature_id() -> str:
-    return _feat_id_gen.next()
+    return _default_ids.next_feature_id()
 
 
 def next_sketch_id() -> str:
-    return _sketch_id_gen.next()
+    return _default_ids.next_sketch_id()
 
 
 def next_workplane_id() -> str:
-    return _workplane_id_gen.next()
+    return _default_ids.next_workplane_id()
 
 
 def next_entity_id() -> str:
-    return _entity_id_gen.next()
+    return _default_ids.next_entity_id()
 
 
 def next_constraint_id() -> str:
-    return _constraint_id_gen.next()
+    return _default_ids.next_constraint_id()
 
 
 def reset_all_id_generators():
-    """重置所有 ID 生成器（用于测试和 undo）"""
-    global _feat_id_gen, _sketch_id_gen, _workplane_id_gen, _entity_id_gen, _constraint_id_gen
-    _feat_id_gen = _IdGenerator("F")
-    _sketch_id_gen = _IdGenerator("SK")
-    _workplane_id_gen = _IdGenerator("WP")
-    _entity_id_gen = _IdGenerator("E")
-    _constraint_id_gen = _IdGenerator("C")
+    """重置模块级默认 ID 生成器（兼容旧调用；kernel 实例内部使用 self._ids）"""
+    _default_ids.reset()
 
 
 def seed_id_generators_from_history(history: list) -> None:
-    """Seed replay IDs so histories created after another kernel stay stable."""
-    import re
-    first_seen = {}
-    for entry in history:
-        value = entry.get("feature_id") if isinstance(entry, dict) else None
-        if not isinstance(value, str):
-            continue
-        match = re.match(r"^(F|E|C)_(\d+)$", value)
-        if match and match.group(1) not in first_seen:
-            first_seen[match.group(1)] = int(match.group(2)) - 1
-    generators = {"F": _feat_id_gen, "E": _entity_id_gen, "C": _constraint_id_gen}
-    for prefix, counter in first_seen.items():
-        generators[prefix].counter = max(0, counter)
+    """Seed 模块级默认生成器（兼容旧调用；kernel 实例内部使用 self._ids）"""
+    _default_ids.seed_from_history(history)
 
 
 # ============================================================

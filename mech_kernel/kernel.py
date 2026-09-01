@@ -26,7 +26,8 @@ from .features import (
     FeatureType, FeatureState, FeatureNode, Sketch, SketchEntity,
     Constraint, ConstraintStatus, Reference, TOPOLOGY_CHANGING_OPS, NON_RENDERING_OPS,
     next_feature_id, next_sketch_id, next_workplane_id, next_entity_id,
-    next_constraint_id, reset_all_id_generators, seed_id_generators_from_history
+    next_constraint_id, reset_all_id_generators, seed_id_generators_from_history,
+    IdGeneratorSet,
 )
 from .assembly import AssemblyInstance
 from .constraint_solver import SUPPORTED_CONSTRAINTS, solve_sketch as solve_sketch_constraints, validate_constraint
@@ -51,6 +52,9 @@ from .validators import (
 )
 
 
+# v2.11: 默认 LLM 能力集 = PUBLIC_OPS（零件建模主线）。
+# 装配相关 10 op 移入 EXPERIMENTAL_OPS：execute() 默认拒绝，
+# allow_experimental=True 或直接方法调用可用（代码冻结保留）。
 PUBLIC_OPS = frozenset({
     "create_workplane", "new_sketch", "add_circle", "add_rectangle", "add_line", "close_sketch",
     "extrude", "revolve", "sweep", "boolean",
@@ -58,15 +62,18 @@ PUBLIC_OPS = frozenset({
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
-    "add_polyline", "add_arc", "assemble", "render",
+    "add_polyline", "add_arc", "render",
     "add_constraint", "set_parameter", "solve_sketch",
     "validate_geometry",
-    "query_assembly", "set_instance_visibility", "set_instance_color",
-    # v2.7: reference-coordinate framework
-    "create_reference_plane", "query_reference",
-    "resolve_point", "resolve_placement",
+})
+
+EXPERIMENTAL_OPS = frozenset({
+    # v2.1 装配（质量不佳，聚焦零件建模主线；后续随装配重写回归）
+    "assemble", "query_assembly", "set_instance_visibility", "set_instance_color",
+    # v2.7 参考坐标系
+    "create_reference_plane", "query_reference", "resolve_point", "resolve_placement",
     "validate_assembly",
-    # v2.9: collision check
+    # v2.9 碰撞检查
     "check_interference",
 })
 
@@ -128,6 +135,7 @@ class MechKernel:
         self._assembly_instances: Dict[str, AssemblyInstance] = {}
         self._frame_registry: FrameRegistry = FrameRegistry()  # v2.7: 参考坐标系
         self._topo_cache: TopologyCache = TopologyCache()  # v2.11: face/edge 引用缓存
+        self._ids = IdGeneratorSet()  # v2.11: 实例私有 ID 生成器（多实例互不污染）
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_profile_fallback: Optional[str] = None  # v2.11: 真弧线剖面回退提示
         self._last_render_base64: Optional[str] = None
@@ -146,6 +154,8 @@ class MechKernel:
         # v2.9.2: PUBLIC_OPS 自动从 cap 派生 (消除 2 个 source-of-truth drift)
         # module-level PUBLIC_OPS 仍保留, 供 `from mech_kernel.kernel import PUBLIC_OPS` 兼容
         self.PUBLIC_OPS = frozenset(c["name"] for c in self.cap.list_public())
+        # v2.11: experimental op 集合（execute(allow_experimental=True) 才可调）
+        self.EXPERIMENTAL_OPS = frozenset(c["name"] for c in self.cap.list_experimental())
     
     def _register_op_schemas(self):
         """手动注册公共 op schema（P1-4 v8: 用 set_capability 检测重复）"""
@@ -424,9 +434,11 @@ class MechKernel:
             },
         }
         for name, schema in placeholder_schemas.items():
+            # v2.11: 装配相关 op 标记 experimental（不进入默认 LLM 能力集）
+            permission = "experimental" if name in EXPERIMENTAL_OPS else "public"
             self.cap.set_capability(Capability(
                 name=name, category=name.split("_")[0], description=name,
-                input_schema=schema, permission="public",
+                input_schema=schema, permission=permission,
             ))
         # Placeholder schemas are declared after the first binding pass.
         # Bind all public capabilities once more so registry.call() is usable.
@@ -524,7 +536,7 @@ class MechKernel:
 
         with Transaction(self, "create_workplane") as txn:
             entry = self._record_history("create_workplane", **history_kwargs)
-            wp = Workplane(id=f"wp_{name}_{next_workplane_id()}", name=name, type=WorkplaneType(type),
+            wp = Workplane(id=f"wp_{name}_{self._ids.next_workplane_id()}", name=name, type=WorkplaneType(type),
                            origin=wp_origin, x_dir=wp_x, normal=wp_normal, reference=reference)
             self.workplanes.register(wp)
             self.narrative.append(f"创建工作平面 {name} ({type})")
@@ -550,7 +562,7 @@ class MechKernel:
         
         with Transaction(self, "new_sketch") as txn:
             entry = self._record_history("new_sketch", workplane_name=workplane_name, sketch_name=sketch_name)
-            sk = Sketch(id=next_sketch_id(), name=sketch_name, workplane_name=workplane_name)
+            sk = Sketch(id=self._ids.next_sketch_id(), name=sketch_name, workplane_name=workplane_name)
             self.sketches[sketch_name] = sk
             self.narrative.append(f"创建草图 {sketch_name} (在 {workplane_name})")
             txn.commit()
@@ -578,7 +590,7 @@ class MechKernel:
         
         with Transaction(self, "add_circle") as txn:
             entry = self._record_history("add_circle", sketch_name=sketch_name, center=center, radius=radius, name=name)
-            entity_id = next_entity_id()
+            entity_id = self._ids.next_entity_id()
             entry["feature_id"] = entity_id
             entity = SketchEntity(
                 id=entity_id, type="circle",
@@ -613,7 +625,7 @@ class MechKernel:
         sk = self.sketches[sketch_name]
         with Transaction(self, "add_rectangle") as txn:
             entry = self._record_history("add_rectangle", sketch_name=sketch_name, width=width, height=height, center=center, name=name)
-            entity_id = next_entity_id()
+            entity_id = self._ids.next_entity_id()
             entry["feature_id"] = entity_id
             entity = SketchEntity(
                 id=entity_id, type="rectangle",
@@ -646,7 +658,7 @@ class MechKernel:
         sk = self.sketches[sketch_name]
         with Transaction(self, "add_line") as txn:
             entry = self._record_history("add_line", sketch_name=sketch_name, start=start, end=end)
-            entity_id = next_entity_id()
+            entity_id = self._ids.next_entity_id()
             entry["feature_id"] = entity_id
             entity = SketchEntity(
                 id=entity_id, type="line",
@@ -679,7 +691,7 @@ class MechKernel:
             raise InvalidRequestError("polyline 至少需要 3 个点")
         sk = self.sketches[sketch_name]
         entry = self._record_history("add_polyline", sketch_name=sketch_name, points=points, name=name)
-        entity_id = next_entity_id()
+        entity_id = self._ids.next_entity_id()
         entry["feature_id"] = entity_id
         entity = SketchEntity(
             id=entity_id, type="polyline",
@@ -712,7 +724,7 @@ class MechKernel:
             "add_arc", sketch_name=sketch_name, center=center, radius=radius,
             start_angle=start_angle, end_angle=end_angle, name=name,
         )
-        entity_id = next_entity_id()
+        entity_id = self._ids.next_entity_id()
         entry["feature_id"] = entity_id
         entity = SketchEntity(
             id=entity_id, type="arc",
@@ -806,7 +818,7 @@ class MechKernel:
                 "add_constraint", sketch_name=sketch_name, constraint_type=constraint_type,
                 references=references, value=value, parameter_name=parameter_name, name=name,
             )
-            constraint_id = next_constraint_id()
+            constraint_id = self._ids.next_constraint_id()
             entry["feature_id"] = constraint_id
             constraint = Constraint(
                 id=constraint_id, type=constraint_type, references=copy.deepcopy(references),
@@ -946,7 +958,7 @@ class MechKernel:
         
         with Transaction(self, "extrude") as txn:
             entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name, confirm_replace=confirm_replace)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.EXTRUDE,
@@ -1048,7 +1060,7 @@ class MechKernel:
         
         with Transaction(self, "revolve") as txn:
             entry = self._record_history("revolve", sketch_name=sketch_name, axis=axis, angle=angle, mode=mode, name=name, confirm_replace=confirm_replace)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.REVOLVE,
@@ -1179,7 +1191,7 @@ class MechKernel:
             raise NotImplementedError("circular_pattern 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "circular_pattern") as txn:
             entry = self._record_history("circular_pattern", sketch_name=sketch_name, count=count, axis_origin=axis_origin, axis_direction=axis_direction, angle=angle, depth=depth, mode=mode, name=name)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.CIRCULAR_PATTERN,
@@ -1298,7 +1310,7 @@ class MechKernel:
         
         with Transaction(self, "boolean") as txn:
             entry = self._record_history("boolean", target_sketch=target_sketch, tools=tools, operation=operation, name=name, depth=depth)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.BOOLEAN,
@@ -1397,7 +1409,7 @@ class MechKernel:
         
         with Transaction(self, "fillet") as txn:
             entry = self._record_history("fillet", radius=radius, edges=edges, name=name)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.FILLET,
@@ -1465,7 +1477,7 @@ class MechKernel:
         
         with Transaction(self, "chamfer") as txn:
             entry = self._record_history("chamfer", length=length, length2=length2, edges=edges, name=name)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.CHAMFER,
@@ -1604,7 +1616,7 @@ class MechKernel:
 
         with Transaction(self, "hole") as txn:
             entry = self._record_history("hole", position=position, diameter=diameter, depth=depth, hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth, name=name, direction=direction)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.HOLE,
@@ -1749,7 +1761,7 @@ class MechKernel:
         
         with Transaction(self, "shell") as txn:
             entry = self._record_history("shell", thickness=thickness, face_filter=face_filter, name=name, face_refs=face_refs)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SHELL,
@@ -1849,7 +1861,7 @@ class MechKernel:
             raise NotImplementedError("linear_pattern 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "linear_pattern") as txn:
             entry = self._record_history("linear_pattern", sketch_name=sketch_name, count=count, direction=direction, spacing=spacing, mode=mode, name=name, depth=depth)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.LINEAR_PATTERN,
@@ -1954,7 +1966,7 @@ class MechKernel:
             raise NotImplementedError("mirror 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "mirror") as txn:
             entry = self._record_history("mirror", sketch_name=sketch_name, axis=axis, mode=mode, name=name, depth=depth)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.MIRROR,
@@ -2095,7 +2107,7 @@ class MechKernel:
 
         with Transaction(self, "sweep") as txn:
             entry = self._record_history("sweep", profile_sketch=profile_sketch, path=path, length=length, name=name, mode=mode, confirm_replace=confirm_replace)
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SWEEP,
@@ -2777,7 +2789,7 @@ class MechKernel:
         from build123d.exporters3d import export_step
         
         with Transaction(self, "export") as txn:
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.EXPORT,
                 parameters={"path": path, "format": format},
@@ -2822,7 +2834,7 @@ class MechKernel:
         from build123d.importers import import_step as b3d_import_step
         
         with Transaction(self, "import_step") as txn:
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.IMPORT_STEP,
                 parameters={"path": path, "mode": mode, "name": name},
@@ -2897,6 +2909,8 @@ class MechKernel:
         graph_data["_assembly_instances"] = {
             key: value.to_dict() for key, value in self._assembly_instances.items()
         }
+        # v2.11: 参考坐标系持久化（此前 save/load 静默丢参考系）
+        graph_data["_frame_registry"] = self._frame_registry.to_dict()
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(graph_data, f, ensure_ascii=False, indent=2)
         history_data = {
@@ -2939,7 +2953,7 @@ class MechKernel:
         
         start = time.time()
         with Transaction(self, "load_project") as txn:
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.IMPORT_STEP,
                 parameters={"path": step_path, "mode": mode, "name": name},
@@ -2957,6 +2971,7 @@ class MechKernel:
             saved_sketches = graph_data.pop("_sketches", {})
             saved_parameters = graph_data.pop("_parameters", {})
             saved_assembly = graph_data.pop("_assembly_instances", {})
+            saved_frames = graph_data.pop("_frame_registry", None)
             graph_data.pop("_project_meta", None)
             self.feature_graph.from_dict(graph_data)
             self.sketches = {name: Sketch.from_dict(data) for name, data in saved_sketches.items()}
@@ -2964,6 +2979,14 @@ class MechKernel:
             self._assembly_instances = {
                 key: AssemblyInstance.from_dict(value) for key, value in saved_assembly.items()
             }
+            # v2.11: 恢复参考坐标系（旧存档无此字段时保持当前状态）
+            if saved_frames:
+                try:
+                    frames = FrameRegistry()
+                    frames.from_dict(saved_frames)
+                    self._frame_registry = frames
+                except Exception:
+                    pass
             assembly_warning = self._restore_assembly_geometries()
             replay_message = ""
             loaded_history_replayable = False
@@ -3047,7 +3070,7 @@ class MechKernel:
         from build123d.importers import import_step as b3d_import_step
         from build123d import Vector, Axis
         with Transaction(self, "assemble") as txn:
-            feature_id = next_feature_id()
+            feature_id = self._ids.next_feature_id()
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.ASSEMBLY,
                 parameters={"parts": parts, "name": name},
@@ -3674,6 +3697,8 @@ class MechKernel:
             "has_non_replayable_op": self._has_non_replayable_op,
             "parameters": dict(self._parameters),
             "assembly_instances": {key: copy.copy(value) for key, value in self._assembly_instances.items()},
+            # v2.11: 参考坐标系入快照（undo/redo 不再静默丢参考系）
+            "frame_registry": self._frame_registry.to_dict(),
         }
     
     def _restore(self, snap: Dict) -> None:
@@ -3693,6 +3718,14 @@ class MechKernel:
         self._has_non_replayable_op = snap.get("has_non_replayable_op", False)
         self._parameters = dict(snap.get("parameters", {}))
         self._assembly_instances = {key: copy.copy(value) for key, value in snap.get("assembly_instances", {}).items()}
+        # v2.11: 恢复参考坐标系（缺省保持当前，兼容旧快照）
+        if "frame_registry" in snap:
+            try:
+                frames = FrameRegistry()
+                frames.from_dict(snap["frame_registry"])
+                self._frame_registry = frames
+            except Exception:
+                pass
         self._last_render_base64 = None
         self._last_render_views = {}
         # P0-3 修复：undo 后 bump revision（让 renderer 缓存失效）
@@ -4044,8 +4077,8 @@ class MechKernel:
             self.semantic_state = {}
             self._step_counter = 0
             self._last_render_step = -1
-            reset_all_id_generators()
-            seed_id_generators_from_history(self._op_history)
+            self._ids.reset()
+            self._ids.seed_from_history(self._op_history)
             parameter_overrides = {}
             for entry in self._op_history:
                 if entry.get("op") == "add_constraint":
@@ -4231,7 +4264,7 @@ class MechKernel:
     
     # ===== 通用执行入口 =====
     
-    def execute(self, op: str, *args, **kwargs) -> StepResult:
+    def execute(self, op: str, *args, allow_experimental: bool = False, **kwargs) -> StepResult:
         self._step_counter += 1
         start = time.time()
         
@@ -4266,12 +4299,14 @@ class MechKernel:
                 step_index=self._step_counter,
             )
         
-        if op not in PUBLIC_OPS:
+        if op not in PUBLIC_OPS and not (allow_experimental and op in EXPERIMENTAL_OPS):
             return make_failure(
-                error=f"未知 op: {op}",
+                error=(f"未知 op: {op}" if op not in EXPERIMENTAL_OPS
+                       else f"op {op} 是 experimental（装配相关，默认不对 LLM 开放）。"
+                            f"确认要用请传 allow_experimental=True"),
                 error_kind="NOT_IMPLEMENTED",
                 api_name=op, planned_version="v1.2",
-                hint=f"可用 op: {sorted(PUBLIC_OPS)[:5]}...",
+                hint=f"可用 op: {sorted(PUBLIC_OPS)[:8]}...",
                 current_narrative=self.narrative.copy(),
                 elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,
@@ -4282,13 +4317,22 @@ class MechKernel:
             hint = f"查看 schema: kernel.cap.get('{op}').to_llm_dict()"
             if args and not kwargs:
                 hint = "kernel.execute() 只接受 keyword arguments，不用 positional。改用: execute(op, {key1=val1, key2=val2, ...})"
-            ok, err = self.cap.validate_call(op, kwargs)
+            ok, err = self.cap.validate_call(op, kwargs, allow_experimental=allow_experimental)
             if not ok:
                 self.adaptive_renderer.mark_failure(op)
+                # v2.11: unknown field 错误附上合法字段列表，LLM 可直接改参重试
+                suggestion = None
+                if "unknown field" in err:
+                    suggestion = {
+                        "action": "只用合法字段重试",
+                        "valid_fields": sorted(self.cap.get(op).input_schema.keys()),
+                        "reason_code": "unknown_field",
+                    }
                 return make_failure(
                     error=f"参数校验失败: {err}",
                     error_kind="INVALID_REQUEST",
                     hint=hint,
+                    suggestion=suggestion,
                     current_narrative=self.narrative.copy(),
                     elapsed_ms=(time.time() - start) * 1000,
                     step_index=self._step_counter,

@@ -324,12 +324,24 @@ def run_loop(
         
         # 4. Inspect + Recoverable 重试
         retry_count = 0
-        while (not result.success 
-               and result.error_kind == "RECOVERABLE" 
-               and result.suggestion 
+        while (not result.success
+               and result.error_kind == "RECOVERABLE"
+               and result.suggestion
                and retry_count < max_retries_per_action):
-            
-            new_args = {**action.args, **result.suggestion}
+
+            # v2.11: suggestion 只合并 schema 合法字段。
+            # suggestion 携带 {"action", "fix": {param: value}, ...} 元数据，
+            # 直接整体注入 args 会因 unknown field 被拒（重试必失败的旧 bug）。
+            fix = result.suggestion.get("fix") if isinstance(result.suggestion, dict) else None
+            new_args = dict(action.args)
+            if isinstance(fix, dict):
+                schema_fields = set()
+                cap = getattr(kernel, "cap", None)
+                if cap is not None and cap.has(action.op):
+                    schema_fields = set(cap.get(action.op).input_schema.keys())
+                merged = {k: v for k, v in fix.items()
+                          if not schema_fields or k in schema_fields}
+                new_args.update(merged)
             new_sig = f"{action.op}:{hashlib.md5(json.dumps(new_args, sort_keys=True, default=str).encode()).hexdigest()[:8]}"
             
             if new_sig in attempted_signatures:

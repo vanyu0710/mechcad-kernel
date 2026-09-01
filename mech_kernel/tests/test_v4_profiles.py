@@ -64,7 +64,11 @@ def test_add_arc_rejects_bad_radius():
 
 
 def test_new_ops_are_public():
-    assert {"add_polyline", "add_arc", "assemble"} <= set(PUBLIC_OPS)
+    from mech_kernel.kernel import EXPERIMENTAL_OPS
+    assert {"add_polyline", "add_arc"} <= set(PUBLIC_OPS)
+    # v2.11: 装配 op 移入 experimental（默认能力集聚焦零件建模）
+    assert "assemble" in EXPERIMENTAL_OPS
+    assert "assemble" not in PUBLIC_OPS
 
 
 # === 2. revolve 闭合剖面 ===
