@@ -11,7 +11,7 @@ import hashlib
 
 from .errors import (
     MechKernelError, InvalidRequestError, KernelBugError, StateCorruptionError,
-    GeometryValidationError,
+    GeometryValidationError, RecoverableError,
     make_geometry_failure, make_recoverable, GeometryFailureReason,
     DeprecatedInternalAPIError
 )
@@ -37,6 +37,9 @@ from .reference_frames import (
 from .feature_graph import FeatureGraph
 from .workplane import Workplane, WorkplaneType, WorkplaneRegistry
 from .persistent_naming import PersistentNamingResolver, PersistentName
+from .topology_refs import (
+    TopologyCache, TopoInfo, RefStaleError, RefFormatError, resolve_refs,
+)
 from .transaction import Transaction
 from .step_result import (
     StepResult, GeometrySummary, make_success, make_failure, RenderLevel, ErrorKind
@@ -90,6 +93,17 @@ def _frame_distance(a, b) -> float:
 import math  # for distance helper
 
 
+def _z_extent_of(geometry) -> Optional[float]:
+    """当前几何的 Z 向尺寸（mm），无几何或无 bbox 时返回 None."""
+    if geometry is None:
+        return None
+    try:
+        bb = geometry.bounding_box()
+        return float(bb.max.Z - bb.min.Z)
+    except Exception:
+        return None
+
+
 class MechKernel:
     """MechKernel 主类"""
     
@@ -113,6 +127,7 @@ class MechKernel:
         self._parameters: Dict[str, float] = {}  # v2.4: 命名尺寸参数
         self._assembly_instances: Dict[str, AssemblyInstance] = {}
         self._frame_registry: FrameRegistry = FrameRegistry()  # v2.7: 参考坐标系
+        self._topo_cache: TopologyCache = TopologyCache()  # v2.11: face/edge 引用缓存
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_render_base64: Optional[str] = None
         self._last_render_views: Dict[str, bytes] = {}
@@ -136,10 +151,21 @@ class MechKernel:
         # 草图类 6 个
         self.cap.set_capability(Capability(
             name="create_workplane", category="sketch",
-            description="创建工作平面",
+            description="创建工作平面。基础面 XY/YZ/XZ（可 offset 偏置）；custom 需 origin+normal；face + face_ref 可在选中平面上草图（面上草图）",
             input_schema={
                 "name": FieldSchema(type="string", required=True),
-                "type": FieldSchema(type="enum", required=False, default="XY", enum=["XY", "YZ", "XZ", "custom"]),
+                "type": FieldSchema(type="enum", required=False, default="XY",
+                                    enum=["XY", "YZ", "XZ", "custom", "face"]),
+                "origin": FieldSchema(type="tuple", required=False, items_type="number", length=3,
+                                      description="custom: 平面原点"),
+                "x_dir": FieldSchema(type="tuple", required=False, items_type="number", length=3,
+                                     description="custom: 局部 u 轴（缺省自动推取）"),
+                "normal": FieldSchema(type="tuple", required=False, items_type="number", length=3,
+                                      description="custom: 平面法向（必填）"),
+                "offset": FieldSchema(type="number", required=False, default=0.0,
+                                      description="标准面沿法向偏置距离"),
+                "face_ref": FieldSchema(type="string", required=False,
+                                        description="面引用（如 'F03'，来自 select）→ 面上草图"),
             },
             permission="public",
         ))
@@ -194,13 +220,14 @@ class MechKernel:
         # 主体 extrude（其他 3 个 placeholder）
         self.cap.set_capability(Capability(
             name="extrude", category="body",
-            description="拉伸草图（圆→圆柱 / 矩形→立方体 / 多圆同心→环面）",
+            description="拉伸草图（圆→圆柱 / 矩形→立方体 / 多圆同心→环面）。注意：已有几何时 mode='new_body' 会被拒绝（防止清空零件），叠加用 'add'，切除用 'cut'，确认替换传 confirm_replace=True",
             input_schema={
                 "sketch_name": FieldSchema(type="string", required=True),
                 "depth": FieldSchema(type="number", required=True, min=0.001),
                 "mode": FieldSchema(type="enum", required=False, default="new_body", enum=["new_body", "add", "cut"]),
                 "name": FieldSchema(type="string", required=False),
                 "direction": FieldSchema(type="enum", required=False, default="Z", enum=["X", "Y", "Z"]),
+                "confirm_replace": FieldSchema(type="boolean", required=False, default=False),
             },
             permission="public",
         ))
@@ -229,38 +256,53 @@ class MechKernel:
                         "axis": FieldSchema(type="tuple", required=False, items_type="number", length=6),
                         "angle": FieldSchema(type="number", required=False, default=360.0, min=0.01, max=360.0),
                         "mode": FieldSchema(type="enum", required=False, default="new_body", enum=["new_body", "add", "cut"]),
-                        "name": FieldSchema(type="string", required=False)},
+                        "name": FieldSchema(type="string", required=False),
+                        "confirm_replace": FieldSchema(type="boolean", required=False, default=False)},
             "sweep": {"profile_sketch": FieldSchema(type="string", required=True),
                       "path": FieldSchema(type="enum", required=False, default="x_axis", enum=["x_axis", "y_axis", "z_axis"]),
                       "length": FieldSchema(type="number", required=False, default=50.0, min=0.001),
-                      "name": FieldSchema(type="string", required=False)},
+                      "name": FieldSchema(type="string", required=False),
+                      "mode": FieldSchema(type="enum", required=False, default="new_body", enum=["new_body", "add", "cut"]),
+                      "confirm_replace": FieldSchema(type="boolean", required=False, default=False)},
             "boolean": {"target_sketch": FieldSchema(type="string", required=True),
                         "tools": FieldSchema(type="list", required=True, items_type="string"),
                         "operation": FieldSchema(type="enum", required=False, default="union", enum=["union", "subtract", "intersect"]),
-                        "name": FieldSchema(type="string", required=False)},
-            "hole": {"position": FieldSchema(type="tuple", required=False, default=[0, 0], items_type="number", length=2),
+                        "name": FieldSchema(type="string", required=False),
+                        "depth": FieldSchema(type="number", required=False, min=0.001,
+                                             description="target/tools 拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm")},
+            "hole": {"position": FieldSchema(type="tuple", required=False, default=[0, 0], items_type="number", length=2,
+                                             description="孔位 2 坐标，相对进入面：top/bottom→(x,y)；x±→(y,z)；y±→(x,z)"),
                      "diameter": FieldSchema(type="number", required=False, default=10.0, min=0.001),
                      "depth": FieldSchema(type="number", required=False, min=0.001),
                      "hole_type": FieldSchema(type="enum", required=False, default="simple", enum=["simple", "counterbore", "countersink"]),
                      "counterbore_diameter": FieldSchema(type="number", required=False, min=0.001),
                      "counterbore_depth": FieldSchema(type="number", required=False, min=0.001),
-                     "name": FieldSchema(type="string", required=False)},
+                     "name": FieldSchema(type="string", required=False),
+                     "direction": FieldSchema(type="enum", required=False, default="top",
+                                              enum=["top", "bottom", "x+", "x-", "y+", "y-"],
+                                              description="孔从哪个面进入（top=默认，沿 Z 向打穿）")},
             "fillet": {"radius": FieldSchema(type="number", required=True, min=0.001),
-                       "edges": FieldSchema(type="enum", required=False, default="all", enum=["all"]),
+                       "edges": FieldSchema(type="string_or_list", required=False, default="all",
+                                            description="'all' 或边引用列表（如 ['E12','E15']，来自 select element_type='edge'）"),
                        "name": FieldSchema(type="string", required=False)},
             "chamfer": {"length": FieldSchema(type="number", required=True, min=0.001),
                         "length2": FieldSchema(type="number", required=False, min=0.001),
-                        "edges": FieldSchema(type="enum", required=False, default="all", enum=["all"]),
+                        "edges": FieldSchema(type="string_or_list", required=False, default="all",
+                                             description="'all' 或边引用列表（如 ['E12','E15']，来自 select element_type='edge'）"),
                         "name": FieldSchema(type="string", required=False)},
             "shell": {"thickness": FieldSchema(type="number", required=True, min=0.001),
                       "face_filter": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "z+", "z-", "x+", "x-", "y+", "y-"]),
-                      "name": FieldSchema(type="string", required=False)},
+                      "name": FieldSchema(type="string", required=False),
+                      "face_refs": FieldSchema(type="list", required=False, items_type="string",
+                                               description="开口面引用列表（如 ['F03']，来自 select）；提供时优先于 face_filter")},
             "linear_pattern": {"sketch_name": FieldSchema(type="string", required=True),
                                "count": FieldSchema(type="integer", required=True, min=2, max=100),
                                "direction": FieldSchema(type="tuple", required=False, default=[1, 0], items_type="number", length=2),
                                "spacing": FieldSchema(type="number", required=False, default=10.0, min=0.001),
                                "mode": FieldSchema(type="enum", required=False, default="cut", enum=["cut", "add", "union"]),
-                               "name": FieldSchema(type="string", required=False)},
+                               "name": FieldSchema(type="string", required=False),
+                               "depth": FieldSchema(type="number", required=False, min=0.001,
+                                                    description="拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm")},
             "circular_pattern": {"sketch_name": FieldSchema(type="string", required=True),
                                  "count": FieldSchema(type="integer", required=True, min=2, max=100),
                                  "axis_origin": FieldSchema(type="tuple", required=False, default=[0, 0, 0], items_type="number", length=3),
@@ -272,11 +314,16 @@ class MechKernel:
             "mirror": {"sketch_name": FieldSchema(type="string", required=True),
                        "axis": FieldSchema(type="enum", required=False, default="X", enum=["X", "Y"]),
                        "mode": FieldSchema(type="enum", required=False, default="union", enum=["union", "add", "cut"]),
-                       "name": FieldSchema(type="string", required=False)},
+                       "name": FieldSchema(type="string", required=False),
+                       "depth": FieldSchema(type="number", required=False, min=0.001,
+                                            description="拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm")},
             "query": {"target": FieldSchema(type="string", required=True),
                       "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"])},
-            "select": {"filter_type": FieldSchema(type="enum", required=False, default="all", enum=["all", "plane", "cylinder", "cone", "sphere", "torus"]),
-                       "face_index": FieldSchema(type="integer", required=False, min=0)},
+            "select": {"filter_type": FieldSchema(type="enum", required=False, default="all",
+                                                  enum=["all", "plane", "cylinder", "cone", "sphere", "torus",
+                                                        "line", "circle", "ellipse", "bezier", "bspline"]),
+                       "face_index": FieldSchema(type="integer", required=False, min=0),
+                       "element_type": FieldSchema(type="enum", required=False, default="face", enum=["face", "edge"])},
             "measure": {"target1": FieldSchema(type="string", required=True),
                         "target2": FieldSchema(type="string", required=False),
                         "metric": FieldSchema(type="enum", required=False, default="distance", enum=["distance", "volume", "area"])},
@@ -387,16 +434,97 @@ class MechKernel:
             if method is not None and callable(method):
                 cap.func = method
 
-    def create_workplane(self, name: str, type: str = "XY", **kwargs) -> StepResult:
+    def create_workplane(self, name: str, type: str = "XY", origin=None, x_dir=None,
+                         normal=None, offset: float = 0.0, face_ref: str = None) -> StepResult:
+        """
+        v2.11: 真实支持自定义平面 / 基准面偏置 / 面上草图（此前 custom 的参数被丢弃）
+
+        Args:
+            name: 工作平面名
+            type: "XY" | "YZ" | "XZ" | "custom" | "face"
+            origin: custom — 平面原点 (x, y, z)
+            x_dir: custom — 局部 u 轴方向（缺省自动推取）
+            normal: custom/face — 平面法向（custom 必填）
+            offset: 标准平面沿法向的偏置距离（mm）
+            face_ref: 面引用（如 "F03"，来自 select）— 从选中平面派生坐标系
+        """
         start = time.time()
         name = require_non_empty_str("name", name)
-        type = require_in("type", type, ["XY", "YZ", "XZ", "custom"])
+        if face_ref is not None:
+            type = "face"
+        type = require_in("type", type, ["XY", "YZ", "XZ", "custom", "face"])
         if self.workplanes.has_name(name):
             raise InvalidRequestError(f"工作平面 {name} 已存在")
-        
+
+        wp_origin = (0.0, 0.0, 0.0)
+        wp_x = {"XY": (1.0, 0.0, 0.0), "YZ": (0.0, 1.0, 0.0), "XZ": (1.0, 0.0, 0.0),
+                "custom": (1.0, 0.0, 0.0), "face": (1.0, 0.0, 0.0)}[type]
+        wp_normal = {"XY": (0.0, 0.0, 1.0), "YZ": (1.0, 0.0, 0.0), "XZ": (0.0, 1.0, 0.0),
+                     "custom": None, "face": None}[type]
+        reference = None
+        history_kwargs = dict(name=name, type=type, offset=offset)
+
+        if type in ("XY", "YZ", "XZ"):
+            if offset:
+                require_finite("offset", offset)
+                wp_origin = tuple(wp_normal[i] * offset for i in range(3))
+                history_kwargs["origin"] = list(wp_origin)
+        elif type == "custom":
+            if origin is None or normal is None:
+                raise InvalidRequestError("custom 工作平面需要 origin (x,y,z) 和 normal (x,y,z)")
+            require_tuple3("origin", origin)
+            require_tuple3("normal", normal)
+            wp_origin = tuple(float(v) for v in origin)
+            wp_normal = self._orthonormalize_axis(normal)
+            if x_dir is not None:
+                wp_x = self._orthonormalize_axis(x_dir, against=wp_normal)
+            else:
+                # 自动取与法向最不平行的世界轴作为 u 轴（最平行会退化）
+                world = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+                wp_x = min(world, key=lambda a: abs(sum(a[i] * wp_normal[i] for i in range(3))))
+                wp_x = self._orthonormalize_axis(wp_x, against=wp_normal)
+            history_kwargs["origin"] = list(wp_origin)
+            history_kwargs["x_dir"] = list(wp_x)
+            history_kwargs["normal"] = list(wp_normal)
+        else:  # face — 面上草图
+            if self._current_geometry is None:
+                raise InvalidRequestError("face 工作平面需要先有几何（先 extrude）")
+            try:
+                info = self._topo_cache.resolve(
+                    self._geometry_revision, self._current_geometry, face_ref, "face")
+            except RefStaleError as e:
+                raise RecoverableError(
+                    f"面引用已失效: {e}",
+                    suggestion={"action": "重新 select 获取新的面引用",
+                                "reason_code": "stale_topo_ref"},
+                    reason_code="stale_topo_ref",
+                )
+            except RefFormatError as e:
+                raise InvalidRequestError(str(e))
+            face = info.shape
+            if info.geom_type != "plane":
+                raise RecoverableError(
+                    f"引用 {face_ref} 是 {info.geom_type} 面，面上草图暂只支持平面",
+                    suggestion={"action": "select filter_type='plane' 选一个平面",
+                                "reason_code": "face_not_planar"},
+                    reason_code="face_not_planar",
+                )
+            wp_origin = tuple(float(v) for v in face.center())
+            wp_normal = self._orthonormalize_axis(face.normal_at())
+            # u 轴：与法向最不平行的世界轴投影到平面（避免退化）
+            world = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+            wp_x = min(world, key=lambda a: abs(sum(a[i] * wp_normal[i] for i in range(3))))
+            wp_x = self._orthonormalize_axis(wp_x, against=wp_normal)
+            reference = Reference.face(face_ref)
+            history_kwargs["face_ref"] = face_ref
+            history_kwargs["origin"] = list(wp_origin)
+            history_kwargs["x_dir"] = list(wp_x)
+            history_kwargs["normal"] = list(wp_normal)
+
         with Transaction(self, "create_workplane") as txn:
-            entry = self._record_history("create_workplane", name=name, type=type)
-            wp = Workplane(id=f"wp_{name}_{next_workplane_id()}", name=name, type=WorkplaneType(type))
+            entry = self._record_history("create_workplane", **history_kwargs)
+            wp = Workplane(id=f"wp_{name}_{next_workplane_id()}", name=name, type=WorkplaneType(type),
+                           origin=wp_origin, x_dir=wp_x, normal=wp_normal, reference=reference)
             self.workplanes.register(wp)
             self.narrative.append(f"创建工作平面 {name} ({type})")
             txn.commit()
@@ -790,7 +918,7 @@ class MechKernel:
     
     # ===== 主体 4（extrude 实现 + 其他 3 占位）=====
     
-    def extrude(self, sketch_name: str, depth: float, mode: str = "new_body", name: str = "", direction: str = "Z") -> StepResult:
+    def extrude(self, sketch_name: str, depth: float, mode: str = "new_body", name: str = "", direction: str = "Z", confirm_replace: bool = False) -> StepResult:
         start = time.time()
         sketch_name = require_non_empty_str("sketch_name", sketch_name)
         require_positive("depth", depth)
@@ -799,9 +927,24 @@ class MechKernel:
         sk = self.sketches[sketch_name]
         if not sk.closed:
             raise InvalidRequestError(f"草图 {sketch_name} 未关闭")
+        # v2.11: new_body 会清空整个已有零件（LLM 驱动流程的高频事故源），必须显式确认
+        if mode == "new_body" and self._current_geometry is not None and not confirm_replace:
+            raise RecoverableError(
+                f"extrude mode='new_body' 会清空已有零件。叠加到当前零件用 mode='add'，切除用 mode='cut'；确实要替换请传 confirm_replace=True",
+                suggestion={
+                    "action": "选择修正参数后重试",
+                    "fix": {"mode": "add"},
+                    "alternatives": [
+                        {"fix": {"mode": "cut"}},
+                        {"fix": {"confirm_replace": True}},
+                    ],
+                    "reason_code": "new_body_would_replace",
+                },
+                reason_code="new_body_would_replace",
+            )
         
         with Transaction(self, "extrude") as txn:
-            entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name)
+            entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name, confirm_replace=confirm_replace)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
@@ -839,7 +982,7 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def revolve(self, sketch_name: str, axis: list = None, angle: float = 360.0, mode: str = "new_body", name: str = "") -> StepResult:
+    def revolve(self, sketch_name: str, axis: list = None, angle: float = 360.0, mode: str = "new_body", name: str = "", confirm_replace: bool = False) -> StepResult:
         """
         v1.3.1 真实 revolve（车削件）— build123d revolve 调试成功！
         
@@ -866,10 +1009,30 @@ class MechKernel:
             axis = [0, 0, 0, 0, 1, 0]  # Y 轴
         if len(axis) != 6:
             raise InvalidRequestError(f"axis 必须是 [ox, oy, oz, dx, dy, dz]（当前 {len(axis)} 个数）")
-        
+
         sk = self.sketches[sketch_name]
         if not sk.closed:
             raise InvalidRequestError(f"草图 {sketch_name} 未关闭")
+        # v2.11: revolve 剖面写死 XY 平面；草图在自定义/面上/偏置平面时诚实报错
+        if self._sketch_plane(sk, "Z") is not None:
+            raise InvalidRequestError(
+                "revolve 暂只支持标准基准面（XY/YZ/XZ 过原点）上的草图；"
+                "草图位于 custom/face/偏置 workplane，请改用 extrude")
+        # v2.11: new_body 会清空整个已有零件，必须显式确认（与 extrude/sweep 一致）
+        if mode == "new_body" and self._current_geometry is not None and not confirm_replace:
+            raise RecoverableError(
+                f"revolve mode='new_body' 会清空已有零件。叠加用 mode='add'，切除用 mode='cut'；确实要替换请传 confirm_replace=True",
+                suggestion={
+                    "action": "选择修正参数后重试",
+                    "fix": {"mode": "add"},
+                    "alternatives": [
+                        {"fix": {"mode": "cut"}},
+                        {"fix": {"confirm_replace": True}},
+                    ],
+                    "reason_code": "new_body_would_replace",
+                },
+                reason_code="new_body_would_replace",
+            )
         
         from build123d import BuildPart, BuildSketch, Plane, add, revolve as b3d_revolve, Axis, Location
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
@@ -882,7 +1045,7 @@ class MechKernel:
             raise InvalidRequestError(f"axis 方向向量为 0")
         
         with Transaction(self, "revolve") as txn:
-            entry = self._record_history("revolve", sketch_name=sketch_name, axis=axis, angle=angle, mode=mode, name=name)
+            entry = self._record_history("revolve", sketch_name=sketch_name, axis=axis, angle=angle, mode=mode, name=name, confirm_replace=confirm_replace)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
@@ -1071,7 +1234,7 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def boolean(self, target_sketch: str, tools: list, operation: str = "union", name: str = "") -> StepResult:
+    def boolean(self, target_sketch: str, tools: list, operation: str = "union", name: str = "", depth: float = None) -> StepResult:
         """
         v1.7 真实 boolean op — 显式 union/subtract/intersect（不靠 extrude mode）
         
@@ -1089,6 +1252,7 @@ class MechKernel:
             tools: 工具草图列表 [sk1, sk2, ...]
             operation: "union" | "subtract" | "intersect"
             name: 特征名
+            depth: target/tools 拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm
         """
         start = time.time()
         if target_sketch not in self.sketches:
@@ -1098,6 +1262,15 @@ class MechKernel:
                 raise InvalidRequestError(f"tool 草图 {t} 不存在")
         if operation not in ("union", "subtract", "intersect"):
             raise InvalidRequestError(f"operation 必须是 union/subtract/intersect（当前 {operation}）")
+        # v2.11: depth 不再硬编码 50；缺省取当前零件 Z 向尺寸 + 2mm
+        derived_depth = depth is None
+        if derived_depth:
+            z_ext = _z_extent_of(self._current_geometry)
+            if z_ext is None:
+                raise InvalidRequestError("boolean 无法推导 depth（无已有几何），请显式传 depth")
+            depth = z_ext + 2.0
+        else:
+            require_positive("depth", depth)
         
         from build123d import (
             BuildPart, BuildSketch, Plane, add, extrude, Location,
@@ -1106,17 +1279,18 @@ class MechKernel:
         from build123d.build_common import Locations
         
         def _extrude_sketch_to_part(sk, depth, direction="Z"):
-            """草图 → Part（v2.1: 统一助手，支持 polyline/arc）"""
-            plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
+            """草图 → Part（v2.1: 统一助手，支持 polyline/arc；v2.11: 尊重 workplane 放置）"""
+            plane = self._sketch_plane(sk, direction) or \
+                {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
             return self._extrude_sketch_solid(sk, depth, plane)
         
         with Transaction(self, "boolean") as txn:
-            entry = self._record_history("boolean", target_sketch=target_sketch, tools=tools, operation=operation, name=name)
+            entry = self._record_history("boolean", target_sketch=target_sketch, tools=tools, operation=operation, name=name, depth=depth)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.BOOLEAN,
-                parameters={"target_sketch": target_sketch, "tools": tools, "operation": operation, "name": name},
+                parameters={"target_sketch": target_sketch, "tools": tools, "operation": operation, "name": name, "depth": depth},
                 name=name or f"boolean_{operation}_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
@@ -1124,13 +1298,13 @@ class MechKernel:
             
             # 1. 拉伸 target 成新 body
             target_sk = self.sketches[target_sketch]
-            new_body = _extrude_sketch_to_part(target_sk, 50.0)
+            new_body = _extrude_sketch_to_part(target_sk, depth)
             
             # 2. 拉伸所有 tools 并 union
             tools_part = None
             for t_name in tools:
                 t_sk = self.sketches[t_name]
-                t_part = _extrude_sketch_to_part(t_sk, 50.0)
+                t_part = _extrude_sketch_to_part(t_sk, depth)
                 if tools_part is None:
                     tools_part = t_part
                 else:
@@ -1161,9 +1335,39 @@ class MechKernel:
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=("depth 未显式提供，自动取当前零件 Z 向尺寸 + 2mm"
+                     if derived_depth else None),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
+    def _resolve_edge_refs(self, edges) -> list:
+        """v2.11: edges 参数 → build123d Edge 列表。
+
+        接受 "all"（全部边）| "E12"（单引用）| ["E12", "E15"]（引用列表）。
+        引用来自 select(element_type="edge")。几何修改后旧引用 → RecoverableError。
+        """
+        if isinstance(edges, str):
+            if edges == "all":
+                return list(self._current_geometry.edges())
+            edges = [edges]
+        if not isinstance(edges, (list, tuple)) or not edges:
+            raise InvalidRequestError(
+                "edges 需为 'all'、单个边引用 'E12' 或引用列表（来自 select element_type='edge'）")
+        try:
+            infos = resolve_refs(self._topo_cache, self._geometry_revision,
+                                 self._current_geometry, list(edges), "edge")
+        except RefStaleError as e:
+            raise RecoverableError(
+                f"边引用已失效: {e}",
+                suggestion={"action": "重新 select 获取新的边引用",
+                            "fix": {"edges": "all"},
+                            "reason_code": "stale_topo_ref"},
+                reason_code="stale_topo_ref",
+            )
+        except RefFormatError as e:
+            raise InvalidRequestError(str(e))
+        return [info.shape for info in infos]
+
     def fillet(self, radius: float, edges: str = "all", name: str = "") -> StepResult:
         """
         v1.4.1 真实 fillet（圆角）— 用 build123d Part.fillet → OCC BRepFilletAPI
@@ -1191,13 +1395,24 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
-            if edges == "all":
-                edge_list = list(self._current_geometry.edges())
-            else:
-                raise NotImplementedError(f"edge 选择 '{edges}' 暂不支持，仅 'all'")
-            
-            self._current_geometry = self._current_geometry.fillet(radius, edge_list)
-            self.narrative.append(f"fillet r={radius} 全部 {len(edge_list)} 边 → {feature.name}")
+            edge_list = self._resolve_edge_refs(edges)
+
+            try:
+                self._current_geometry = self._current_geometry.fillet(radius, edge_list)
+            except RecoverableError:
+                raise
+            except Exception as e:
+                # v2.11: OCC 失败转结构化建议（典型：半径相对所选边过大）
+                raise RecoverableError(
+                    f"fillet 失败: {e}",
+                    suggestion={
+                        "action": "减小半径或减少所选边后重试",
+                        "fix": {"radius": round(radius / 2, 3)},
+                        "reason_code": "fillet_too_large",
+                    },
+                    reason_code="fillet_too_large",
+                )
+            self.narrative.append(f"fillet r={radius} {len(edge_list)} 边 → {feature.name}")
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
@@ -1248,13 +1463,24 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
-            if edges == "all":
-                edge_list = list(self._current_geometry.edges())
-            else:
-                raise NotImplementedError(f"edge 选择 '{edges}' 暂不支持")
-            
-            self._current_geometry = self._current_geometry.chamfer(length, l2, edge_list)
-            self.narrative.append(f"chamfer l={length}/{l2} 全部 {len(edge_list)} 边 → {feature.name}")
+            edge_list = self._resolve_edge_refs(edges)
+
+            try:
+                self._current_geometry = self._current_geometry.chamfer(length, l2, edge_list)
+            except RecoverableError:
+                raise
+            except Exception as e:
+                # v2.11: OCC 失败转结构化建议（典型：倒角尺寸相对所选边过大）
+                raise RecoverableError(
+                    f"chamfer 失败: {e}",
+                    suggestion={
+                        "action": "减小倒角长度或减少所选边后重试",
+                        "fix": {"length": round(length / 2, 3)},
+                        "reason_code": "chamfer_too_large",
+                    },
+                    reason_code="chamfer_too_large",
+                )
+            self.narrative.append(f"chamfer l={length}/{l2} {len(edge_list)} 边 → {feature.name}")
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
@@ -1285,19 +1511,23 @@ class MechKernel:
         counterbore_diameter: float = None,
         counterbore_depth: float = None,
         name: str = "",
+        direction: str = "top",
     ) -> StepResult:
         """
-        v1.8 真实 hole（孔向导）— 在 XY 平面打孔
-        
+        v1.8 真实 hole（孔向导）— v2.11 支持任意面进入 + 真 countersink 锥面
+
         Args:
-            position: 孔位 (x, y) 在 XY 平面
+            position: 孔位，2 个坐标，相对进入面：
+                top/bottom → (x, y)；x+/x- → (y, z)；y+/y- → (x, z)
             diameter: 孔径（mm）
-            depth: 深度（默认 None = 穿透 current_geometry）
+            depth: 孔深（从进入面起算；默认 None = 穿透）
             hole_type: "simple" | "counterbore" | "countersink"
-            counterbore_diameter: 沉孔大圆直径（仅 counterbore/countersink）
-            counterbore_depth: 沉孔深度（仅 counterbore）
+            counterbore_diameter: 沉孔/锪孔大径（仅 counterbore/countersink）
+            counterbore_depth: 沉孔/锪孔深度（仅 counterbore/countersink）
             name: 特征名
-        
+            direction: 孔从哪个面进入："top"(默认) / "bottom" / "x+" / "x-" / "y+" / "y-"
+                （同义别名 "+Z"/"-Z"/"+X"/"-X"/"+Y"/"-Y"）
+
         自动从 current_geometry 切出孔
         """
         start = time.time()
@@ -1307,29 +1537,61 @@ class MechKernel:
             raise InvalidRequestError(f"diameter 必须 > 0（当前 {diameter}）")
         if hole_type not in ("simple", "counterbore", "countersink"):
             raise InvalidRequestError(f"hole_type 必须 simple/counterbore/countersink（当前 {hole_type}）")
-        
-        from build123d import (
-            BuildPart, BuildSketch, Plane, add, extrude, Location,
-            Circle as B3DCircle,
-        )
-        from build123d.build_common import Locations
-        
-        # 实际孔深：取 current_geometry bbox 的 Z 长度
+        if depth is not None and depth <= 0:
+            raise InvalidRequestError(f"depth 必须 > 0（当前 {depth}）")
+
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_SOLID
         from OCP.TopoDS import TopoDS
         from OCP.BRepBndLib import BRepBndLib
         from OCP.Bnd import Bnd_Box
+        from build123d import Solid as B3DSolid, Plane as B3DPlane
+
+        dir_map = {
+            "top": (0, 0, -1), "z+": (0, 0, -1), "+Z": (0, 0, -1),
+            "bottom": (0, 0, 1), "z-": (0, 0, 1), "-Z": (0, 0, 1),
+            "x+": (-1, 0, 0), "+X": (-1, 0, 0),
+            "x-": (1, 0, 0), "-X": (1, 0, 0),
+            "y+": (0, -1, 0), "+Y": (0, -1, 0),
+            "y-": (0, 1, 0), "-Y": (0, 1, 0),
+        }
+        if direction not in dir_map:
+            raise InvalidRequestError(
+                f"direction '{direction}' 不支持。可选 top/bottom/x+/x-/y+/y-（即孔从哪个面进入）")
+        drill = dir_map[direction]
+
         shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
         exp = TopExp_Explorer(shape, TopAbs_SOLID)
         bbox = Bnd_Box()
         if exp.More():
             BRepBndLib.Add_s(exp.Current(), bbox)
-        z_min, z_max = bbox.CornerMin().Z(), bbox.CornerMax().Z()
-        actual_depth = (z_max - z_min) + 10 if depth is None else depth  # +10 保险穿透
-        
+        bb = bbox.CornerMin(), bbox.CornerMax()
+        lo = (bb[0].X(), bb[0].Y(), bb[0].Z())
+        hi = (bb[1].X(), bb[1].Y(), bb[1].Z())
+        extents = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+
+        # 进入面锚点 + 沿钻轴的零件总深
+        margin = 5.0  # 刀具高出进入面，保证干净切穿
+        if direction in ("top", "z+", "+Z"):
+            anchor = (position[0], position[1], hi[2]); axis_extent = extents[2]
+        elif direction in ("bottom", "z-", "-Z"):
+            anchor = (position[0], position[1], lo[2]); axis_extent = extents[2]
+        elif direction in ("x+", "+X"):
+            anchor = (hi[0], position[0], position[1]); axis_extent = extents[0]
+        elif direction in ("x-", "-X"):
+            anchor = (lo[0], position[0], position[1]); axis_extent = extents[0]
+        elif direction in ("y+", "+Y"):
+            anchor = (position[0], hi[1], position[1]); axis_extent = extents[1]
+        else:  # y- / -Y
+            anchor = (position[0], lo[1], position[1]); axis_extent = extents[1]
+
+        actual_depth = (axis_extent + 2 * margin) if depth is None else (depth + margin)
+        axis_plane = B3DPlane(origin=anchor, z_dir=drill)
+        back_plane = B3DPlane(origin=anchor, z_dir=tuple(-v for v in drill))
+        px, py = position
+
         with Transaction(self, "hole") as txn:
-            entry = self._record_history("hole", position=position, diameter=diameter, depth=depth, hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth, name=name)
+            entry = self._record_history("hole", position=position, diameter=diameter, depth=depth, hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth, name=name, direction=direction)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
@@ -1337,54 +1599,39 @@ class MechKernel:
                 parameters={
                     "position": list(position), "diameter": diameter, "depth": actual_depth,
                     "hole_type": hole_type, "counterbore_diameter": counterbore_diameter,
-                    "counterbore_depth": counterbore_depth, "name": name,
+                    "counterbore_depth": counterbore_depth, "name": name, "direction": direction,
                 },
                 name=name or f"hole_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
             self.feature_graph.add(feature)
-            
-            # 1. simple: 1 个圆
-            # 2. counterbore: 2 个圆叠切（大圆+深，小圆+深）
-            # 3. countersink: 2 个圆叠切（简化：外大圆切锥度）
-            px, py = position
+
+            # 1. simple: 单圆柱
+            # 2. counterbore: 大圆浅柱 + 小圆全长柱
+            # 3. countersink: 真 90° 锥面（大径在进入面，缩到孔径）+ 小圆全长柱
+            bore = B3DSolid.make_cylinder(diameter / 2, actual_depth, plane=axis_plane)
             if hole_type == "simple":
-                with BuildPart(Plane.XY) as bp:
-                    with BuildSketch() as s:
-                        with Locations((px, py, 0)):
-                            B3DCircle(diameter / 2)
-                    extrude(amount=actual_depth)
-                cutter = bp.part
+                cutter = bore
             elif hole_type == "counterbore":
                 cb_d = counterbore_diameter or (diameter * 1.8)
                 cb_depth = counterbore_depth or (diameter * 0.5)
-                with BuildPart(Plane.XY) as bp:
-                    with BuildSketch() as s:
-                        with Locations((px, py, 0)):
-                            B3DCircle(cb_d / 2)  # 沉孔大圆
-                    extrude(amount=cb_depth)
-                    with BuildSketch() as s:
-                        with Locations((px, py, 0)):
-                            B3DCircle(diameter / 2)  # 通孔小圆
-                    extrude(amount=actual_depth)
-                cutter = bp.part
-            elif hole_type == "countersink":
-                # 简化：外大圆 + 小圆（无锥度）
+                cb = B3DSolid.make_cylinder(cb_d / 2, cb_depth + margin, plane=axis_plane)
+                cutter = bore + cb
+            else:  # countersink: 真 90° 锥面
                 cs_d = counterbore_diameter or (diameter * 1.8)
-                with BuildPart(Plane.XY) as bp:
-                    with BuildSketch() as s:
-                        with Locations((px, py, 0)):
-                            B3DCircle(cs_d / 2)  # 沉孔大圆
-                    extrude(amount=actual_depth)
-                    with BuildSketch() as s:
-                        with Locations((px, py, 0)):
-                            B3DCircle(diameter / 2)  # 通孔小圆
-                    extrude(amount=actual_depth)
-                cutter = bp.part
-            
+                cs_depth = counterbore_depth or (diameter * 0.5)
+                if cs_d <= diameter:
+                    raise InvalidRequestError(
+                        f"countersink 大径 {cs_d} 必须大于孔径 {diameter}")
+                cone = B3DSolid.make_cone(
+                    cs_d / 2, diameter / 2, cs_depth, plane=axis_plane)
+                collar = B3DSolid.make_cylinder(cs_d / 2, margin, plane=back_plane)
+                cutter = bore + cone + collar
+
             # boolean subtract
             self._current_geometry = self._current_geometry - cutter
-            self.narrative.append(f"hole {hole_type} Ø{diameter} @ ({px}, {py}) 深 {actual_depth:.1f}")
+            self.narrative.append(
+                f"hole {hole_type} Ø{diameter} @ ({px}, {py}) {direction} 深 {actual_depth - margin:.1f}")
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
@@ -1404,14 +1651,16 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def shell(self, thickness: float, face_filter: str = "top", name: str = "") -> StepResult:
+    def shell(self, thickness: float, face_filter: str = "top", name: str = "", face_refs: list = None) -> StepResult:
         """
         v1.6.1 真实 shell（抽壳）— 用 OCP BRepOffsetAPI_MakeThickSolid
-        
+
         Args:
             thickness: 壁厚（mm），必须 > 0
             face_filter: 开口面选择："top"/"bottom"/"z+"/"z-"/"x+"/"x-"/"y+"/"y-"
             name: 特征名
+            face_refs: v2.11 — 开口面引用列表（如 ["F03"]，来自 select）。
+                提供时优先于 face_filter，可指定任意面（含曲面）作为开口。
         """
         start = time.time()
         if self._current_geometry is None:
@@ -1446,34 +1695,53 @@ class MechKernel:
             "x+": (1, 0, 0), "x-": (-1, 0, 0),
             "y+": (0, 1, 0), "y-": (0, -1, 0),
         }
-        if face_filter not in target_dirs:
-            raise InvalidRequestError(f"face_filter '{face_filter}' 不支持。可选: {list(target_dirs.keys())}")
-        target_dir = target_dirs[face_filter]
-        
-        exp = TopExp_Explorer(solid_ocp, TopAbs_FACE)
-        while exp.More():
-            f = exp.Current()
-            f_face = TopoDS.Face_s(f)
-            if not f_face.IsNull():
-                adaptor = BRepAdaptor_Surface(f_face)
-                if adaptor.GetType() == 0:  # Plane
-                    d = adaptor.Plane().Axis().Direction()
-                    if (abs(d.X() - target_dir[0]) < 0.1 and 
-                        abs(d.Y() - target_dir[1]) < 0.1 and 
-                        abs(d.Z() - target_dir[2]) < 0.1):
-                        faces_list.Append(f)
-            exp.Next()
-        
+        if face_refs:
+            # v2.11: 按引用选开口面（支持任意面，含曲面）
+            if isinstance(face_refs, str):
+                face_refs = [face_refs]
+            try:
+                open_infos = resolve_refs(self._topo_cache, self._geometry_revision,
+                                          self._current_geometry, list(face_refs), "face")
+            except RefStaleError as e:
+                raise RecoverableError(
+                    f"面引用已失效: {e}",
+                    suggestion={"action": "重新 select 获取新的面引用",
+                                "reason_code": "stale_topo_ref"},
+                    reason_code="stale_topo_ref",
+                )
+            except RefFormatError as e:
+                raise InvalidRequestError(str(e))
+            for info in open_infos:
+                faces_list.Append(info.shape.wrapped)
+        else:
+            if face_filter not in target_dirs:
+                raise InvalidRequestError(f"face_filter '{face_filter}' 不支持。可选: {list(target_dirs.keys())}，或改用 face_refs 指定开口面")
+            target_dir = target_dirs[face_filter]
+
+            exp = TopExp_Explorer(solid_ocp, TopAbs_FACE)
+            while exp.More():
+                f = exp.Current()
+                f_face = TopoDS.Face_s(f)
+                if not f_face.IsNull():
+                    adaptor = BRepAdaptor_Surface(f_face)
+                    if adaptor.GetType() == 0:  # Plane
+                        d = adaptor.Plane().Axis().Direction()
+                        if (abs(d.X() - target_dir[0]) < 0.1 and
+                            abs(d.Y() - target_dir[1]) < 0.1 and
+                            abs(d.Z() - target_dir[2]) < 0.1):
+                            faces_list.Append(f)
+                exp.Next()
+
         if faces_list.Size() == 0:
             raise InvalidRequestError(f"没找到匹配 '{face_filter}' 的面")
         
         with Transaction(self, "shell") as txn:
-            entry = self._record_history("shell", thickness=thickness, face_filter=face_filter, name=name)
+            entry = self._record_history("shell", thickness=thickness, face_filter=face_filter, name=name, face_refs=face_refs)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SHELL,
-                parameters={"thickness": thickness, "face_filter": face_filter, "name": name},
+                parameters={"thickness": thickness, "face_filter": face_filter, "name": name, "face_refs": face_refs},
                 name=name or f"shell_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
@@ -1517,10 +1785,11 @@ class MechKernel:
         spacing: float = 10.0,
         mode: str = "cut",
         name: str = "",
+        depth: float = None,
     ) -> StepResult:
         """
         v1.10 真实 linear_pattern（线性阵列）— 沿 direction 复制 N 个草图 + boolean
-        
+
         Args:
             sketch_name: 草图名
             count: 副本数（>= 2）
@@ -1528,6 +1797,7 @@ class MechKernel:
             spacing: 副本间距（mm）
             mode: "cut" | "add" | "union"
             name: 特征名
+            depth: 拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm（穿透式）
         """
         start = time.time()
         if sketch_name not in self.sketches:
@@ -1538,6 +1808,15 @@ class MechKernel:
             raise InvalidRequestError(f"count 必须 >= 2（当前 {count}）")
         if mode not in ("cut", "add", "union"):
             raise InvalidRequestError(f"mode 必须是 cut/add/union（当前 {mode}）")
+        # v2.11: depth 不再硬编码 50；缺省取当前零件 Z 向尺寸 + 2mm（穿透式）
+        derived_depth = depth is None
+        if derived_depth:
+            z_ext = _z_extent_of(self._current_geometry)
+            if z_ext is None:
+                raise InvalidRequestError("linear_pattern 无法推导 depth（无已有几何），请显式传 depth")
+            depth = z_ext + 2.0
+        else:
+            require_positive("depth", depth)
         
         from build123d import (
             BuildPart, BuildSketch, Plane, add, extrude, Location,
@@ -1557,19 +1836,19 @@ class MechKernel:
         if any(e.type not in ("circle", "rectangle") for e in sk.entities):
             raise NotImplementedError("linear_pattern 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "linear_pattern") as txn:
-            entry = self._record_history("linear_pattern", sketch_name=sketch_name, count=count, direction=direction, spacing=spacing, mode=mode, name=name)
+            entry = self._record_history("linear_pattern", sketch_name=sketch_name, count=count, direction=direction, spacing=spacing, mode=mode, name=name, depth=depth)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.LINEAR_PATTERN,
-                parameters={"sketch_name": sketch_name, "count": count, "direction": list(direction), "spacing": spacing, "mode": mode, "name": name},
+                parameters={"sketch_name": sketch_name, "count": count, "direction": list(direction), "spacing": spacing, "mode": mode, "name": name, "depth": depth},
                 name=name or f"linear_pattern_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
             self.feature_graph.add(feature)
-            
+
             # 复制 count 次：每次 entity center 偏移 i*spacing*direction
-            with BuildPart(Plane.XY) as bp:
+            with BuildPart(self._sketch_plane(sk, "Z") or Plane.XY) as bp:
                 with BuildSketch() as s:
                     for i in range(count):
                         off_x = i * spacing * ux
@@ -1585,7 +1864,7 @@ class MechKernel:
                                 c = e.params.get("center", (0, 0))
                                 with Locations((c[0] + off_x, c[1] + off_y, 0)):
                                     B3DRect(w, h)
-                extrude(amount=50.0)
+                extrude(amount=depth)
             all_parts = bp.part
             
             if mode in ("union", "add"):
@@ -1609,25 +1888,29 @@ class MechKernel:
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=("depth 未显式提供，自动取当前零件 Z 向尺寸 + 2mm"
+                     if derived_depth else None),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
-    
+
     def mirror(
         self,
         sketch_name: str,
         axis: str = "X",
         mode: str = "union",
         name: str = "",
+        depth: float = None,
     ) -> StepResult:
         """
         v1.9 真实 mirror（镜像）— 沿 X/Y 轴镜像草图 + boolean
-        
+
         Args:
             sketch_name: 要镜像的草图
             axis: "X" | "Y"（镜像轴）
             mode: "union"（镜像后合并到 current_geometry）| "add" | "cut"
             name: 特征名
+            depth: 拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm（穿透式）
         """
         start = time.time()
         if sketch_name not in self.sketches:
@@ -1638,6 +1921,15 @@ class MechKernel:
             raise InvalidRequestError(f"axis 必须是 'X' 或 'Y'（当前 {axis}）")
         if mode not in ("union", "add", "cut"):
             raise InvalidRequestError(f"mode 必须是 union/add/cut（当前 {mode}）")
+        # v2.11: depth 不再硬编码 50；缺省取当前零件 Z 向尺寸 + 2mm（穿透式）
+        derived_depth = depth is None
+        if derived_depth:
+            z_ext = _z_extent_of(self._current_geometry)
+            if z_ext is None:
+                raise InvalidRequestError("mirror 无法推导 depth（无已有几何），请显式传 depth")
+            depth = z_ext + 2.0
+        else:
+            require_positive("depth", depth)
         
         from build123d import (
             BuildPart, BuildSketch, Plane, add, extrude, Location,
@@ -1649,12 +1941,12 @@ class MechKernel:
         if any(e.type not in ("circle", "rectangle") for e in sk.entities):
             raise NotImplementedError("mirror 暂不支持 polyline/arc 实体（请用 circle/rectangle）")
         with Transaction(self, "mirror") as txn:
-            entry = self._record_history("mirror", sketch_name=sketch_name, axis=axis, mode=mode, name=name)
+            entry = self._record_history("mirror", sketch_name=sketch_name, axis=axis, mode=mode, name=name, depth=depth)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.MIRROR,
-                parameters={"sketch_name": sketch_name, "axis": axis, "mode": mode, "name": name},
+                parameters={"sketch_name": sketch_name, "axis": axis, "mode": mode, "name": name, "depth": depth},
                 name=name or f"mirror_{axis}_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
@@ -1663,7 +1955,7 @@ class MechKernel:
             # 镜像：原位置（保留）+ 镜像位置（也生成）
             # axis="X" 镜像 → 翻转 X 坐标（cx=-c[0], cy=c[1]）
             # axis="Y" 镜像 → 翻转 Y 坐标（cx=c[0], cy=-c[1]）
-            with BuildPart(Plane.XY) as bp:
+            with BuildPart(self._sketch_plane(sk, "Z") or Plane.XY) as bp:
                 with BuildSketch() as s:
                     for e in sk.entities:
                         if e.type == "circle":
@@ -1692,7 +1984,7 @@ class MechKernel:
                                 cx, cy = c[0], -c[1]
                             with Locations((cx, cy, 0)):
                                 B3DRect(w, h)
-                extrude(amount=50.0)
+                extrude(amount=depth)
             both_parts = bp.part
             
             if mode == "union" or mode == "add":
@@ -1716,42 +2008,68 @@ class MechKernel:
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
+            warning=("depth 未显式提供，自动取当前零件 Z 向尺寸 + 2mm"
+                     if derived_depth else None),
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
     
-    def sweep(self, profile_sketch: str, path: str = "x_axis", length: float = 50.0, name: str = "") -> StepResult:
+    def sweep(self, profile_sketch: str, path: str = "x_axis", length: float = 50.0, name: str = "", mode: str = "new_body", confirm_replace: bool = False) -> StepResult:
         """
         v1.6.2 sweep（扫掠，沿直线路径）— 用 build123d.extrude(face, amount/dir)
-        
+        v2.11: 加 mode (new_body/add/cut) 对齐 extrude 语义，不再静默丢弃已有几何
+
         Args:
-            profile_sketch: profile 草图名（必须在 XY 平面，中心在原点）
+            profile_sketch: profile 草图名（中心在原点，circle 或 rectangle）
             path: 路径方向，"x_axis" | "y_axis" | "z_axis"
             length: 路径长度（mm）
             name: 特征名
+            mode: "new_body" | "add" | "cut"
+            confirm_replace: mode="new_body" 且已有几何时必须显式 True
         """
         start = time.time()
         if profile_sketch not in self.sketches:
             raise InvalidRequestError(f"profile 草图 {profile_sketch} 不存在")
         if length <= 0:
             raise InvalidRequestError(f"length 必须 > 0（当前 {length}）")
-        
+        if mode not in ("new_body", "add", "cut"):
+            raise InvalidRequestError(f"mode 必须是 new_body/add/cut（当前 {mode}）")
+        # v2.11: new_body 会清空整个已有零件，必须显式确认
+        if mode == "new_body" and self._current_geometry is not None and not confirm_replace:
+            raise RecoverableError(
+                f"sweep mode='new_body' 会清空已有零件。叠加到当前零件用 mode='add'，切除用 mode='cut'；确实要替换请传 confirm_replace=True",
+                suggestion={
+                    "action": "选择修正参数后重试",
+                    "fix": {"mode": "add"},
+                    "alternatives": [
+                        {"fix": {"mode": "cut"}},
+                        {"fix": {"confirm_replace": True}},
+                    ],
+                    "reason_code": "new_body_would_replace",
+                },
+                reason_code="new_body_would_replace",
+            )
+        if mode in ("add", "cut") and self._current_geometry is None:
+            raise InvalidRequestError(f"sweep mode='{mode}' 需要先有几何")
+
         sk = self.sketches[profile_sketch]
         if not sk.closed:
             raise InvalidRequestError(f"profile {profile_sketch} 未关闭")
         if len(sk.entities) != 1:
-            raise InvalidRequestError(f"sweep v1.6.2 只支持单 entity profile")
-        
+            raise InvalidRequestError(f"sweep 只支持单 entity profile")
+
         e = sk.entities[0]
-        if e.type != "circle":
-            raise InvalidRequestError(f"sweep v1.6.2 只支持 circle profile（当前 {e.type}）")
-        r = e.params["radius"]
-        
+        if e.type not in ("circle", "rectangle"):
+            raise InvalidRequestError(f"sweep 只支持 circle/rectangle profile（当前 {e.type}）")
+        r = e.params.get("radius")
+        w, h = e.params.get("width"), e.params.get("height")
+        c = e.params.get("center", (0, 0))
+
         from build123d import (
-            BuildPart, BuildSketch, Plane, Circle as B3DCircle, add,
-            Solid as B3DSolid, Vector,
+            BuildPart, BuildSketch, Plane, Circle as B3DCircle, Rectangle as B3DRect, add,
+            Solid as B3DSolid, Vector, Locations,
         )
-        
+
         # v1.16 修复：path → 草绘平面（profile 垂直于路径，extrude 沿平面法向 = 路径方向）
         # 注：build123d extrude(dir=...) 要求 dir 不平行于面局部 x 轴，圆形 profile 沿 X 会崩，
         # 因此改为按路径选平面 + 普通 extrude(amount)。
@@ -1762,31 +2080,39 @@ class MechKernel:
         }
         if path not in path_planes:
             raise InvalidRequestError(f"path '{path}' 不支持（x_axis/y_axis/z_axis）")
-        
+
         with Transaction(self, "sweep") as txn:
-            entry = self._record_history("sweep", profile_sketch=profile_sketch, path=path, length=length, name=name)
+            entry = self._record_history("sweep", profile_sketch=profile_sketch, path=path, length=length, name=name, mode=mode, confirm_replace=confirm_replace)
             feature_id = next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.SWEEP,
-                parameters={"profile_sketch": profile_sketch, "path": path, "length": length, "name": name},
+                parameters={"profile_sketch": profile_sketch, "path": path, "length": length, "name": name, "mode": mode},
                 name=name or f"sweep_{feature_id}",
                 state=FeatureState.COMPUTED,
             )
             self.feature_graph.add(feature)
-            
+
             # BuildPart + BuildSketch + extrude（沿平面法向 = 路径方向）
             # 注意：BuildSketch 必须显式传平面，否则默认落在 XY（build123d 行为）
             with BuildPart(path_planes[path]) as bp:
                 with BuildSketch(path_planes[path]) as s:
-                    add(B3DCircle(r))
+                    with Locations((c[0], c[1], 0)):
+                        if e.type == "circle":
+                            add(B3DCircle(r))
+                        else:
+                            add(B3DRect(w, h))
                 from build123d import extrude as b3d_extrude
                 b3d_extrude(amount=length)
-            
+
             new_solid = bp.part
-            if self._current_geometry is None:
+            if mode == "new_body" or self._current_geometry is None:
                 self._current_geometry = new_solid
-            self.narrative.append(f"sweep {profile_sketch} 沿 {path} 长 {length}")
+            elif mode == "add":
+                self._current_geometry = self._current_geometry + new_solid
+            else:  # cut
+                self._current_geometry = self._current_geometry - new_solid
+            self.narrative.append(f"sweep {profile_sketch} 沿 {path} 长 {length} {mode}")
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
         
@@ -2097,72 +2423,83 @@ class MechKernel:
         result.value = result_value
         return result
 
-    def select(self, filter_type: str = "all", face_index: int = None) -> "StepResult":
+    def select(self, filter_type: str = "all", face_index: int = None, element_type: str = "face") -> "StepResult":
         """
-        v1.12 真实 select（按类型/索引选 face）
-        
+        v1.12 真实 select（按类型选 face/edge）— v2.11 起返回可回喂引用
+
         Args:
-            filter_type: "all" | "plane" | "cylinder" | "cone" | "sphere" | "torus"
+            filter_type: face 模式: "all"|"plane"|"cylinder"|"cone"|"sphere"|"torus"
+                         edge 模式: "all"|"line"|"circle"|"ellipse"|"bezier"|"bspline"
             face_index: 第几个匹配（0-indexed, None = 全部）
+            element_type: "face"（默认）| "edge"
+
+        返回项带 ref（如 "F03"/"E12"），可直接回喂 fillet/chamfer 的 edges、
+        shell 的 face_refs、create_workplane 的 face_ref。
+        引用在几何被修改后失效（需重新 select）。
         """
         start = time.time()
         if self._current_geometry is None:
             raise InvalidRequestError("select 需要先有几何")
-        
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE
-        from OCP.BRepAdaptor import BRepAdaptor_Surface
-        from OCP.GeomAbs import (
-            GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus,
-        )
-        from OCP.TopoDS import TopoDS
-        from build123d import Face as B3DFace
-        
-        type_map = {
-            "plane": GeomAbs_Plane,
-            "cylinder": GeomAbs_Cylinder,
-            "cone": GeomAbs_Cone,
-            "sphere": GeomAbs_Sphere,
-            "torus": GeomAbs_Torus,
-        }
-        if filter_type not in ("all",) and filter_type not in type_map:
-            raise InvalidRequestError(f"filter_type 必须是 all/plane/cylinder/cone/sphere/torus（当前 {filter_type}）")
-        
-        shape = self._current_geometry.wrapped if hasattr(self._current_geometry, 'wrapped') else self._current_geometry
-        all_faces = []
-        type_count = {"plane": 0, "cylinder": 0, "cone": 0, "sphere": 0, "torus": 0}
-        exp = TopExp_Explorer(shape, TopAbs_FACE)
-        while exp.More():
-            f = exp.Current()
-            f_face = TopoDS.Face_s(f)
-            if not f_face.IsNull():
-                adaptor = BRepAdaptor_Surface(f_face)
-                t = adaptor.GetType()
-                type_name = "unknown"
-                if t == GeomAbs_Plane: type_name = "plane"
-                elif t == GeomAbs_Cylinder: type_name = "cylinder"
-                elif t == GeomAbs_Cone: type_name = "cone"
-                elif t == GeomAbs_Sphere: type_name = "sphere"
-                elif t == GeomAbs_Torus: type_name = "torus"
-                if type_name in type_count:
-                    type_count[type_name] += 1
-                if filter_type == "all" or filter_type == type_name:
-                    all_faces.append({"index": len(all_faces), "type": type_name})
-            exp.Next()
-        
-        result_value = {
-            "total": sum(type_count.values()),
-            "by_type": type_count,
-            "selected": all_faces,
-            "note": "select 返回面类型与索引元数据（描述性筛选用）；v2.0 前不可直接回喂给 fillet/chamfer/shell 作为实体引用",
-        }
-        if face_index is not None and 0 <= face_index < len(all_faces):
-            result_value["specific"] = all_faces[face_index]
-        
+        if element_type not in ("face", "edge"):
+            raise InvalidRequestError(f"element_type 必须是 face/edge（当前 {element_type}）")
+
+        result_value: dict = {}
+        if element_type == "face":
+            face_type_map = {"plane", "cylinder", "cone", "sphere", "torus"}
+            if filter_type != "all" and filter_type not in face_type_map:
+                raise InvalidRequestError(
+                    f"filter_type 必须是 all/plane/cylinder/cone/sphere/torus（当前 {filter_type}）")
+
+            infos = self._topo_cache.faces(self._geometry_revision, self._current_geometry)
+            type_count = {"plane": 0, "cylinder": 0, "cone": 0, "sphere": 0, "torus": 0}
+            all_faces = []
+            for info in infos:
+                if info.geom_type in type_count:
+                    type_count[info.geom_type] += 1
+                if filter_type == "all" or filter_type == info.geom_type:
+                    item = {"index": len(all_faces), "type": info.geom_type, "ref": info.ref}
+                    item.update(info.summary())
+                    all_faces.append(item)
+            result_value = {
+                "element_type": "face",
+                "total": sum(type_count.values()),
+                "by_type": type_count,
+                "selected": all_faces,
+                "revision": self._geometry_revision,
+                "note": "ref 可回喂 fillet/chamfer(edges)、shell/create_workplane(face_refs/face_ref)；几何修改后引用失效需重新 select",
+            }
+            if face_index is not None and 0 <= face_index < len(all_faces):
+                result_value["specific"] = all_faces[face_index]
+        else:  # edge
+            edge_types = {"line", "circle", "ellipse", "hyperbola", "parabola", "bezier", "bspline", "other"}
+            if filter_type != "all" and filter_type not in edge_types:
+                raise InvalidRequestError(
+                    f"edge 模式 filter_type 必须是 all/{'/'.join(sorted(edge_types))}（当前 {filter_type}）")
+
+            infos = self._topo_cache.edges(self._geometry_revision, self._current_geometry)
+            type_count: dict = {}
+            all_edges = []
+            for info in infos:
+                type_count[info.geom_type] = type_count.get(info.geom_type, 0) + 1
+                if filter_type == "all" or filter_type == info.geom_type:
+                    item = {"index": len(all_edges), "type": info.geom_type, "ref": info.ref}
+                    item.update(info.summary())
+                    all_edges.append(item)
+            result_value = {
+                "element_type": "edge",
+                "total": sum(type_count.values()),
+                "by_type": type_count,
+                "selected": all_edges,
+                "revision": self._geometry_revision,
+                "note": "ref 可回喂 fillet/chamfer 的 edges 参数（如 edges=['E12','E15']）；几何修改后引用失效需重新 select",
+            }
+            if face_index is not None and 0 <= face_index < len(all_edges):
+                result_value["specific"] = all_edges[face_index]
+
         self._step_counter += 1
         result = make_success(
             feature_id=f"S_{self._step_counter:03d}",
-            narrative=f"select {filter_type}",
+            narrative=f"select {element_type} {filter_type}",
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"selected": [filter_type]},
             elapsed_ms=(time.time() - start) * 1000,
@@ -3455,6 +3792,46 @@ class MechKernel:
             raise InvalidRequestError("剖面未闭合")
         return pts
 
+    @staticmethod
+    def _orthonormalize_axis(axis, against=None) -> tuple:
+        """归一化 3D 向量；against 提供时先去掉其分量（Gram-Schmidt 正交化）。"""
+        import math as _math
+        v = [float(c) for c in axis]
+        n = _math.sqrt(sum(c * c for c in v))
+        if n == 0:
+            raise InvalidRequestError("方向向量不能全为 0")
+        v = [c / n for c in v]
+        if against is not None:
+            a = [float(c) for c in against]
+            dot = sum(v[i] * a[i] for i in range(3))
+            v = [v[i] - dot * a[i] for i in range(3)]
+            n2 = _math.sqrt(sum(c * c for c in v))
+            if n2 < 1e-9:
+                raise InvalidRequestError("x_dir 与 normal 平行，无法构成坐标系")
+            v = [c / n2 for c in v]
+        return tuple(v)
+
+    def _sketch_plane(self, sketch, direction: str = "Z"):
+        """v2.11: 草图所属 workplane 的真实 build123d 平面。
+
+        - standard 过原点平面：返回 None（沿用 direction 参数选择 Plane.XY/YZ/XZ，
+          完全向后兼容）
+        - custom / face / offset 平面：按 workplane 的 origin/x_dir/normal 构造，
+          草图 2D 坐标 (u, v) 映射到 origin + u*x_dir + v*y_dir，沿 normal 拉伸
+        """
+        from build123d import Plane as B3DPlane
+        try:
+            wp = self.workplanes.get_by_name(sketch.workplane_name)
+        except Exception:
+            return None
+        if wp is None:
+            return None
+        is_standard = (wp.type in (WorkplaneType.XY, WorkplaneType.YZ, WorkplaneType.XZ)
+                       and tuple(wp.origin) == (0.0, 0.0, 0.0))
+        if is_standard:
+            return None
+        return B3DPlane(origin=tuple(wp.origin), x_dir=tuple(wp.x_dir), z_dir=tuple(wp.normal))
+
     def _extrude_sketch_solid(self, sketch, depth, plane):
         """v2.1: 把草图拉伸成 Part（circle/rectangle/line/polyline/arc 统一支持）。"""
         from build123d import BuildPart, BuildSketch, add, extrude
@@ -3568,8 +3945,9 @@ class MechKernel:
                 from .build123d_adapter import extrude_sketch
                 return extrude_sketch(sketch, depth)
             
-            # v1.2.1: 方向 → plane
-            plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
+            # v1.2.1: 方向 → plane；v2.11: 尊重 workplane 的真实放置
+            plane = self._sketch_plane(sketch, direction) or \
+                {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
             
             # 单个圆 → 圆柱（v1.16 修复：支持 center 偏移）
             if len(sketch.entities) == 1 and sketch.entities[0].type == "circle":
@@ -3654,9 +4032,10 @@ class MechKernel:
             raise InvalidRequestError(f"extrude mode={mode} 需要先有几何（先 new_body 拉伸）")
         from build123d import BuildPart, BuildSketch, Plane, add, extrude, Location
         from build123d import Circle as B3DCircle, Rectangle as B3DRect
-        
-        # v1.2.1: direction → plane
-        plane = {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
+
+        # v1.2.1: direction → plane；v2.11: 尊重 workplane 的真实放置
+        plane = self._sketch_plane(sketch, direction) or \
+            {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
         
         # 1. 单独把新 sketch 拉伸成 Part（v2.1: 统一助手，支持 circle/rect/polyline/arc）
         new_solid = self._extrude_sketch_solid(sketch, depth, plane)
@@ -3773,6 +4152,18 @@ class MechKernel:
                 suggestion={"action": "检查操作参数或回退到上一个有效特征"},
                 geometry_summary=self._geometry_summary_for(self._current_geometry),
                 geometry_validation=e.validation,
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+        except RecoverableError as e:
+            # v2.11: op 内部显式判定"可修复"，suggestion 携带结构化修正参数
+            self.adaptive_renderer.mark_failure(op)
+            return make_failure(
+                error=str(e),
+                error_kind="RECOVERABLE",
+                suggestion=e.suggestion,
+                geometry_summary=self._geometry_summary_for(self._current_geometry),
                 current_narrative=self.narrative.copy(),
                 elapsed_ms=(time.time() - start) * 1000,
                 step_index=self._step_counter,

@@ -216,7 +216,7 @@ def test_boolean_polyline_tool():
     k.new_sketch("XY", "b")
     k.add_polyline("b", [[0, 0], [10, 0], [10, 5], [0, 5]])
     k.close_sketch("b")
-    r = k.boolean("a", tools=["b"], operation="subtract")
+    r = k.boolean("a", tools=["b"], operation="subtract", depth=50)
     assert r.success, r.error
     vol = k.query("_current_geometry", "volume").value
     assert abs(vol - (40 * 30 * 50 - 10 * 5 * 50)) < 1.0

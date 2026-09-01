@@ -46,6 +46,20 @@ class GeometryValidationError(MechKernelError):
         self.validation = validation or {}
 
 
+class RecoverableError(MechKernelError):
+    """可恢复失败：参数可修正后重试（v2.11）。
+
+    execute() 会把它映射为 RECOVERABLE StepResult，suggestion 携带结构化
+    修正参数（{"fix": {param: value}}），LLM 可据此自动重试。
+    """
+
+    def __init__(self, message: str, suggestion: Optional[Dict[str, Any]] = None,
+                 reason_code: Optional[str] = None):
+        super().__init__(message)
+        self.suggestion = suggestion or {"action": "修正参数后重试"}
+        self.reason_code = reason_code
+
+
 class DeprecatedInternalAPIError(KernelBugError):
     """内部 API 已弃用。用于标记不该被调用的方法（如 _push_undo）。"""
     pass

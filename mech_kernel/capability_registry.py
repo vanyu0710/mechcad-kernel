@@ -20,7 +20,7 @@ from functools import wraps
 import inspect
 
 # Schema 中支持的类型
-SUPPORTED_TYPES = {"string", "number", "integer", "boolean", "tuple", "list", "dict", "enum"}
+SUPPORTED_TYPES = {"string", "number", "integer", "boolean", "tuple", "list", "dict", "enum", "string_or_list"}
 
 
 @dataclass
@@ -63,10 +63,10 @@ class Capability:
     description: str                       # 给 LLM 看
     input_schema: Dict[str, FieldSchema] = field(default_factory=dict)
     output_schema: Dict[str, Any] = field(default_factory=dict)
-    permission: str = "public"             # "public" | "read" | "internal"
+    permission: str = "public"             # "public" | "read" | "internal" | "experimental"
     func: Optional[Callable] = None
     examples: List[Dict] = field(default_factory=list)  # Few-shot 用
-    
+
     def to_llm_dict(self) -> dict:
         """LLM 友好的 op 描述"""
         return {
@@ -74,6 +74,7 @@ class Capability:
             "category": self.category,
             "description": self.description,
             "permission": self.permission,
+            "experimental": self.permission == "experimental",
             "inputs": {k: v.to_dict() for k, v in self.input_schema.items()},
             "outputs": self.output_schema,
             "examples": self.examples,
@@ -144,6 +145,15 @@ class Capability:
         elif t == "list":
             if not isinstance(value, list):
                 return False, f"{name} must be list, got {type(value).__name__}"
+        elif t == "string_or_list":
+            # v2.11: 'all' 或引用列表（如 fillet edges）
+            if isinstance(value, str):
+                pass
+            elif isinstance(value, (list, tuple)):
+                if not all(isinstance(x, str) for x in value):
+                    return False, f"{name} items must be strings"
+            else:
+                return False, f"{name} must be string or list of strings, got {type(value).__name__}"
         elif t == "dict":
             if not isinstance(value, dict):
                 return False, f"{name} must be dict, got {type(value).__name__}"
@@ -248,11 +258,19 @@ class CapabilityRegistry:
         return name in self._caps
     
     def list_public(self) -> List[dict]:
-        """列出所有 public 权限的 op（LLM 友好）"""
+        """列出所有 public 权限的 op（LLM 友好；experimental 不在此列）"""
         return [
             cap.to_llm_dict()
             for cap in self._caps.values()
             if cap.permission == "public"
+        ]
+
+    def list_experimental(self) -> List[dict]:
+        """v2.11: 列出 experimental op（默认能力集之外，显式 allow_experimental 才能调）"""
+        return [
+            cap.to_llm_dict()
+            for cap in self._caps.values()
+            if cap.permission == "experimental"
         ]
     
     def list_by_category(self, category: str) -> List[dict]:
@@ -267,12 +285,17 @@ class CapabilityRegistry:
         """列出所有 op（调试用）"""
         return [cap.to_llm_dict() for cap in self._caps.values()]
     
-    def validate_call(self, name: str, kwargs: dict) -> Tuple[bool, str]:
-        """校验一次 op 调用"""
+    def validate_call(self, name: str, kwargs: dict, allow_experimental: bool = False) -> Tuple[bool, str]:
+        """校验一次 op 调用
+
+        v2.11: experimental op 默认拒绝；allow_experimental=True 时放行并正常校验参数。
+        """
         cap = self.get(name)
         if cap is None:
             return False, f"未知 op: {name}"
         if cap.permission != "public":
+            if cap.permission == "experimental" and allow_experimental:
+                return cap.validate_inputs(kwargs)
             return False, f"op {name} 权限是 {cap.permission}，不允许调用"
         return cap.validate_inputs(kwargs)
     

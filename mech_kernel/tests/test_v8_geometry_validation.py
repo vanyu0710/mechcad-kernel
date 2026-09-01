@@ -1,5 +1,7 @@
 """v2.6 geometry validation and deterministic fingerprint contracts."""
 import json
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -73,11 +75,12 @@ def test_invalid_candidate_rolls_back_before_commit():
     assert kernel._op_history == before["op_history"]
 
 
-def test_history_contains_v26_validation(tmp_path):
+def test_history_contains_v26_validation():
     kernel = _solid_kernel()
     kernel.extrude("plate", 10)
-    paths = kernel.save_project(str(tmp_path / "plate"))
-    with open(paths["history_path"], encoding="utf-8") as stream:
-        history = json.load(stream)
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = kernel.save_project(str(Path(tmp) / "plate"))
+        with open(paths["history_path"], encoding="utf-8") as stream:
+            history = json.load(stream)
     assert history["schema_version"] == "2.6"
     assert history["geometry_validation"]["fingerprint"].startswith("sha256:")

@@ -249,7 +249,7 @@ def test_undo_clears_renderer_cache():
     k.new_sketch("base", "sk_1")
     k.add_circle("sk_1", (0, 0), 50)
     k.close_sketch("sk_1")
-    r1 = k.extrude("sk_1", depth=20)  # 触发 iso 渲染
+    r1 = k.extrude("sk_1", depth=20, confirm_replace=True)  # 触发 iso 渲染
     
     # 缓存应该有内容
     assert len(k.renderer._cache) > 0
@@ -430,7 +430,7 @@ def test_kernel_undo_with_bad_geometry_does_not_crash():
     k.new_sketch("base", "sk_1")
     k.add_circle("sk_1", (0, 0), 50)
     k.close_sketch("sk_1")
-    k.extrude("sk_1", depth=20)
+    k.extrude("sk_1", depth=20, confirm_replace=True)
     
     # 模拟几何损坏
     k._current_geometry = None

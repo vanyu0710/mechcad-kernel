@@ -267,7 +267,7 @@ def test_kernel_extrude_with_mock_geometry_renders():
     k.new_sketch("base", "sk_1")
     k.add_circle("sk_1", (0, 0), 50)
     k.close_sketch("sk_1")
-    r = k.extrude("sk_1", depth=20)
+    r = k.extrude("sk_1", depth=20, confirm_replace=True)
     
     # M1 阶段：拓扑变化 + 有几何 = iso 渲染
     assert r.render_level == "full"
@@ -295,7 +295,7 @@ def test_kernel_render_cache_works():
     k.new_sketch("base", "sk_1")
     k.add_circle("sk_1", (0, 0), 50)
     r1 = k.close_sketch("sk_1")
-    r2 = k.extrude("sk_1", depth=20)
+    r2 = k.extrude("sk_1", depth=20, confirm_replace=True)
     
     # 草图阶段不渲染
     assert r1.render_level == "none"

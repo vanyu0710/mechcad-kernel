@@ -248,7 +248,7 @@ def test_execute_boolean_via_execute():
     ]:
         r = k.execute(op, **kw)
         assert r.success, f"{op}: {r.error}"
-    r = k.execute("boolean", target_sketch="a", tools=["b"], operation="subtract")
+    r = k.execute("boolean", target_sketch="a", tools=["b"], operation="subtract", depth=50)
     assert r.success, r.error
     vol = k.query("_current_geometry", "volume").value
     expected = 40 * 30 * 50 - math.pi * 25 * 50

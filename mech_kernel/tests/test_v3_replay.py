@@ -39,7 +39,7 @@ def test_history_records_ops_order_and_args():
     ops = [e["op"] for e in k._op_history]
     assert ops == ["create_workplane", "new_sketch", "add_circle", "close_sketch"]
     wp_entry = k._op_history[0]
-    assert wp_entry["args"] == {"name": "base", "type": "XY"}
+    assert wp_entry["args"]["name"] == "base" and wp_entry["args"]["type"] == "XY"
     circle_entry = k._op_history[2]
     assert circle_entry["args"]["radius"] == 5
     assert circle_entry["feature_id"].startswith("E_")
