@@ -226,10 +226,47 @@ def main():
     # ---------- 4. 减速比示意图 ----------
     _render_ratio_diagram(OUT / "gearbox_v3_ratio.png")
 
+    # ---------- 4b. 干涉检查 (v2.9) ----------
+    print(f"\n[collision check] v2.9")
+    from mech_kernel.collision import check_assembly_interference
+
+    # 检查 7 个 part (1 housing + 3 shafts + 4 gears)
+    part_list = [
+        ("housing", housing),
+        ("shaft_input/output", io_shaft_x),
+        ("shaft_intermediate", inter_shaft_x),
+        ("gear_input", g_input_p),
+        ("gear_intermediate_large", g_inter_large_p),
+        ("gear_intermediate_small", g_inter_small_p),
+        ("gear_output", g_output_p),
+    ]
+    interference = check_assembly_interference(part_list, only_interfering=True)
+    print(f"  total pairs: {interference['total_pairs']}")
+    print(f"  interfering: {interference['interfering_count']}")
+    print(f"  max interference vol: {interference['max_interference_volume']:.2f} mm³")
+    for p in interference["interfering_pairs"][:10]:  # top 10
+        center = p.get("center")
+        c_str = f"@({center[0]:.0f},{center[1]:.0f},{center[2]:.0f})" if center else ""
+        print(f"    {p['name_a']:30s} ↔ {p['name_b']:30s}: {p['volume_mm3']:8.2f} mm³ {c_str}")
+
+    # 保存 interference 报告
+    interference_report = {
+        "total_pairs": interference["total_pairs"],
+        "interfering_count": interference["interfering_count"],
+        "max_interference_volume": interference["max_interference_volume"],
+        "interfering_pairs": [
+            {"a": p["name_a"], "b": p["name_b"], "vol": p["volume_mm3"],
+             "center": p.get("center")}
+            for p in interference["interfering_pairs"]
+        ],
+    }
+    # 添加到总报告 (在 report dict 创建之后)
+    # (这个 dict 在第 268 行创建, 把它加到 interference_report 后)
+
     # ---------- 5. 报告 ----------
     import json
     report = {
-        "version": "v3",
+        "version": "v3.1",
         "parameters": GEAR_PARAMS,
         "derived": {
             "center_distance": CENTER_DISTANCE,
@@ -249,6 +286,10 @@ def main():
             "intermediate_small_to_output": CENTER_DISTANCE,
         },
     }
+    # 把 collision report 合并进去
+    report["collision_check"] = interference_report
+
+    # JSON 写入
     (OUT / "gearbox_v3_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )

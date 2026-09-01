@@ -63,6 +63,8 @@ PUBLIC_OPS = frozenset({
     "create_reference_plane", "query_reference",
     "resolve_point", "resolve_placement",
     "validate_assembly",
+    # v2.9: collision check
+    "check_interference",
 })
 
 
@@ -363,6 +365,12 @@ class MechKernel:
                 "level": FieldSchema(type="enum", required=False, default="standard",
                                      enum=["basic", "standard", "strict"]),
                 "relations": FieldSchema(type="list", required=False, default=None, items_type="dict"),
+            },
+            # v2.9: collision check
+            "check_interference": {
+                "parts": FieldSchema(type="list", required=False, default=None, items_type="dict"),
+                "tolerance": FieldSchema(type="number", required=False, default=0.001, min=0.0),
+                "only_interfering": FieldSchema(type="boolean", required=False, default=False),
             },
         }
         for name, schema in placeholder_schemas.items():
@@ -2044,7 +2052,49 @@ class MechKernel:
         if warning:
             result.warning = warning
         return result
-    
+
+    def check_interference(self, parts: list = None, tolerance: float = 0.001,
+                           only_interfering: bool = False) -> "StepResult":
+        """v2.9: 装配体干涉检查.
+
+        检查所有 part pair (A, B) 的几何干涉, 返回体积矩阵.
+
+        Args:
+            parts: [(name, Part), ...] 列表, None = 检查 _current_geometry
+            tolerance: 体积阈值 (mm³), 低于此视为无干涉 (默认 0.001, 浮点精度)
+            only_interfering: 只返回有干涉的 pair
+
+        Returns: dict {
+          total_pairs, interfering_count, max_interference_volume,
+          pairs: [{name_a, name_b, interfering, volume_mm3, center}],
+          interfering_pairs: [subset]
+        }
+        """
+        from .collision import check_assembly_interference
+        start = time.time()
+        if parts is None:
+            # 单 part 模式: 检查 _current_geometry 自身 (返回空)
+            result_value = {
+                "total_pairs": 0, "interfering_count": 0, "max_interference_volume": 0.0,
+                "pairs": [], "interfering_pairs": []
+            }
+        else:
+            result_value = check_assembly_interference(
+                parts, tolerance=tolerance, only_interfering=only_interfering
+            )
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"CI_{self._step_counter:04d}",
+            narrative=f"check_interference: {result_value['interfering_count']} interfering of "
+                      f"{result_value['total_pairs']} pairs",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"interference_checked": result_value['total_pairs']},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = result_value
+        return result
+
     def select(self, filter_type: str = "all", face_index: int = None) -> "StepResult":
         """
         v1.12 真实 select（按类型/索引选 face）
