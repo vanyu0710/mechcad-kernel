@@ -2,24 +2,134 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-v2.6%20geometry%20validated-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-291%2F294%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.6](https://img.shields.io/badge/version-v2.6-blue)]()
+[![v2.9.1](https://img.shields.io/badge/version-v2.9.1-blue)]()
 
 ## 概述
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
-**核心能力**：
-- **37/37 op 全部真实实现**（100%）— 覆盖所有 capability registry op
+**核心能力 (v2.9.1)**：
+- **43/43 op 全部真实实现**（100%）— 覆盖所有 capability registry op
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean）
-- Capability Registry (33 op JSON Schema) — LLM 知道"能做什么"
+- Capability Registry (43 op JSON Schema) — LLM 知道"能做什么"
 - 5 类类型化错误 + 事务 Savepoint + 撤销/重做
+- **v2.7** 参考坐标系 (5 op) + 装配语义化验证
+- **v2.8** 真实 ISO 6336 齿轮 (梯形齿形 proxy)
+- **v2.9** OCC boolean 碰撞检查 (11 测试)
+- **v2.9.1** 专家审查修复 (P0/P1)
 - 6 种几何属性查询 + 按类型选面 + 3 种度量
 - OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
 - 二维约束、命名参数、确定性重放、持久化与多视角证据
+
+## v2.9.1 专家审查修复 (本次)
+
+基于 DeepSeek gpt-5.4-mini 专家审查 + 自我审查 (13 findings: 1 P0 + 6 P1 + 6 P2)，已修：
+
+- **P0** `assemble()` `local_origin` 死代码简化 (`position or [...]` → `position`)
+- **P1** `coaxial` 校验现在允许反向 (齿轮啮合需要 `|dot| > 1-eps`); 加 `coaxial_aligned` 严格模式
+- **P1** `collision.check_pair_interference()` 加 `strict=False` 参数, 区分 expected (`ValueError/TypeError/AttributeError`) vs unexpected `Exception`
+- **P1** `reference_frames.resolve_placement()` 旋转语义 docstring 详细化 (axis 是世界轴, 合成 `R @ base`)
+- **P2** `gear.py` docstring 加 WARNING: 梯形齿形是 proxy, 真实啮合有 100-500mm³ 假干涉
+- **测试**: + 3 新测试 (v7.1: 旋转语义, coaxial 反向, coaxial_aligned 严格)
+
+## v2.9 碰撞检查
+
+新增 `mech_kernel/collision.py` — 用 build123d `Part & Part` (OCC `BRepAlgoAPI_Common`) 算 boolean intersection:
+
+```python
+from mech_kernel.collision import check_pair_interference, check_assembly_interference, check_interference_matrix
+from build123d import Box
+
+# 单对
+r = check_pair_interference(Box(10, 10, 10), Box(5, 5, 5))
+# {"name_a": "A", "name_b": "B", "interfering": True, "volume_mm3": 125.0, "center": (..., ..., ...)}
+
+# 装配体
+parts = [("A", Box(10, 10, 10)), ("B", Box(5, 5, 5)), ("C", Box(5, 5, 5).moved(Location((20, 0, 0))))]
+r = check_assembly_interference(parts, only_interfering=True)
+# {"total_pairs": 3, "interfering_count": 1, "max_interference_volume": 125.0, ...}
+
+# MechKernel 集成
+k.check_interference(parts, tolerance=0.001, only_interfering=False)  → StepResult
+```
+
+**算法**: OCC `BRepAlgoAPI_Common` → volume > tolerance = 干涉. **性能**: 7 parts × 21 pairs ≈ 200ms, **O(N²) 复杂度**, 100 parts 估 ~20-30s (v2.10 加 AABB broad-phase).
+
+**Demo 14 v3.1 真实碰撞报告** (7 parts):
+```
+total pairs: 21
+interfering: 7
+max interference vol: 8275.92 mm³
+  housing        ↔ gear_intermediate_large : 8275.92 mm³ @(-41, 97, 10)
+  housing        ↔ gear_intermediate_small : 8275.92 mm³ @( 59, 97, 10)
+  gear_input     ↔ gear_intermediate_large :  307.50 mm³ @(-41, 20, 30)  ← 啮合
+  gear_inter_small ↔ gear_output          :  307.50 mm³ @( 59, 20, 30)  ← 啮合
+  shaft_input    ↔ gear_input             :   23.21 mm³
+  shaft_inter    ↔ gear_intermediate_large:   43.88 mm³
+  shaft_inter    ↔ gear_intermediate_small:   43.88 mm³
+```
+
+3 类干涉: housing 切齿轮 8275mm³ (真问题), 齿轮啮合 307mm³ (预期接触, 梯形齿形 proxy), 轴穿齿轮孔 23-44mm³ (boolean union 行为).
+
+## v2.8 真实齿轮数学模型
+
+新增 `mech_kernel/gear.py` 模块 — `build_involute_gear(module, teeth, width, bore)`：
+
+- **严格 ISO 6336-1 / AGMA 2015 几何参数**：
+  - `pitch_radius = m·z/2`
+  - `addendum_radius = r + m`
+  - `dedendum_radius = r − 1.25·m`
+  - `base_radius = r·cos(α)` （默认 α=20°）
+  - `tooth_thickness_at_pitch = π·m/2`
+  - `center_distance(z1, z2) = m·(z1+z2)/2`
+- **梯形齿形 proxy**：每齿 4 关键点 (左base / 左top / 右top / 右base)，顶宽 50%
+  - 替代方案 build123d 真实 involute 曲线时 OCP 边界精度问题 (`TopoDS::Face` 异常)
+  - ⚠️ 已知限制: 啮合时有 ~100-500 mm³ 假干涉 (梯形 vs 真圆齿)
+  - 真实 involute 留给 v2.10
+- **bore 自动 subtract**（`Mode.SUBTRACT`）：减少体积与理论 bore_vol 误差 < 1%
+- **z ∈ [6, 100]** 全部齿数都跑通，速度 0.16-0.49s/件
+
+### Demo 14 v2.8.4: 真实齿轮齿形 + in-kernel 装配
+
+替换 4 个齿轮 + housing + 3 根轴后, **完全 in-kernel build123d 建模** (不再是 load STEP + translate), 视觉从中空外壳 + 3 根轴 + 4 个啮合齿轮 + RPM 标注 + 减速比 3:1 (input 1500 → intermediate 500 → output 166 RPM).
+
+![v2.9 gearbox presentation](docs/images/gearbox_v29_presentation.png)
+![v2.9 gearbox iso](docs/images/gearbox_v29_iso.png)
+![v2.9 ratio diagram](docs/images/gearbox_v29_ratio.png)
+
+## v2.7 参考坐标系与装配验证
+
+新增 5 个公开 op, 把 demo 14 升到语义化装配：
+
+| op | 作用 |
+|----|------|
+| `create_reference_plane(name, origin, normal, x_axis, parent, metadata)` | 创建命名右手坐标系; 自动正交化, parent 链校验 |
+| `query_reference(name=None)` | 查询单/全部 frame |
+| `resolve_point(frame, uv, normal_offset)` | `{frame, uv, normal_offset}` 形式 → 世界坐标 |
+| `resolve_placement(frame, uv, normal_offset, rotation)` | 返回 (world_origin, 3x3 rotation_matrix) |
+| `validate_assembly(level, relations)` | 校验共轴/平行/垂直/齿轮啮合/装配完整性 |
+
+支持的关系 kind: `coaxial` / `coaxial_aligned` / `parallel` / `perpendicular` / `clearance` / `mounted` / `inside` / `gear_mesh`.
+
+> **v2.7.1 修复**: `coaxial` 现在允许反向 (`|dot| > 1-eps`, 齿轮啮合/轴对中等); `coaxial_aligned` 严格同向
+
+### Demo 14 v2.7-v2.8.4: 5 个 reference frame, 13 个装配实例
+
+```
+world
+├── housing_mount_plane
+├── input_shaft_axis     (normal=(1,0,0), 沿 +X)
+├── intermediate_shaft_axis
+└── output_shaft_axis
+```
+
+所有 13 个 instance 都通过 `mount_frame` + `resolve_placement` 放置, 不再硬编码坐标.
+
+`validate_assembly(level="standard", relations=10)` → `ok=True issues=0`.
 
 ## v2.6 几何可靠性验证与严格回滚
 
@@ -35,11 +145,7 @@ MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发�
 
 草图约束支持 `coincident`、`horizontal`、`vertical`、`parallel`、`perpendicular`、`distance`、`radius` 和 `equal`。命名尺寸通过 `set_parameter` 修改后会触发全量历史重放；严格模式失败回滚，`best_effort` 返回冲突和欠约束诊断。
 
-项目保存为 STEP、`graph.json` 和 `history.json`。缺少或校验失败的历史不会覆盖已加载的 STEP 几何，而是返回 `RECOVERABLE`。生产力基准运行：
-
-```text
-python -m benchmarks.run --output reports/v2.4.json
-```
+项目保存为 STEP、`graph.json` 和 `history.json`。缺少或校验失败的历史不会覆盖已加载的 STEP 几何，而是返回 `RECOVERABLE`。
 
 ## 🎨 实际产出（端到端真实几何）
 
@@ -68,58 +174,8 @@ python -m benchmarks.run --output reports/v2.4.json
 
 > **0% 体积误差**（单次 boolean）— 所有 demo 体积与理论值高度一致
 
-## v2.8 真实齿轮数学模型
-
-新增 `mech_kernel/gear.py` 模块 — `build_involute_gear(module, teeth, width, bore)`：
-
-- **严格 ISO 6336-1 / AGMA 2015 几何参数**：
-  - `pitch_radius = m·z/2`
-  - `addendum_radius = r + m`
-  - `dedendum_radius = r − 1.25·m`
-  - `base_radius = r·cos(α)` （默认 α=20°）
-  - `tooth_thickness_at_pitch = π·m/2`
-  - `center_distance(z1, z2) = m·(z1+z2)/2`
-- **梯形齿形 proxy**：每齿 4 关键点 (左base / 左top / 右top / 右base)，顶宽 50%
-  - 替代方案 build123d 真实 involute 曲线时 OCP 边界精度问题
-  - 数学完全等价，渲染结果视觉上明显比 v2.7 矩形代理更像真齿轮
-- **bore 自动 subtract**（`Mode.SUBTRACT`）：减少体积与理论 bore_vol 误差 < 1%
-- **z ∈ [6, 100]** 全部齿数都跑通，速度 0.16-0.49s/件
-
-### Demo 14 v2.8: 真实齿轮齿形
-
-替换 4 个齿轮后，视觉从"辐条状矩形"升级到"真实齿形"。
-
-![v2.8 gearbox full evidence](docs/images/gearbox_v28_full_evidence.png)
-![v2.8 gearbox presentation](docs/images/gearbox_v28_presentation.png)
-
-## v2.7 参考坐标系与装配验证
-
-新增 5 个公开 op，把 demo 14 升到语义化装配：
-
-| op | 作用 |
-|----|------|
-| `create_reference_plane(name, origin, normal, x_axis, parent, metadata)` | 创建命名右手坐标系；自动正交化、parent 链校验 |
-| `query_reference(name=None)` | 查询单/全部 frame |
-| `resolve_point(frame, uv, normal_offset)` | `{frame, uv, normal_offset}` 形式 → 世界坐标 |
-| `resolve_placement(frame, uv, normal_offset, rotation)` | 返回 (world_origin, 3x3 rotation_matrix) |
-| `validate_assembly(level, relations)` | 校验共轴/平行/垂直/齿轮啮合/装配完整性 |
-
-支持的关系 kind：`coaxial` / `parallel` / `perpendicular` / `clearance` / `mounted` / `inside` / `gear_mesh`。
-
-### Demo 14 重写：齿轮中心距由 module/齿数自动算
-
-```
-input(z=20) ─── center=80 ─── intermediate_large(z=60)
-intermediate_small(z=18) ─── center=72 ─── output(z=54)
-```
-
-5 个 reference frame（`world` / `housing_mount_plane` / 三根 `*_shaft_axis`），
-所有 13 个装配实例都通过 `mount_frame` + `resolve_placement` 放置，
-不再是硬编码坐标。
-
-`validate_assembly(level="standard", relations=10)` → `ok=True issues=0`。
-
 ## 快速开始
+
 
 ```python
 from mech_kernel import MechKernel
@@ -182,11 +238,14 @@ k.export('flange.step', format='step')
                        ▼
 ┌────────────────────────────────────────────────────────────┐
 │  MechKernel (本项目)                                         │
-│  - 33 op API（100% 真实实现）                                │
-│  - CapabilityRegistry (33 op + JSON Schema)               │
+│  - 43 op API（100% 真实实现）                                │
+│  - CapabilityRegistry (43 op + JSON Schema)               │
 │  - Feature Graph (DAG) + Persistent Naming                 │
 │  - 事务 Savepoint + 撤销栈                                  │
 │  - 5 类类型化错误                                            │
+│  - v2.7 参考坐标系 + 装配验证                               │
+│  - v2.8 真实齿轮 (ISO 6336)                                 │
+│  - v2.9 碰撞检查 (OCC boolean intersection)                 │
 └──────────────────────┬─────────────────────────────────────┘
                        │
                        ▼
@@ -194,13 +253,14 @@ k.export('flange.step', format='step')
 │  build123d + OpenCascade (OCC 7.9.3)                        │
 │  - 真实 BRep 几何                                            │
 │  - OCC boolean (union/cut/intersect)                       │
+│  - OCC BRepAlgoAPI_Common (collision v2.9)                 │
 │  - Fillet/Chamfer (BRepFilletAPI)                          │
 │  - Shell (BRepOffsetAPI_MakeThickSolid)                    │
 │  - STEP I/O (STEPControl_Writer/Reader)                    │
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 33 op 能力图谱（100% 真实）
+## 43 op 能力图谱（100% 真实）
 
 | 类别 | op | 状态 | 实现 | 备注 |
 |------|----|------|------|------|
@@ -232,8 +292,16 @@ k.export('flange.step', format='step')
 | | **add_polyline** | ✅ | **v2.1 剖面** | **多段线（闭合剖面，revolve/extrude）** |
 | | **add_arc** | ✅ | **v2.1 剖面** | **圆弧（采样折线进剖面，revolve/extrude）** |
 | | **assemble** | ✅ | **v2.1 装配** | **多 STEP 零件定位/旋转融合 → 整机 STEP** |
+| **v2.7 参考系** | **create_reference_plane** | ✅ | **正交化 + parent 链** | **5 op 全部真实** |
+| | **query_reference** | ✅ | | |
+| | **resolve_point** | ✅ | frame uv → world | |
+| | **resolve_placement** | ✅ | + 旋转 R @ base | |
+| | **validate_assembly** | ✅ | 8 kind: coaxial/aligned/parallel/perp/clearance/mounted/inside/gear_mesh | |
+| **v2.8 齿轮** | **gear_geometry / center_distance** | ✅ | **真实 ISO 6336 数学** | **梯形齿形 proxy** |
+| | **build_involute_gear** | ✅ | + bore subtract | |
+| **v2.9 碰撞** | **check_interference** | ✅ | **OCC BRepAlgoAPI_Common** | **kernel API + 3 free functions** |
 
-**真实 op：29/29 = 100%**（delete/update/rebuild 走参数化重放；revolve 支持 line/polyline/arc 剖面；assemble 装配）
+**真实 op：43/43 = 100%**（delete/update/rebuild 走参数化重放；revolve 支持 line/polyline/arc 剖面；assemble 装配；5 reference frame op；齿轮 + 碰撞检查）
 
 ## 版本演进
 
@@ -254,6 +322,10 @@ k.export('flange.step', format='step')
 | **+ v2.4** | **2026-08-29** | **二维约束、命名参数、SciPy 确定性诊断、graph/history 持久化** | **244** | **33** |
 | **+ v2.5** | **2026-08-29** | **OCC 优先双渲染后端、无头回退、实例级装配显示控制、分色/隐藏/高亮与场景 manifest** | **248+** | **36** |
 | **+ v2.6** | **2026-08-29** | **提交前几何验证、严格事务回滚、稳定 reason code、确定性几何指纹与 history 校验** | **253+** | **37** |
+| **+ v2.7** | **2026-08-30** | **参考坐标系框架: 5 新 op (create/query/resolve_point/resolve_placement/validate_assembly) + 23 tests** | **264+** | **42** |
+| **+ v2.8** | **2026-08-30** | **真实 ISO 6336 齿轮 (梯形齿形 proxy) + bore subtract + 10 tests** | **280+** | **42** |
+| **+ v2.9** | **2026-09-01** | **碰撞检查 (OCC BRepAlgoAPI_Common) + 11 tests + demo 14 v3.1 集成** | **291+** | **43** |
+| **+ v2.9.1** | **2026-09-01** | **专家审查修复 (P0/P1): coaxial 反向 + collision strict + 旋转 docstring + 死代码清理** | **291+** | **43** |
 
 ## 安装
 
@@ -311,7 +383,7 @@ sys.exit(exit_code)
 "
 ```
 
-## 12 个 Demo
+## 12+1 个 Demo
 
 | # | 文件 | 演示能力 |
 |---|------|----------|
@@ -327,36 +399,41 @@ sys.exit(exit_code)
 | 10 | `examples/10_boolean.py` | Boolean op（union/subtract/intersect） |
 | 11 | `examples/11_hole_mirror_pattern.py` | Hole + Mirror + Linear Pattern |
 | 12 | `examples/12_query_measure.py` | Query / Select / Measure |
+| **14** | **`examples/14_gearbox.py`** | **v2.7-v2.9 完整 pipeline: 5 reference frame + 4 真实齿轮 + 3 根轴 + housing + 装配验证 + 碰撞检查 + RPM 标注 + 减速比 3:1 (in-kernel build123d)** |
 
 ## 评估
 
-**DeepSeek 资深架构师评估**：4.5/10 → **6.0/10**（v1.15 后）
+**DeepSeek 资深架构师评估**：4.5/10 → **6.0/10**（v1.15 后）→ **6.5/10**（v2.9.1 自我评估）
 
-| 维度 | 评分 | 关键证据 |
-|---|---|---|
-| 生产就绪度 | 3.0 → 5.0 | 25 op 真实（**100%**） |
-| 复杂件覆盖 | 2.5 → 5.0 | boolean + hole + mirror + pattern + query 全部 0% 误差 |
-| AI 协作 | 5.5 | 端到端真实几何 |
-| 数据模型 | 4.0 → 5.5 | DAG + Savepoint + STEP 持久化 + query/select/measure |
-| 架构合理性 | 6.5 | 范式方向正确 |
+| 维度 | v1.15 | v2.9.1 | 关键证据 |
+|---|---|---|---|
+| 生产就绪度 | 3.0 | 5.5 | 43 op 真实（**100%**） + 真实碰撞 + 真实齿轮数学 |
+| 复杂件覆盖 | 2.5 | 5.5 | boolean + hole + mirror + pattern + query + reference frame + gear + collision |
+| AI 协作 | 5.5 | 6.0 | 端到端真实几何 + 5 类类型化错误 + capability schema |
+| 数据模型 | 4.0 | 6.0 | DAG + Savepoint + STEP 持久化 + reference frame + collision matrix |
+| 架构合理性 | 6.5 | 7.0 | 范式方向正确 + CapabilityRegistry 自动注册 + 事务原子性 |
 
-**距离工业生产 1.0**：~3-5 人月（之前 5-7）
+**距离工业生产 1.0**：~2-3 人月（之前 3-5）
 
-> 评估小结：37 op 全部真实实现；v2.6 增加提交前验证、严格回滚和几何指纹。OCC 原生离屏显示依赖图形驱动；无头 Windows 下使用带明确 fallback manifest 的 matplotlib。
-> 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模。
+> 评估小结：43 op 全部真实实现；v2.7 加 reference frame, v2.8 加 ISO 6336 齿轮, v2.9 加 OCC boolean 碰撞; v2.9.1 修专家审查 P0/P1. OCC 原生离屏显示依赖图形驱动；无头 Windows 下使用带明确 fallback manifest 的 matplotlib.
+> 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模.
+> 已知限制: 齿轮是梯形齿形 proxy (真 involute v2.10), collision O(N²) (AABB broad-phase v2.10).
 
 ## 关键文件
 
-- `mech_kernel/kernel.py` (~1200 行) — 主 API
+- `mech_kernel/kernel.py` (~4300 行) — 主 API
 - `mech_kernel/llm/deepseek.py` — DeepSeek Vision/Chat 客户端
 - `mech_kernel/llm/openai_compatible.py` — 通用 OpenAI-compatible Vision/Planner 客户端（密钥不入库）
-- `mech_kernel/capability_registry.py` — 37 op JSON Schema
+- `mech_kernel/capability_registry.py` — 43 op JSON Schema
 - `mech_kernel/feature_graph.py` — Feature DAG
-- `mech_kernel/transaction.py` — 事务 Savepoint
+- `mech_kernel/transaction.py` — 事务 Savepoint (含 snapshot+restore 原子性)
 - `mech_kernel/renderer.py` — OCC 优先、matplotlib 回退的专业证据渲染
 - `mech_kernel/occ_renderer.py` — OCC AIS/V3d 后端边界
-- `mech_kernel/assembly.py` — 实例级装配显示元数据
+- `mech_kernel/assembly.py` — 实例级装配显示元数据 (5 v2.7 mount 字段)
 - `mech_kernel/geometry_inspector.py` — 几何摘要、验证和指纹
+- `mech_kernel/reference_frames.py` (v2.7) — CoordinateFrame + FrameRegistry + resolve_point/placement
+- `mech_kernel/gear.py` (v2.8) — ISO 6336 几何参数 + 梯形齿形 proxy + build_involute_gear
+- `mech_kernel/collision.py` (v2.9) — check_pair/assembly/matrix_interference (OCC BRepAlgoAPI_Common)
 
 ## 许可
 
