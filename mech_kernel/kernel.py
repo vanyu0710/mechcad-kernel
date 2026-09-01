@@ -136,6 +136,8 @@ class MechKernel:
         self._frame_registry: FrameRegistry = FrameRegistry()  # v2.7: 参考坐标系
         self._topo_cache: TopologyCache = TopologyCache()  # v2.11: face/edge 引用缓存
         self._ids = IdGeneratorSet()  # v2.11: 实例私有 ID 生成器（多实例互不污染）
+        self._ref_birth_revision: Dict[str, int] = {}  # v2.11: ref → 诞生时几何 revision
+        self._pending_op_warning: Optional[str] = None  # v2.11: op 内部产生的附带警告
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_profile_fallback: Optional[str] = None  # v2.11: 真弧线剖面回退提示
         self._last_render_base64: Optional[str] = None
@@ -239,6 +241,8 @@ class MechKernel:
                 "name": FieldSchema(type="string", required=False),
                 "direction": FieldSchema(type="enum", required=False, default="Z", enum=["X", "Y", "Z"]),
                 "confirm_replace": FieldSchema(type="boolean", required=False, default=False),
+                "reverse": FieldSchema(type="boolean", required=False, default=False,
+                                       description="沿面法向反方向拉伸（面上草图切削进材料用）"),
             },
             permission="public",
         ))
@@ -502,6 +506,7 @@ class MechKernel:
         else:  # face — 面上草图
             if self._current_geometry is None:
                 raise InvalidRequestError("face 工作平面需要先有几何（先 extrude）")
+            self._check_refs_fresh([face_ref])
             try:
                 info = self._topo_cache.resolve(
                     self._geometry_revision, self._current_geometry, face_ref, "face")
@@ -931,7 +936,7 @@ class MechKernel:
     
     # ===== 主体 4（extrude 实现 + 其他 3 占位）=====
     
-    def extrude(self, sketch_name: str, depth: float, mode: str = "new_body", name: str = "", direction: str = "Z", confirm_replace: bool = False) -> StepResult:
+    def extrude(self, sketch_name: str, depth: float, mode: str = "new_body", name: str = "", direction: str = "Z", confirm_replace: bool = False, reverse: bool = False) -> StepResult:
         start = time.time()
         sketch_name = require_non_empty_str("sketch_name", sketch_name)
         require_positive("depth", depth)
@@ -957,7 +962,7 @@ class MechKernel:
             )
         
         with Transaction(self, "extrude") as txn:
-            entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name, confirm_replace=confirm_replace)
+            entry = self._record_history("extrude", sketch_name=sketch_name, depth=depth, mode=mode, direction=direction, name=name, confirm_replace=confirm_replace, reverse=reverse)
             feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
@@ -969,10 +974,10 @@ class MechKernel:
             self.feature_graph.add(feature)
             if mode == "new_body":
                 # v2.1: 真实 build123d（已装上，体积误差 < 0.01%）
-                self._current_geometry = self._extrude_build123d(sk, depth, direction=direction)
+                self._current_geometry = self._extrude_build123d(sk, depth, direction=direction, reverse=reverse)
             elif mode in ("cut", "add"):
                 # v1.2: 真实 boolean（在已有几何上 add/cut）
-                self._current_geometry = self._extrude_add_or_cut(sk, depth, mode, direction=direction)
+                self._current_geometry = self._extrude_add_or_cut(sk, depth, mode, direction=direction, reverse=reverse)
             self.narrative.append(f"拉伸 {sketch_name} 深度 {depth} → {feature.name}")
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
@@ -986,12 +991,15 @@ class MechKernel:
             renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
             render_png = renders.get("iso") or renders.get("default")
         self._step_counter += 1
+        warnings_ = [w for w in (self._take_profile_fallback_warning(),
+                                 self._pending_op_warning) if w]
+        self._pending_op_warning = None
         return self._wrap_step_result(make_success(
             feature_id=feature_id, narrative=f"拉伸 {sketch_name} 深度 {depth}",
             render_png=render_png, render_level=render_level,
             current_narrative=self.narrative.copy(),
             feature_graph_delta={"added": [feature_id]},
-            warning=self._take_profile_fallback_warning(),
+            warning="; ".join(warnings_) if warnings_ else None,
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
@@ -1090,7 +1098,7 @@ class MechKernel:
                     B3DPolyline(*profile, close=True)
                 profile_wires = bl.wires()
             with BuildPart(Plane.XY) as bp:
-                with BuildSketch() as s:
+                with BuildSketch(Plane.XY) as s:
                     if profile_wires is not None:
                         make_face(profile_wires)
                     else:
@@ -1208,7 +1216,7 @@ class MechKernel:
             for i in range(count):
                 angle_deg = i * angle / count
                 with BuildPart(Plane.XY) as bp:
-                    with BuildSketch() as s:
+                    with BuildSketch(self._sketch_plane(sk, "Z") or Plane.XY) as s:
                         for e in sk.entities:
                             if e.type == "circle":
                                 r = e.params["radius"]
@@ -1377,6 +1385,7 @@ class MechKernel:
         if not isinstance(edges, (list, tuple)) or not edges:
             raise InvalidRequestError(
                 "edges 需为 'all'、单个边引用 'E12' 或引用列表（来自 select element_type='edge'）")
+        self._check_refs_fresh(list(edges))
         try:
             infos = resolve_refs(self._topo_cache, self._geometry_revision,
                                  self._current_geometry, list(edges), "edge")
@@ -1723,6 +1732,7 @@ class MechKernel:
             # v2.11: 按引用选开口面（支持任意面，含曲面）
             if isinstance(face_refs, str):
                 face_refs = [face_refs]
+            self._check_refs_fresh(list(face_refs))
             try:
                 open_infos = resolve_refs(self._topo_cache, self._geometry_revision,
                                           self._current_geometry, list(face_refs), "face")
@@ -1873,7 +1883,7 @@ class MechKernel:
 
             # 复制 count 次：每次 entity center 偏移 i*spacing*direction
             with BuildPart(self._sketch_plane(sk, "Z") or Plane.XY) as bp:
-                with BuildSketch() as s:
+                with BuildSketch(self._sketch_plane(sk, "Z") or Plane.XY) as s:
                     for i in range(count):
                         off_x = i * spacing * ux
                         off_y = i * spacing * uy
@@ -1980,7 +1990,7 @@ class MechKernel:
             # axis="X" 镜像 → 翻转 X 坐标（cx=-c[0], cy=c[1]）
             # axis="Y" 镜像 → 翻转 Y 坐标（cx=c[0], cy=-c[1]）
             with BuildPart(self._sketch_plane(sk, "Z") or Plane.XY) as bp:
-                with BuildSketch() as s:
+                with BuildSketch(self._sketch_plane(sk, "Z") or Plane.XY) as s:
                     for e in sk.entities:
                         if e.type == "circle":
                             r = e.params["radius"]
@@ -2475,6 +2485,7 @@ class MechKernel:
                     f"filter_type 必须是 all/plane/cylinder/cone/sphere/torus（当前 {filter_type}）")
 
             infos = self._topo_cache.faces(self._geometry_revision, self._current_geometry)
+            self._record_ref_births([i.ref for i in infos])
             type_count = {"plane": 0, "cylinder": 0, "cone": 0, "sphere": 0, "torus": 0}
             all_faces = []
             for info in infos:
@@ -2501,6 +2512,7 @@ class MechKernel:
                     f"edge 模式 filter_type 必须是 all/{'/'.join(sorted(edge_types))}（当前 {filter_type}）")
 
             infos = self._topo_cache.edges(self._geometry_revision, self._current_geometry)
+            self._record_ref_births([i.ref for i in infos])
             type_count: dict = {}
             all_edges = []
             for info in infos:
@@ -3995,6 +4007,28 @@ class MechKernel:
             return None
         return B3DPlane(origin=tuple(wp.origin), x_dir=tuple(wp.x_dir), z_dir=tuple(wp.normal))
 
+    def _record_ref_births(self, refs: List[str]) -> None:
+        """v2.11: select 发放引用时记录其诞生 revision"""
+        for ref in refs:
+            self._ref_birth_revision[ref] = self._geometry_revision
+
+    def _check_refs_fresh(self, refs: List[str]) -> None:
+        """v2.11: 引用必须来自当前 revision（几何被修改后旧引用失效）。
+
+        重放时跳过（重放拓扑确定性重建，历史引用直接按序号解析）。
+        """
+        if self._replaying:
+            return
+        stale = [r for r in refs
+                 if self._ref_birth_revision.get(r) != self._geometry_revision]
+        if stale:
+            raise RecoverableError(
+                f"引用 {stale} 已失效（几何在 select 之后被修改）",
+                suggestion={"action": "重新 select 获取新的引用",
+                            "reason_code": "stale_topo_ref"},
+                reason_code="stale_topo_ref",
+            )
+
     def _take_profile_fallback_warning(self) -> Optional[str]:
         """v2.11: 取走真弧线剖面回退提示（一次性）"""
         w = self._last_profile_fallback
@@ -4017,7 +4051,7 @@ class MechKernel:
                 segments = self._collect_profile_segments(sketch)
                 profile_wires = self._profile_wire_from_segments(segments)
                 with BuildPart(plane) as bp:
-                    with BuildSketch() as s:
+                    with BuildSketch(plane) as s:
                         make_face(profile_wires)
                     extrude(amount=depth)
                 return bp.part
@@ -4031,13 +4065,13 @@ class MechKernel:
                 B3DPolyline(*profile, close=True)
             profile_wires = bl.wires()
             with BuildPart(plane) as bp:
-                with BuildSketch() as s:
+                with BuildSketch(plane) as s:
                     make_face(profile_wires)
                 extrude(amount=depth)
             return bp.part
 
         with BuildPart(plane) as bp:
-            with BuildSketch() as s:
+            with BuildSketch(plane) as s:
                 for e in sketch.entities:
                     if e.type == "circle":
                         r = e.params["radius"]
@@ -4079,6 +4113,7 @@ class MechKernel:
             self._last_render_step = -1
             self._ids.reset()
             self._ids.seed_from_history(self._op_history)
+            self._ref_birth_revision = {}
             parameter_overrides = {}
             for entry in self._op_history:
                 if entry.get("op") == "add_constraint":
@@ -4112,7 +4147,7 @@ class MechKernel:
             self.adaptive_renderer.suspended = was_suspended
             self._replaying = False
     
-    def _extrude_build123d(self, sketch, depth: float, mode: str = "new_body", direction: str = "Z"):
+    def _extrude_build123d(self, sketch, depth: float, mode: str = "new_body", direction: str = "Z", reverse: bool = False):
         """
         v2.1 + v1.2.1: 用真实 build123d 做 extrude（已装上）。
         direction: "X" | "Y" | "Z" - 拉伸方向
@@ -4127,7 +4162,8 @@ class MechKernel:
             
             if not sketch or not sketch.entities:
                 from .build123d_adapter import extrude_sketch
-                return extrude_sketch(sketch, depth)
+                return extrude_sketch(sketch, -depth if reverse else depth)
+            signed_depth = -depth if reverse else depth
             
             # v1.2.1: 方向 → plane；v2.11: 尊重 workplane 的真实放置
             plane = self._sketch_plane(sketch, direction) or \
@@ -4139,14 +4175,14 @@ class MechKernel:
                 r = e.params["radius"]
                 c = e.params.get("center", (0, 0))
                 with BuildPart(plane) as bp:
-                    with BuildSketch() as s:
+                    with BuildSketch(plane) as s:
                         if c == (0, 0) or c == [0, 0]:
                             add(B3DCircle(r))
                         else:
                             # Locations 上下文（add(Location*shape) 会产生幻影原点副本）
                             with Locations((c[0], c[1], 0)):
                                 B3DCircle(r)
-                    extrude(amount=depth)
+                    extrude(amount=signed_depth)
                 return bp.part
             
             # 单个矩形 → 立方体（v1.16 修复：支持 center 偏移）
@@ -4155,13 +4191,13 @@ class MechKernel:
                 w, h = e.params["width"], e.params["height"]
                 c = e.params.get("center", (0, 0))
                 with BuildPart(plane) as bp:
-                    with BuildSketch() as s:
+                    with BuildSketch(plane) as s:
                         if c == (0, 0) or c == [0, 0]:
                             add(B3DRect(w, h))
                         else:
                             with Locations((c[0], c[1], 0)):
                                 B3DRect(w, h)
-                    extrude(amount=depth)
+                    extrude(amount=signed_depth)
                 return bp.part
             
             # P0-V3 修复：环面（多 circle 同心）→ 真实 build123d boolean
@@ -4173,10 +4209,10 @@ class MechKernel:
                     if len(radii) >= 2:
                         # 一次性 extrude 多个 circle + 用 mode 切换
                         with BuildPart(plane) as bp:
-                            with BuildSketch() as s:
+                            with BuildSketch(plane) as s:
                                 add(B3DCircle(radii[0]))
-                            extrude(amount=depth)
-                            with BuildSketch() as s2:
+                            extrude(amount=signed_depth)
+                            with BuildSketch(plane) as s:
                                 add(B3DCircle(radii[1]))
                             from build123d import Mode
                             extrude(amount=depth, mode=Mode.SUBTRACT)
@@ -4191,9 +4227,9 @@ class MechKernel:
                     segments = self._collect_profile_segments(sketch)
                     profile_wires = self._profile_wire_from_segments(segments)
                     with BuildPart(plane) as bp:
-                        with BuildSketch() as s:
+                        with BuildSketch(plane) as s:
                             make_face(profile_wires)
-                        extrude(amount=depth)
+                        extrude(amount=signed_depth)
                     return bp.part
                 except (InvalidRequestError, RefStaleError, RefFormatError):
                     raise
@@ -4204,9 +4240,9 @@ class MechKernel:
                     B3DPolyline(*profile, close=True)
                 profile_wires = bl.wires()
                 with BuildPart(plane) as bp:
-                    with BuildSketch() as s:
+                    with BuildSketch(plane) as s:
                         make_face(profile_wires)
-                    extrude(amount=depth)
+                    extrude(amount=signed_depth)
                 return bp.part
 
             # 其他 → adapter
@@ -4220,7 +4256,7 @@ class MechKernel:
             from .build123d_adapter import extrude_sketch
             return extrude_sketch(sketch, depth)
     
-    def _extrude_add_or_cut(self, sketch, depth: float, mode: str, direction: str = "Z"):
+    def _extrude_add_or_cut(self, sketch, depth: float, mode: str, direction: str = "Z", reverse: bool = False):
         """
         v1.2: 在已有几何上 ADD 或 CUT 一个新草图。
         v1.2.1: 支持 direction 参数（X/Y/Z）。
@@ -4236,13 +4272,21 @@ class MechKernel:
             {"X": Plane.YZ, "Y": Plane.XZ, "Z": Plane.XY}.get(direction, Plane.XY)
         
         # 1. 单独把新 sketch 拉伸成 Part（v2.1: 统一助手，支持 circle/rect/polyline/arc）
-        new_solid = self._extrude_sketch_solid(sketch, depth, plane)
+        signed_depth = -depth if reverse else depth
+        new_solid = self._extrude_sketch_solid(sketch, signed_depth, plane)
         
         # 3. 走 boolean
         if mode == "add":
             return self._current_geometry + new_solid  # OCC fuse
         elif mode == "cut":
-            return self._current_geometry - new_solid  # OCC cut
+            vol_before = self._current_geometry.volume
+            result = self._current_geometry - new_solid  # OCC cut
+            try:
+                if abs(result.volume - vol_before) < max(1e-6, vol_before * 1e-9):
+                    self._pending_op_warning = "cut 未移除任何材料（拉伸方向可能背向材料，考虑 reverse=True）"
+            except Exception:
+                pass
+            return result
     
     
     def _push_undo(self, description: str = "") -> None:

@@ -117,8 +117,10 @@ def demo4_full():
     k.add_circle('top_hole', center=[0, 25], radius=3)
     k.close_sketch('top_hole')
     k.mirror('top_hole', axis='X', mode='cut')
-    # 全部圆角
-    k.fillet(1.5, edges='all')
+    # 外轮廓 4 条竖直边圆角 (v2.11: select 引用 → fillet 指定边)
+    sel = k.select(element_type='edge', filter_type='line')
+    v_refs = [e['ref'] for e in sel.value['selected'] if abs(e['length_mm'] - 10) < 1e-6]
+    k.fillet(1.5, edges=v_refs)
     render(k, "demo4_full", OUT / "04_full.png",
            "完整流程: 板 + counterbore + 4 hole + mirror + fillet")
 

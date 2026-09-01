@@ -1,19 +1,42 @@
 # MechKernel Handoff
 
-Updated: 2026-09-01
+Updated: 2026-09-01 (v2.11)
 
 ## Current Repository State
 
 - Repository: `https://github.com/vanyu0710/mechcad-kernel.git`
 - Branch: `main`
-- Latest stable commit: `fe356e7 v2.9.1: 修专家 + 自我审查发现的问题`
-- Current test result: **291/294 通过** (3 个 fixture-related 失败, 跟 v2.9 无关)
+- Latest stable commit: v2.11 (零件建模全流程)
+- Current test result: **329/329 通过** (302 旧 + 27 新 v2.11 测试)
+- 测试环境: 仓库根 `.venv` (Python 3.12 + build123d 0.11.1 + OCP 7.9.3), 无 fixture 依赖 mock runner
 - License: **AGPL-3.0-or-later** (since v2.5 commit `aa9e2b3`)
 - No API keys, `.env` files, VPN settings, or provider credentials are committed.
 
-## Implemented Features (v2.9.1)
+## Implemented Features (v2.11)
 
-### v2.9.1 (本次)
+### v2.11 (本次) — 零件建模全流程, 装配降级
+- **装配 10 op 标 experimental**: PUBLIC_OPS 43→33 + EXPERIMENTAL_OPS;
+  execute() 默认拒绝, `allow_experimental=True` 放行; capability permission=experimental;
+  LLM 默认能力集聚焦零件建模。代码冻结保留, 直调可用, demo 14 不受影响
+- **选边/选面闭环** (新模块 `topology_refs.py`):
+  - select 扩展 `element_type="edge"`, 返回项带 `ref` ("F03"/"E12") + 类型/长度或面积/中心/法向摘要
+  - 引用按 geometry revision 校验新鲜度; 过期 → RECOVERABLE(reason_code="stale_topo_ref")
+  - fillet/chamfer `edges` 接受 "all" | 引用列表; shell `face_refs` 任意开口面
+  - 面上草图: `create_workplane(face_ref=...)` 从选中平面派生坐标系 (曲面诚实拒绝)
+- **安全基线**:
+  - extrude/revolve/sweep `mode='new_body'` 已有几何时 RECOVERABLE + `confirm_replace=True` 逃生门
+    (此前静默清空整个零件 — LLM 驱动流程高频事故源)
+  - sweep 加 mode (new_body/add/cut) + rectangle 剖面, 消除已有几何静默丢弃
+  - linear_pattern/mirror/boolean 深度参数化 (硬编码 50 → 显式/自动推导零件 Z 尺寸+2mm + warning)
+- **草图强化**: custom workplane origin/axes 修复 (此前被丢弃) + offset 偏置;
+  extrude 全链路尊重 workplane 放置 (BuildSketch 必须显式传 plane 的 build123d 坑已修);
+  混合剖面真弧线 wire (ThreePointArc, 0 采样误差; 回退采样折线 + warning); revolve 拒绝非标准面草图
+- **hole 升级**: `direction` 任意面进入 (top/bottom/x+/x-/y+/y-); countersink 真 90° 锥面
+- **harness 接口**: RecoverableError 类型化异常 + suggestion `{action, fix, reason_code}`;
+  unknown field 附 valid_fields; cut 无切除警告; extrude `reverse` 参数 (面上草图切削进材料);
+  ID 生成器实例化 (多实例互不污染); orchestrator 重试合并 bug 修复; reference frame 持久化
+
+### v2.9.1
 - **专家审查修复** (DeepSeek gpt-5.4-mini 13 findings + 自我审查):
   - **P0** 修 `assemble()` `local_origin` 死代码 (`position or [...]` → `position`)
   - **P1** `coaxial` 校验允许反向 (齿轮啮合需要 `|dot| > 1-eps`); 加 `coaxial_aligned` 严格模式
@@ -118,6 +141,7 @@ mech_kernel/
 ├── build123d_adapter.py   (fallback)
 ├── _pytest_compat.py
 ├── collision.py           (v2.9, OCC BRepAlgoAPI_Common)
+├── topology_refs.py       (v2.11, face/edge 引用缓存 + 新鲜度校验)
 ├── reference_frames.py    (v2.7, CoordinateFrame + FrameRegistry)
 ├── assembly.py            (v2.5 + v2.7 mount 字段)
 ├── constraint_solver.py   (v2.4, SciPy)
@@ -138,37 +162,44 @@ mech_kernel/
     └── 14_gearbox.py      (v3.1: 完整 gearbox pipeline)
 ```
 
-## 43 Public Ops
+## Public Ops (v2.11: 33 公开 + 10 experimental)
+
+**公开 (默认 LLM 能力集, 33)**:
 
 | 类别 | op | 数量 |
 |------|-----|------|
-| 草图 | create_workplane, new_sketch, close_sketch, add_circle, add_rectangle, add_line | 6 |
-| 主体 | extrude, revolve, sweep, boolean (3 mode), direction (X/Y/Z) | 7 |
-| 细节 | fillet, chamfer, shell, hole | 4 |
-| pattern | circular_pattern, linear_pattern, mirror | 3 |
-| query | query, select, measure | 3 |
+| 草图 | create_workplane (custom/offset/face_ref), new_sketch, close_sketch, add_circle, add_rectangle, add_line | 6 |
+| 主体 | extrude (+reverse/confirm_replace), revolve, sweep (+mode), boolean | 4 |
+| 细节 | fillet (+边引用), chamfer (+边引用), shell (+face_refs), hole (+direction/真锥面) | 4 |
+| pattern | circular_pattern, linear_pattern (+depth), mirror (+depth) | 3 |
+| query | query, select (+element_type=edge/引用), measure | 3 |
 | I/O | export, import_step, save_project, load_project | 4 |
-| 事务 | undo, redo | 2 |
-| 装配 | assemble, query_assembly, set_instance_visibility, set_instance_color | 4 |
-| 编辑 | delete_feature, update_feature, rebuild | 3 |
+| 事务/编辑 | undo, redo, delete_feature, update_feature, rebuild | 5 |
 | 剖面 | add_polyline, add_arc | 2 |
-| 渲染 | render, validate_geometry | 2 |
-| **v2.7 参考系** | create_reference_plane, query_reference, resolve_point, resolve_placement, validate_assembly | **5** |
-| **v2.9 碰撞** | check_interference | **1** |
-| **合计** | | **43** |
+| 渲染/校验 | render, validate_geometry | 2 |
 
-## Next Development Target: v2.10
+**experimental (装配相关, 10)**: assemble, query_assembly, set_instance_visibility, set_instance_color,
+create_reference_plane, query_reference, resolve_point, resolve_placement, validate_assembly, check_interference
 
-按优先级 (从我自己的 self-review + 专家审查):
+## Next Development Target: v2.12+
 
-1. **真实 involute 曲线** (齿轮 v2.8 升级) — 用 build123d Curve/Edge 高级 API 替代梯形 proxy, 避开 `TopoDS::Face`. 4-6 小时.
-2. **AABB broad-phase** (collision v2.9 性能) — 加 spatial hash 剪枝, 100 parts 估从 30s → 5s. 1 周.
-3. **拆分 kernel.py** (4296 → 多个 <1000 行模块: kernel/{core, ops, renderer}.py). 1 周.
-4. **装配 mount 字段真用起来** (`mount_uv` / `mount_normal_offset` / `world_transform` 实现 placement, 删 v2.10 死代码). 2 周.
-5. **Planner 自修复闭环** (检测 StepResult.error_kind 自动重试). 2 周.
-6. **集成到 vanyu0710/aicad** (替换 freecad_executor.py). 1 周.
-7. **PUBLIC_OPS 跟 schema 自动派生** (避免 v2.x 末 drift). 1 小时.
-8. **renderer 缓存 rollback 时清** (P2-2, 1 行).
+方向已定: 装配冻结, 内核将集成到 AI CAD 软件 (类 harness 架构: LLM agent 循环 → 内核工具调用 → 结构化结果反馈 → 自修复)。
+
+零件建模剩余缺口 (按优先级):
+1. **特征级 pattern/mirror** (阵列已有 3D 特征而非重拉草图) + loft/rib/draft. 1-2 周.
+2. **sweep 真路径** (圆弧/样条 path + 多剖面形状). 3-5 天.
+3. **约束求解覆盖 arc/polyline** + tangent 约束. 3-5 天.
+4. **spline/ellipse/slot 草图实体**. 2-3 天.
+5. **AABB broad-phase** (collision 性能). 1 周.
+6. **拆分 kernel.py** (4400+ 行 → 多模块). 1 周.
+7. **螺纹孔 / 孔标注** (简化表示). 待定.
+
+harness 集成阶段 (v2.11 已铺路, 集成时做):
+- planner prompt 从 cap.list_public() 动态生成 (现硬编码 6 op 于 deepseek.py)
+- run_loop 逐步决策适配器 (现在 plan() 一次性批量 vs run_loop 逐步)
+- 事件/进度/取消机制 (execute() 目前同步黑盒)
+- 会话管理壳 (每会话一 kernel 实例 + RPC/队列)
+- ⚠️ AGPL-3.0 许可证: 闭源商业集成前需法律评估或双授权
 
 ## Self-Review Summary (v2.9.1)
 
@@ -187,13 +218,16 @@ mech_kernel/
 ## Verification Commands
 
 ```bash
-# 全测试 (291/294)
-PYTHONPATH=. python3 -c "
+# 全测试 (329/329) — 建议用仓库根 .venv
+PYTHONPATH=. ./.venv/Scripts/python.exe -c "
 import sys; sys.path.insert(0, '.')
 import mech_kernel._pytest_compat as mock
 sys.modules['pytest'] = mock
 sys.exit(mock.main(['mech_kernel/tests']))
 "
+
+# v2.11 新测试
+PYTHONPATH=. ./.venv/Scripts/python.exe mech_kernel/tests/test_v11_part_modeling.py
 
 # 跑 demo 14 (v3.1 in-kernel gearbox)
 PYTHONPATH=. python3 mech_kernel/examples/14_gearbox.py

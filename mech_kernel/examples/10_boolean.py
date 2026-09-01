@@ -55,7 +55,7 @@ def demo1_union():
     k.new_sketch('XY', 'b')
     k.add_rectangle('b', 30, 20, center=[10, 5])
     k.close_sketch('b')
-    k.boolean('a', ['b'], operation='union', name='two_boxes')
+    k.boolean('a', ['b'], operation='union', name='two_boxes', depth=50)
     render(k, "demo1_union", OUT / "01_union.png", "Boolean union: 40×30 + 30×20")
 
 
@@ -73,7 +73,7 @@ def demo2_subtract_multi():
     k.new_sketch('XY', 'h2')
     k.add_circle('h2', center=[20, 0], radius=5)
     k.close_sketch('h2')
-    k.boolean('plate', ['h1', 'h2'], operation='subtract', name='two_holes')
+    k.boolean('plate', ['h1', 'h2'], operation='subtract', name='two_holes', depth=50)
     render(k, "demo2_subtract_multi", OUT / "02_subtract_multi.png",
            "Boolean subtract (multi-tool): 80×50 - 2×Ø10 孔")
 
@@ -89,7 +89,7 @@ def demo3_intersect():
     k.new_sketch('XY', 'cyl')
     k.add_circle('cyl', center=[0, 0], radius=10)
     k.close_sketch('cyl')
-    k.boolean('box', ['cyl'], operation='intersect', name='cyl_in_box')
+    k.boolean('box', ['cyl'], operation='intersect', name='cyl_in_box', depth=50)
     render(k, "demo3_intersect", OUT / "03_intersect.png",
            "Boolean intersect: 60×40 ∩ Ø20 (理论 圆柱)")
 
@@ -105,7 +105,7 @@ def demo4_l_shape():
     k.new_sketch('XY', 'upright')
     k.add_rectangle('upright', 10, 60, center=[-35, 35])
     k.close_sketch('upright')
-    k.boolean('base', ['upright'], operation='union', name='L_bracket')
+    k.boolean('base', ['upright'], operation='union', name='L_bracket', depth=50)
     # 加圆角
     k.fillet(2.0, edges='all')
     render(k, "demo4_l_shape", OUT / "04_L_union_fillet.png",

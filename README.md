@@ -2,30 +2,41 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-291%2F294%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-329%2F329%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.9.1](https://img.shields.io/badge/version-v2.9.1-blue)]()
+[![v2.11](https://img.shields.io/badge/version-v2.11-blue)]()
 
 ## 概述
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
-**核心能力 (v2.9.1)**：
-- **43/43 op 全部真实实现**（100%）— 覆盖所有 capability registry op
-- 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean）
-- Capability Registry (43 op JSON Schema) — LLM 知道"能做什么"
-- 5 类类型化错误 + 事务 Savepoint + 撤销/重做
-- **v2.7** 参考坐标系 (5 op) + 装配语义化验证
-- **v2.8** 真实 ISO 6336 齿轮 (梯形齿形 proxy)
-- **v2.9** OCC boolean 碰撞检查 (11 测试)
-- **v2.9.1** 专家审查修复 (P0/P1)
-- 6 种几何属性查询 + 按类型选面 + 3 种度量
-- OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
+**核心能力 (v2.11)**：
+- **33 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线
+- 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean / 真弧线剖面）
+- **v2.11 选边/选面闭环**: select 返回可回喂引用 (F03/E12) → fillet/chamfer 指定边 / shell 指定开口面 / 面上草图
+- **v2.11 安全基线**: new_body 防护（不再静默清空零件）+ 结构化自修复建议 ({fix: {...}}) + cut 无切除警告
+- **v2.11 草图强化**: custom/offset workplane 真实生效 + 面上草图 + 混合剖面真弧线（0 采样误差）
+- **v2.11 hole 升级**: 任意面进入 (top/bottom/x±/y±) + countersink 真 90° 锥面
+- Capability Registry (JSON Schema + few-shot) — LLM 知道"能做什么"
+- 5 类类型化错误 + RecoverableError + 事务 Savepoint + 撤销/重做
+- 实例私有 ID 生成器 — 多 kernel 实例同进程互不污染（harness 多会话就绪）
 - 二维约束、命名参数、确定性重放、持久化与多视角证据
+- OpenAI-compatible Vision + Chat Planner 端到端集成（DeepSeek 兼容保留）
 
-## v2.9.1 专家审查修复 (本次)
+## v2.11 零件建模全流程 (本次)
+
+装配体功能降级（标记 experimental，代码冻结保留），聚焦零件建模主线：
+
+- **选边/选面闭环**（新模块 `topology_refs.py`）: `select(element_type="edge")` 返回带几何摘要的可回喂引用 → `fillet(radius, edges=['E12','E15'])` / `chamfer` / `shell(face_refs=['F03'])` / `create_workplane(face_ref='F03')`（面上草图）。引用按几何 revision 校验新鲜度，过期引用返回 RECOVERABLE("re_select")。
+- **安全基线**: `extrude/revolve/sweep mode='new_body'` 在已有几何时改为 RECOVERABLE + `confirm_replace=True` 逃生门（此前静默清空整个零件）；sweep 增加 mode (new_body/add/cut) 并支持 rectangle 剖面；linear_pattern/mirror/boolean 深度参数化（去掉硬编码 50，缺省取零件 Z 尺寸+2mm 并附 warning）。
+- **草图强化**: `create_workplane(type='custom', origin, normal)` 参数真实生效（修复丢弃 bug）；基准面 `offset` 偏置；混合轮廓 (line+arc) 走 build123d 真弧线 wire（半圆盘体积 0 误差，此前 5° 采样折线 ~0.13% 误差），失败自动回退采样并附 warning。
+- **hole 升级**: `direction` 支持从任意面进入 (top/bottom/x+/x-/y+/y-)；countersink 真 90° 锥面（此前是直壁假沉头）。
+- **harness 接口准备**: ID 生成器实例化（多 MechKernel 实例同进程互不污染）；RecoverableError 类型化异常 + suggestion 统一 `{action, fix: {param: value}, reason_code}`（LLM 可直接改参重试）；unknown field 错误附 valid_fields；cut 无切除时警告；修复 orchestrator 重试合并 bug；reference frame 入快照/存档。
+- **装配 10 op 标记 experimental**: `PUBLIC_OPS` 43→33 + `EXPERIMENTAL_OPS`；execute() 默认拒绝、`allow_experimental=True` 放行；LLM 默认能力集不再包含装配 op。
+
+## v2.9.1 专家审查修复
 
 基于 DeepSeek gpt-5.4-mini 专家审查 + 自我审查 (13 findings: 1 P0 + 6 P1 + 6 P2)，已修：
 
@@ -260,7 +271,7 @@ k.export('flange.step', format='step')
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 43 op 能力图谱（100% 真实）
+## Op 能力图谱（100% 真实; v2.11 起 33 公开 + 10 experimental）
 
 | 类别 | op | 状态 | 实现 | 备注 |
 |------|----|------|------|------|
@@ -301,7 +312,17 @@ k.export('flange.step', format='step')
 | | **build_involute_gear** | ✅ | + bore subtract | |
 | **v2.9 碰撞** | **check_interference** | ✅ | **OCC BRepAlgoAPI_Common** | **kernel API + 3 free functions** |
 
-**真实 op：43/43 = 100%**（delete/update/rebuild 走参数化重放；revolve 支持 line/polyline/arc 剖面；assemble 装配；5 reference frame op；齿轮 + 碰撞检查）
+**真实 op：43/43 = 100%**（delete/update/rebuild 走参数化重放；revolve 支持 line/polyline/arc 真弧线剖面；5 reference frame op + 碰撞检查属 experimental，`allow_experimental=True` 或直调可用）
+
+**v2.11 闭环用法**:
+```python
+r = k.select(element_type="edge", filter_type="line")     # 返回 [{'ref': 'E12', ...}]
+k.fillet(2.0, edges=['E00', 'E03'])                        # 指定边圆角
+r = k.select(filter_type="plane")                          # 返回 [{'ref': 'F03', ...}]
+k.create_workplane("on_face", face_ref="F03")              # 面上草图
+k.new_sketch("on_face", "pocket"); k.add_circle("pocket", (0, 0), 4); k.close_sketch("pocket")
+k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
+```
 
 ## 版本演进
 
@@ -326,6 +347,8 @@ k.export('flange.step', format='step')
 | **+ v2.8** | **2026-08-30** | **真实 ISO 6336 齿轮 (梯形齿形 proxy) + bore subtract + 10 tests** | **280+** | **42** |
 | **+ v2.9** | **2026-09-01** | **碰撞检查 (OCC BRepAlgoAPI_Common) + 11 tests + demo 14 v3.1 集成** | **291+** | **43** |
 | **+ v2.9.1** | **2026-09-01** | **专家审查修复 (P0/P1): coaxial 反向 + collision strict + 旋转 docstring + 死代码清理** | **291+** | **43** |
+| **+ v2.10** | **2026-09-01** | **真 involute 齿轮曲线 + 13 测试 (z≤30 involute, 大齿数梯形 fallback)** | **302** | **43** |
+| **+ v2.11** | **2026-09-01** | **零件建模全流程: 选边/选面闭环 + new_body 防护 + 真弧线剖面 + 面上草图 + hole 任意面 + harness 接口; 装配 10 op 标 experimental** | **329** | **33+10** |
 
 ## 安装
 
@@ -399,6 +422,7 @@ sys.exit(exit_code)
 | 10 | `examples/10_boolean.py` | Boolean op（union/subtract/intersect） |
 | 11 | `examples/11_hole_mirror_pattern.py` | Hole + Mirror + Linear Pattern |
 | 12 | `examples/12_query_measure.py` | Query / Select / Measure |
+| 13 | `examples/13_rocket_motor.py` | 固体火箭发动机 (case/nozzle/closure) |
 | **14** | **`examples/14_gearbox.py`** | **v2.7-v2.9 完整 pipeline: 5 reference frame + 4 真实齿轮 + 3 根轴 + housing + 装配验证 + 碰撞检查 + RPM 标注 + 减速比 3:1 (in-kernel build123d)** |
 
 ## 评估
@@ -417,7 +441,8 @@ sys.exit(exit_code)
 
 > 评估小结：43 op 全部真实实现；v2.7 加 reference frame, v2.8 加 ISO 6336 齿轮, v2.9 加 OCC boolean 碰撞; v2.9.1 修专家审查 P0/P1. OCC 原生离屏显示依赖图形驱动；无头 Windows 下使用带明确 fallback manifest 的 matplotlib.
 > 说明：导入/加载（STEP）会话暂不支持重放（delete/update/rebuild 返回 RECOVERABLE）；重放仅适用于会话内建模.
-> 已知限制: 齿轮是梯形齿形 proxy (真 involute v2.10), collision O(N²) (AABB broad-phase v2.10).
+> 已知限制: 大齿数 (z>30) 齿轮走梯形 fallback；collision O(N²) (AABB broad-phase 待做)；revolve 暂只支持标准基准面草图；sweep 仅直线 path；特征级 pattern/loft/rib/draft 未做（见 HANDOFF 路线图）。
+> 装配说明: 装配相关 10 op (assemble/参考系/碰撞) 自 v2.11 标记 experimental——代码保留、直调可用，execute() 需 allow_experimental=True。装配体验仍差，等装配重写后回归默认能力集。
 
 ## 关键文件
 
@@ -434,6 +459,7 @@ sys.exit(exit_code)
 - `mech_kernel/reference_frames.py` (v2.7) — CoordinateFrame + FrameRegistry + resolve_point/placement
 - `mech_kernel/gear.py` (v2.8) — ISO 6336 几何参数 + 梯形齿形 proxy + build_involute_gear
 - `mech_kernel/collision.py` (v2.9) — check_pair/assembly/matrix_interference (OCC BRepAlgoAPI_Common)
+- `mech_kernel/topology_refs.py` (v2.11) — face/edge 引用缓存 (按 revision), select→fillet/shell/面上草图 闭环
 
 ## 许可
 
