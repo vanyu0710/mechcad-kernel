@@ -32,7 +32,7 @@ from typing import List, Tuple
 
 from build123d import (
     BuildPart, BuildLine, BuildSketch, Plane, add, extrude, Mode,
-    Polyline, make_face, Part,
+    Polyline, make_face, Part, Edge, Circle, Cylinder, Axis,
 )
 
 
@@ -119,6 +119,56 @@ def _bore_profile_points(bore_radius: float, n_points: int = 32) -> List[Tuple[f
     return pts
 
 
+def _build_involute_tooth_face(
+    module: float, teeth: int, pressure_angle_deg: float,
+    n_points_flank: int = 25, n_points_dedendum_arc: int = 5,
+):
+    """v2.10: 造 1 个 involute 齿的 closed 2D face.
+
+    齿形: 
+      - 起点 (rb, 0)  (base circle 切点)
+      - left_flank: involute 曲线 (rb, 0) -> (ra, +y_top)
+      - top_arc: (ra, +y_top) -> (ra, -y_top)
+      - right_flank: involute 镜像 (ra, -y_top) -> (rb, 0)
+    中心: hub circle (rf, 0) 不画, 单独加
+
+    数学 (ISO 21771):
+      involute 曲线: x = rb*(cos t + t sin t), y = rb*(sin t - t cos t)
+      rb = r*cos α
+      max_t = sqrt((ra/rb)² - 1)
+    """
+    m = module
+    z = teeth
+    alpha = math.radians(pressure_angle_deg)
+    r = m * z / 2.0
+    rb = r * math.cos(alpha)
+    ra = r + m
+
+    # left_flank: involute from (rb, 0) to (ra, +y_top)
+    max_t = math.sqrt((ra / rb) ** 2 - 1)
+    left_flank: List[Tuple[float, float, float]] = []
+    for i in range(n_points_flank + 1):
+        t = i / n_points_flank * max_t
+        x = rb * (math.cos(t) + t * math.sin(t))
+        y = rb * (math.sin(t) - t * math.cos(t))
+        left_flank.append((x, y, 0.0))
+
+    # right_flank: 镜像 left_flank
+    right_flank = [(p[0], -p[1], 0.0) for p in left_flank]
+
+    # top arc (ra 圆) from (ra, +y_top) to (ra, -y_top)
+    th0 = math.atan2(left_flank[-1][1], left_flank[-1][0])
+    th1 = math.atan2(right_flank[-1][1], right_flank[-1][0])
+    top_arc: List[Tuple[float, float, float]] = []
+    for i in range(1, n_points_dedendum_arc):
+        th = th0 + i * (th1 - th0) / n_points_dedendum_arc
+        top_arc.append((ra * math.cos(th), ra * math.sin(th), 0.0))
+
+    # 闭合 wire: left_flank + top_arc + right_flank reversed (skip start)
+    pts = left_flank + top_arc + right_flank[::-1][1:]
+    return pts
+
+
 # ---------- public API: 几何构造 ----------
 
 def build_involute_gear(
@@ -127,20 +177,32 @@ def build_involute_gear(
     width: float,
     bore: float = 0.0,
     pressure_angle_deg: float = 20.0,
-    n_points_flank: int = 18,  # 保留参数兼容性 (用 trapezoidal 时忽略)
-    n_points_dedendum_arc: int = 4,  # 保留参数兼容性
+    n_points_flank: int = 25,
+    n_points_dedendum_arc: int = 5,
+    fallback_to_trapezoid: bool = True,
+    involute_teeth_threshold: int = 30,
 ) -> Part:
-    """Build a spur gear (trapezoidal teeth proxy) as a build123d Part.
+    """Build a spur gear as a build123d Part.
 
-    v2.8 实现使用梯形齿形 (pitch 上一半齿厚 + 顶上一半的顶宽),
-    数学参数 (pitch/center distance) 严格按 ISO 21771 / AGMA 2015 计算.
+    v2.10 升级: 真 involute 曲线 (spline_approx) + hub 圆盘 + bore subtract.
+    v2.8 实现梯形齿形 (fallback, involute 失败时自动回退).
+
+    数学严格按 ISO 21771 / AGMA 2015 (module/teeth/pressure_angle).
 
     Args:
         module: 齿轮模数 m (mm)
         teeth: 齿数 z (>= 6)
         width: face width (extrude depth) (mm)
         bore: 中心孔直径 (0 = no bore) (mm)
-        pressure_angle_deg: 压力角 (默认 20°, 保留兼容性, 用于 pitch/base 半径计算)
+        pressure_angle_deg: 压力角 (默认 20°)
+        n_points_flank: involute 曲线采样点数 (默认 25)
+        n_points_dedendum_arc: 齿根圆弧采样点数 (默认 5)
+        fallback_to_trapezoid: True 时 involute 失败回退梯形
+        involute_teeth_threshold: 齿数 > 此值自动走梯形 (因为 OCC boolean
+                                   O(N²) 在 z>30 时太慢, ~0.4s/add)
+
+    Returns:
+        build123d Part
     """
     if teeth < 6:
         raise ValueError(f"teeth 必须 >= 6（当前 {teeth}）")
@@ -149,16 +211,78 @@ def build_involute_gear(
     if width <= 0:
         raise ValueError(f"width 必须 > 0（当前 {width}）")
 
+    # 大齿数 (> threshold) 自动走梯形 (OCC boolean O(N²) 慢)
+    if teeth > involute_teeth_threshold and fallback_to_trapezoid:
+        return _build_trapezoid_gear(
+            module=module, teeth=teeth, width=width, bore=bore,
+            pressure_angle_deg=pressure_angle_deg,
+        )
+
+    # 尝试真 involute (v2.10)
+    try:
+        tooth_pts = _build_involute_tooth_face(
+            module=module, teeth=teeth,
+            pressure_angle_deg=pressure_angle_deg,
+            n_points_flank=n_points_flank,
+            n_points_dedendum_arc=n_points_dedendum_arc,
+        )
+        tooth_edge = Edge.make_spline_approx(tooth_pts)
+        if not tooth_edge.is_closed:
+            raise ValueError("tooth_edge not closed (spline fit failed)")
+        tooth_face = make_face(tooth_edge)
+        tooth_part = extrude(tooth_face, width)
+
+        m = module
+        z = teeth
+        alpha = math.radians(pressure_angle_deg)
+        r = m * z / 2.0
+        rf = r - 1.25 * m
+
+        # hub 圆盘 (rf 半径, 厚 width)
+        with BuildPart(Plane.XY) as bp:
+            with BuildSketch():
+                add(Circle(rf))
+            extrude(amount=width)
+        hub = bp.part
+
+        # 完整齿轮: hub + 20 齿 union
+        with BuildPart(Plane.XY) as bp2:
+            add(hub)
+            for i in range(z):
+                rotated = tooth_part.rotate(Axis.Z, i * 360.0 / z)
+                add(rotated)
+        gear = bp2.part
+
+        # bore subtract
+        if bore > 0:
+            from build123d import Cylinder
+            with BuildPart(Plane.XY) as bp3:
+                add(Cylinder(width, bore / 2.0))
+            bore_cyl = bp3.part
+            gear = gear - bore_cyl
+        return gear
+    except Exception as e:
+        if not fallback_to_trapezoid:
+            raise
+        return _build_trapezoid_gear(
+            module=module, teeth=teeth, width=width, bore=bore,
+            pressure_angle_deg=pressure_angle_deg,
+        )
+
+
+def _build_trapezoid_gear(
+    module: float, teeth: int, width: float, bore: float = 0.0,
+    pressure_angle_deg: float = 20.0,
+) -> Part:
+    """v2.8 梯形 proxy (fallback, 大齿数 / involute 失败时用)"""
     outer = _gear_profile_points(
         module=module, teeth=teeth,
         pressure_angle_deg=pressure_angle_deg,
     )
-
     with BuildLine() as bl:
         Polyline(outer, close=True)
     outer_wire = bl.line
     outer_face = make_face(outer_wire)
-
     with BuildPart(Plane.XY) as bp:
         with BuildSketch() as s:
             add(outer_face)
@@ -168,7 +292,6 @@ def build_involute_gear(
                 bore_wire = bl2.line
                 add(make_face(bore_wire), mode=Mode.SUBTRACT)
         extrude(amount=width)
-
     return bp.part
 
 

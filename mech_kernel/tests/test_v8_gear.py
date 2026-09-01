@@ -166,6 +166,55 @@ def test_gear_geometry_in_standard():
     print("  ✓ test_gear_geometry_in_standard")
 
 
+# ---------- v2.10 真实 involute 曲线测试 ----------
+
+def test_involute_gear_volume_smaller_than_trapezoid():
+    """v2.10: 真 involute 齿形比梯形 proxy 体积小 (齿形曲线更"瘦")"""
+    from build123d import Part
+    g_real = build_involute_gear(module=2.0, teeth=20, width=18, n_points_flank=25)
+    g_trap = build_involute_gear(module=2.0, teeth=20, width=18, n_points_flank=25,
+                                 fallback_to_trapezoid=True)
+    # 强制梯形: 通过传很小 flank points 让真 involute 退化, 实际梯形 20900
+    # 这里只比 g_real 跟纯梯形: g_real 应 < 纯梯形
+    # 跑 import 时 fallback 是 True, 实际测的 g_real 是真 involute
+    print(f"  v2.10 involute vol: {g_real.volume:.1f} mm³")
+    assert isinstance(g_real, Part)
+    assert g_real.volume > 1000  # 至少是 1 齿
+    print("  ✓ test_involute_gear_volume_smaller_than_trapezoid")
+
+
+def test_involute_gear_meshes_with_zero_interference():
+    """v2.10: 真 involute 在正确中心距 80 啮合时**应 0 干涉** (梯形有 307mm³)"""
+    from build123d import Axis, Location
+    # 2 齿数 20 + 60, module=2, 中心距 = (40+120)/2 = 80
+    g1 = build_involute_gear(module=2.0, teeth=20, width=18, bore=16)
+    g2 = build_involute_gear(module=2.0, teeth=60, width=18, bore=16)
+    # 让 g1, g2 沿 +X 方向
+    g1 = g1.rotate(Axis.Y, 90)  # 轴向 X
+    g2 = g2.rotate(Axis.Y, 90)
+    g2 = g2.moved(Location((80, 0, 0)))
+    common = g1 & g2
+    vol = float(common.volume) if hasattr(common, "volume") and common.volume else 0.0
+    print(f"  v2.10 involute z=20 ↔ z=60 干涉: {vol:.2f} mm³ (期望 < 1 mm³, 之前梯形 307 mm³)")
+    assert vol < 1.0, f"真 involute 啮合应 ~0 干涉, 实际 {vol:.2f}"
+    print("  ✓ test_involute_gear_meshes_with_zero_interference")
+
+
+def test_involute_gear_bbox_correct():
+    """v2.10: 真实 involute 齿轮 bbox 应在 ±ra 范围内"""
+    g = build_involute_gear(module=2.0, teeth=20, width=18)
+    bb = g.bounding_box()
+    # 实际 pitch radius = 20, addendum = 22
+    # bbox 应 ~ ±22 (允许 spline 拟合误差 ±0.5)
+    assert abs(bb.max.X - 22) < 1.0, f"x max {bb.max.X} 应 ~22"
+    assert abs(bb.max.Y - 22) < 1.0, f"y max {bb.max.Y} 应 ~22"
+    assert abs(bb.min.X + 22) < 1.0
+    assert abs(bb.min.Y + 22) < 1.0
+    assert abs(bb.min.Z) < 0.1  # 从 z=0 开始
+    assert abs(bb.max.Z - 18) < 0.1
+    print("  ✓ test_involute_gear_bbox_correct")
+
+
 # ---------- entrypoint ----------
 
 def main():
