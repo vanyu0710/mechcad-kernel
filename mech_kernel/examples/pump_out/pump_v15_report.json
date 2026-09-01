@@ -1,0 +1,79 @@
+{
+  "version": "v15",
+  "kernel": {
+    "public_ops_count": 43,
+    "frames": [
+      "world",
+      "housing_center",
+      "input_shaft_axis",
+      "output_shaft_axis",
+      "gear_mesh_plane"
+    ]
+  },
+  "design": {
+    "housing": {
+      "length": 200,
+      "width": 140,
+      "height": 130,
+      "wall": 8,
+      "fillet": 3
+    },
+    "shaft_input": {
+      "diameter": 30,
+      "length": 250
+    },
+    "shaft_output": {
+      "diameter": 30,
+      "length": 250
+    },
+    "gear": {
+      "module": 2.5,
+      "z_input": 24,
+      "z_output": 36,
+      "width": 25,
+      "bore_input": 30,
+      "bore_output": 30,
+      "pressure_angle_deg": 20.0,
+      "face_width": 25
+    },
+    "center_distance": 75.0,
+    "oil_port": {
+      "diameter": 20,
+      "count": 2,
+      "spacing": 60
+    },
+    "mount_hole": {
+      "diameter": 12,
+      "count": 4,
+      "corner_offset": 15
+    },
+    "cover_bolt": {
+      "diameter": 8,
+      "count": 6,
+      "circle_diameter": 110
+    }
+  },
+  "ops_used": [
+    "create_workplane / new_sketch / add_circle / add_rectangle / add_line / close_sketch",
+    "extrude (new_body/cut) / fillet / chamfer / hole (counterbore) / shell (replaced by extrude cut)",
+    "linear_pattern (4 mount) / circular_pattern (6 bolt) / mirror (oil right)",
+    "query (bbox/volume/face_count) / set_parameter / validate_geometry",
+    "create_reference_plane (5) / validate_assembly (8 kind)",
+    "build_involute_gear (z=24, z=36) / center_distance",
+    "check_assembly_interference (5 parts, 10 pairs)",
+    "render (4 views) / export (STEP)"
+  ],
+  "validation": {
+    "ok": true,
+    "level": "standard",
+    "checked": 13,
+    "issue_count": 0,
+    "issues": []
+  },
+  "collision": {
+    "total_pairs": 10,
+    "interfering_count": 5,
+    "max_interference_volume": 24037.88260900719
+  },
+  "assembly_volume_mm3": 1060961.113772915
+}
