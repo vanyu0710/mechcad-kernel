@@ -269,10 +269,8 @@ def check_collisions(parts_with_names: list) -> dict:
 # ============================================================================
 
 def render_and_export(k: MechKernel, assembly: Part):
-    """v2.0 export + 4 视角渲染 + 报告 (render 用 build123d 直接, 避开 MechKernel 内存问题)"""
+    """v2.0 export + 报告 (用 build123d.export_step)"""
     print("\n[render + export]")
-    # 渲染 (用 build123d export STL + 自带 matplotlib render, 不走 MechKernel.render)
-    # 简化: 只 export STEP, 跳过 PNG render (避免 OOM)
     try:
         from build123d import export_step
         step_path = OUT / "hydraulic_pump_v15.step"
@@ -280,42 +278,6 @@ def render_and_export(k: MechKernel, assembly: Part):
         print(f"  STEP: {step_path.name} ({step_path.stat().st_size} bytes)")
     except Exception as e:
         print(f"  ⚠ STEP 导出失败: {e}")
-
-    # 简单 PNG: 用 matplotlib 画 bbox
-    try:
-        import matplotlib.pyplot as plt
-        bb = assembly.bounding_box()
-        fig, ax = plt.subplots(figsize=(8, 6))
-        # 画 bbox box
-        from matplotlib.patches import Rectangle
-        rect = Rectangle((bb.min.X, bb.min.Y), bb.max.X - bb.min.X, bb.max.Y - bb.min.Y,
-                         linewidth=2, edgecolor='navy', facecolor='lightblue', alpha=0.5)
-        ax.add_patch(rect)
-        # 标中心距
-        ax.annotate(f'housing\n{HOUSING["length"]}×{HOUSING["width"]}×{HOUSING["height"]} mm',
-                    xy=(0, 0), xytext=(10, 30), fontsize=10, weight='bold')
-        ax.annotate(f'gear_input (z={GEAR_PARAMS["z_input"]})',
-                    xy=(0, 0), xytext=(-30, 60), fontsize=9, color='darkgreen')
-        ax.annotate(f'gear_output (z={GEAR_PARAMS["z_output"]})',
-                    xy=(0, CENTER_DISTANCE), xytext=(30, 60), fontsize=9, color='darkorange')
-        ax.annotate(f'center distance = {CENTER_DISTANCE} mm',
-                    xy=((bb.min.X + bb.max.X) / 2, bb.min.Y - 20),
-                    ha='center', fontsize=12, weight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', edgecolor='navy'))
-        ax.set_xlim(bb.min.X - 20, bb.max.X + 20)
-        ax.set_ylim(bb.min.Y - 20, bb.max.Y + 20)
-        ax.set_aspect('equal')
-        ax.set_title(f'2-Stage Hydraulic Gear Pump\nm={GEAR_PARAMS["module"]} z={GEAR_PARAMS["z_input"]}/{GEAR_PARAMS["z_output"]} cd={CENTER_DISTANCE}mm',
-                     fontsize=12, weight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel('X (mm)')
-        ax.set_ylabel('Y (mm)')
-        plt.tight_layout()
-        plt.savefig(OUT / "pump_v15_top_view.png", dpi=110, bbox_inches='tight', facecolor='white')
-        plt.close()
-        print(f"  saved: pump_v15_top_view.png")
-    except Exception as e:
-        print(f"  ⚠ PNG 失败: {e}")
 
 
 def main():
@@ -373,6 +335,36 @@ def main():
 
     # 8. 渲染 + 导出
     render_and_export(k, assembly)
+
+    # 8.5. 3D 渲染 (4 视角, 避开 OOM 用 gc 释放)
+    print("\n[3D render] 4 视角 (iso/top/side/front) 用 build123d tessellate + matplotlib 3D")
+    import gc
+    from render_3d import render_part_3d
+    parts_for_render = {
+        "housing": housing,
+        "gear_input": g_in_at,
+        "gear_output": g_out_at,
+        "shaft_input": s_in_at,
+        "shaft_output": s_out_at,
+    }
+    for view_name, elev, azim in [
+        ("iso", 25, -60),
+        ("top", 89, -30),    # 俯视 (Z 朝上)
+        ("side", 0, -90),    # Y 朝前
+        ("front", 0, 0),     # X 朝前
+    ]:
+        out_png = OUT / f"pump_v15_3d_{view_name}.png"
+        ok = render_part_3d(
+            parts_for_render,
+            str(out_png),
+            title=f"Hydraulic Gear Pump (m=2.5, z=24/36, cd=75mm) — {view_name}",
+            elevation=elev, azimuth=azim,
+        )
+        if ok:
+            print(f"  saved: {out_png.name} ({out_png.stat().st_size} bytes)")
+        else:
+            print(f"  ⚠ {view_name} render 失败")
+        gc.collect()  # 释放 matplotlib 内存, 避免 OOM
 
     # 9. 报告
     report = {
