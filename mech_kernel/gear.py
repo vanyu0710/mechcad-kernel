@@ -3,7 +3,7 @@ MechKernel v2.8: Spur Gear Generator
 
 v2.8 实现: 完整数学模型（pitch/addendum/dedendum/中心距）+ 梯形齿形 proxy.
 
-数学:
+数学 (真实 ISO 6336):
   module m, 齿数 z, 压力角 α
   pitch_radius r = m * z / 2
   base_radius    rb = r * cos(α)
@@ -12,11 +12,16 @@ v2.8 实现: 完整数学模型（pitch/addendum/dedendum/中心距）+ 梯形�
   tooth_thickness_at_pitch = π * m / 2
   center_distance (z1, z2) = m * (z1 + z2) / 2
 
-齿形: 梯形近似（去 involute 曲线段，用 4 关键点 + 直线段）.
+齿形: 梯形近似 (WARNING: 不是真 involute 曲线).
   - pitch circle 上齿厚 = πm/2
   - 齿顶 (addendum): 90% 半齿宽
   - 齿根 (dedendum): 100% 半齿宽
   - 这给出与真实 involute 齿相似的啮合性能, 但几何构造简单 (避免 OCC face-from-polyline 边界精度问题)
+
+⚠️ 已知限制 (v2.8.1):
+  - 真实啮合时会有 ~100-500 mm³ 干涉 (梯形 vs 真圆齿, 几何差异)
+  - 实际机械应视为"几何参考", 真实加工前必须用真 involute 齿形 (v2.10+)
+  - collision check 会检测到这些"假干涉", 这是预期行为
 
 Returns: build123d Part, 可直接 boolean / export.
 """

@@ -2746,7 +2746,8 @@ class MechKernel:
                     visible=bool(item.get("visible", True)),
                     bbox=list(self._geometry_summary_for(part).bounding_box),
                     geometry=part,
-                    local_origin=list(item.get("local_origin", position or [0.0, 0.0, 0.0])),
+                    # v2.7.1: `position or [...]` 死代码 (position 总是 truthy), 简化为 position
+                    local_origin=list(item.get("local_origin", position)),
                     mount_frame=item.get("mount_frame"),
                     world_transform=item.get("world_transform"),
                     mount_uv=list(item.get("mount_uv", [0.0, 0.0])),
@@ -4104,8 +4105,9 @@ class MechKernel:
 
         支持的 relation kind:
             - frame_valid:  检查 frame 自身正交右手
-            - coaxial:      两 frame normal 同向
-            - parallel:     两 frame normal 平行
+            - coaxial:      两 frame normal 共线 (|dot| > 1-eps, 同向或反向均可)
+            - coaxial_aligned:    两 frame normal 同向 (dot > 1-eps)
+            - parallel:     两 frame normal 平行 (|dot| > 1-eps)
             - perpendicular: 两 frame normal 垂直
             - clearance:    两 instance bbox 不重叠（如果给了 source/target）
             - mounted:      instance 的 mount_frame 已注册
@@ -4174,14 +4176,24 @@ class MechKernel:
                 continue
 
             if kind == "coaxial":
-                # 法向平行且同向
+                # 法向共线 (同向或反向都可, 齿轮啮合/轴对中等都是反向)
                 d = sum(sf.normal[i] * tf.normal[i] for i in range(3))
-                if d < 1 - 1e-6:
+                if abs(d) < 1 - 1e-6:
                     issues.append({
                         "code": "coaxial_misaligned",
                         "source": source_name, "target": target_name,
                         "dot": d,
-                        "message": f"{source_name} 与 {target_name} 不共轴 (dot={d:.4f})",
+                        "message": f"{source_name} 与 {target_name} 不共轴 (|dot|={abs(d):.4f})",
+                    })
+            elif kind == "coaxial_aligned":
+                # 仅允许同向
+                d = sum(sf.normal[i] * tf.normal[i] for i in range(3))
+                if d < 1 - 1e-6:
+                    issues.append({
+                        "code": "coaxial_aligned_misaligned",
+                        "source": source_name, "target": target_name,
+                        "dot": d,
+                        "message": f"{source_name} 与 {target_name} 不共轴同向 (dot={d:.4f})",
                     })
             elif kind == "parallel":
                 d = abs(sum(sf.normal[i] * tf.normal[i] for i in range(3)))

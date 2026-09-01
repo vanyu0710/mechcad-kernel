@@ -279,14 +279,23 @@ def resolve_placement(registry: FrameRegistry,
                       ) -> Tuple[Tuple[float, float, float], List[List[float]]]:
     """返回 (world_origin, 3x3 rotation_matrix).
 
-    rotation = (angle_deg, axis) 是相对 frame 的旋转（绕 frame 的 x/y/normal
-    或任意 (x,y,z) 方向）。
+    语义 (v2.7.1 修正):
+        - origin: uv 在 frame 平面 + normal_offset 沿 frame.normal, 转世界坐标
+        - rotation = (angle_deg, axis):
+            * axis 是**世界坐标系**的轴 (不是 frame 本地轴)
+            * 把 frame 的 x/y/normal basis 整体绕 axis 旋转 angle 度
+            * 合成: out = R_world @ frame.basis  (R 先作用, base 在右)
+            * 即: 如果 frame.normal 原来朝 +Z, 旋转 90° 绕 +Y 后, new normal 朝 -X
+
+    例子:
+        frame: normal=(1,0,0) (轴沿 +X)
+        rotation = (90, (0,1,0))  绕 +Y 旋转 90°
+        原 normal (1,0,0) → 经 R (绕 +Y 90°) → (0,0,-1)
+        原 x_axis (0,1,0) → (0,1,0) (不变, 因为它在旋转轴上)
     """
     frame = registry.get(frame_name)
     origin = frame.to_world((uv[0], uv[1], normal_offset))
-    # 基础矩阵 = frame.basis_matrix()
     base = frame.basis_matrix()
-    # 额外旋转: 绕 axis 旋转 angle 度
     angle = float(rotation[0])
     axis = _normalize(tuple(rotation[1]))
     if _is_close(angle, 0.0, 1e-9):
@@ -301,7 +310,7 @@ def resolve_placement(registry: FrameRegistry,
         [t * ax * ay + s * az,    t * ay * ay + c,        t * ay * az - s * ax],
         [t * ax * az - s * ay,    t * ay * az + s * ax,   t * az * az + c],
     ]
-    # 合成: R * base
+    # 合成: out = R @ base  (列向量约定: v_world = R @ v_local)
     out: List[List[float]] = [[0.0, 0.0, 0.0] for _ in range(3)]
     for i in range(3):
         for j in range(3):

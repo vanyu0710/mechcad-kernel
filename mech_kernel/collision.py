@@ -22,6 +22,7 @@ def check_pair_interference(
     name_a: str = "A",
     name_b: str = "B",
     tolerance: float = 0.001,
+    strict: bool = False,
 ) -> Dict[str, Any]:
     """检查两个 Part 是否相互干涉.
 
@@ -35,6 +36,8 @@ def check_pair_interference(
         name_b: 第二个的名字 (用于报告)
         tolerance: 体积阈值 (mm³), 低于此值视为无干涉
                    默认 0.001 (考虑 OCC 浮点精度)
+        strict: True 时区分 expected OCC 错误 (空 shape) vs unexpected
+                错误 (raise); 默认 False 保持向后兼容
 
     Returns:
         {
@@ -44,11 +47,30 @@ def check_pair_interference(
           "volume_mm3": float,        # 干涉体积 (0 表示无)
           "intersection_part": Part | None,  # 干涉实体 (None 表示无)
           "center": (x, y, z) | None,  # 干涉中心
+          "error": str | None,  # 计算错误信息 (如有)
         }
     """
+    # 区分 expected OCC 错误 (空 shape) vs unexpected
     try:
         common = part_a & part_b
+    except (ValueError, TypeError, AttributeError) as e:
+        # expected: 空 shape / 无效 input
+        if strict:
+            raise
+        return {
+            "name_a": name_a,
+            "name_b": name_b,
+            "interfering": False,
+            "volume_mm3": 0.0,
+            "intersection_part": None,
+            "center": None,
+            "error": f"expected: {type(e).__name__}: {e}",
+        }
     except Exception as e:
+        # unexpected: OCC 内部错误 / kernel bug
+        if strict:
+            raise
+        # 仍记录, 但标为"未知", 让 caller 决定如何处理
         return {
             "name_a": name_a,
             "name_b": name_b,
@@ -56,11 +78,28 @@ def check_pair_interference(
             "volume_mm3": 0.0,
             "intersection_part": None,
             "center": None,
-            "error": str(e),
+            "error": f"unexpected: {type(e).__name__}: {e}",
         }
 
-    if not hasattr(common, "volume"):
-        # build123d 在某些情况下返回空 Compound/Shape, 没有 volume 属性
+    # 显式检查空 shape (不依赖 hasattr)
+    # OCC 的 empty shape (Common 算法返回 null shape) 在 build123d 中:
+    #   - 如果两个 shape 不相交: common 是空 Compound (无 Solids)
+    #   - 如果一个 shape 包含另一个: common 是空 / 等于较小的
+    # 实际检测: 试 bounding_box, 空 shape 抛异常或返回 null bbox
+    try:
+        bb = common.bounding_box()
+        # 空 shape 的 bbox 可能是 (0,0,0) 到 (0,0,0)
+        if (bb.max.X - bb.min.X) < 1e-9 and (bb.max.Y - bb.min.Y) < 1e-9 and (bb.max.Z - bb.min.Z) < 1e-9:
+            return {
+                "name_a": name_a,
+                "name_b": name_b,
+                "interfering": False,
+                "volume_mm3": 0.0,
+                "intersection_part": None,
+                "center": None,
+            }
+    except (ValueError, TypeError, AttributeError):
+        # 空 shape: 视为无干涉
         return {
             "name_a": name_a,
             "name_b": name_b,
@@ -70,7 +109,22 @@ def check_pair_interference(
             "center": None,
         }
 
-    vol = float(common.volume) if common.volume else 0.0
+    # 计算体积 — 只在 bbox 有效时
+    try:
+        vol = float(common.volume) if common.volume else 0.0
+    except (ValueError, TypeError, AttributeError) as e:
+        if strict:
+            raise
+        return {
+            "name_a": name_a,
+            "name_b": name_b,
+            "interfering": False,
+            "volume_mm3": 0.0,
+            "intersection_part": None,
+            "center": None,
+            "error": f"volume read failed: {type(e).__name__}: {e}",
+        }
+
     interfering = vol > tolerance
 
     result = {
@@ -83,7 +137,6 @@ def check_pair_interference(
     }
     if interfering:
         try:
-            bb = common.bounding_box()
             result["center"] = (
                 (bb.min.X + bb.max.X) / 2,
                 (bb.min.Y + bb.max.Y) / 2,
