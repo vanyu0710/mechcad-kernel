@@ -67,9 +67,12 @@ def _vec3(v) -> Tuple[float, float, float]:
 
 def _round_center(p) -> Tuple[float, float, float]:
     try:
-        return (float(p.X), float(p.Y), float(p.Z))
+        x, y, z = p.X, p.Y, p.Z
     except AttributeError:
         return (float(p[0]), float(p[1]), float(p[2]))
+    if callable(x):  # OCP gp_Pnt 暴露的是方法（p.X()），build123d Vector 是属性
+        x, y, z = x(), y(), z()
+    return (float(x), float(y), float(z))
 
 
 def _make_ref(kind: str, index: int) -> str:
