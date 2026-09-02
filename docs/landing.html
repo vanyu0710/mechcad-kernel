@@ -112,10 +112,10 @@
   }
   .wave svg { display: block; width: 100%; height: 100%; }
 
-  /* Wave 1: 最浅 (薄荷青) */
+  /* Wave 1: 最浅 (薄雾青) — 整体调浅 */
   .wave-1 {
     top: 0; height: 22vh;
-    background: linear-gradient(180deg, #d0e5ec 0%, #c5dee5 50%, #b6d6e0 100%);
+    background: linear-gradient(180deg, #ecf3f7 0%, #dde9f0 50%, #c9dde7 100%);
     z-index: 1;
   }
   .wave-1 svg { position: absolute; bottom: -1px; height: 90px; }
@@ -123,7 +123,7 @@
   /* Wave 2: 浅青 */
   .wave-2 {
     top: 22vh; height: 22vh;
-    background: linear-gradient(180deg, #a8cad9 0%, #94b9d0 50%, #82aac6 100%);
+    background: linear-gradient(180deg, #c5dceb 0%, #aac7da 50%, #93b6cc 100%);
     z-index: 2;
   }
   .wave-2 svg { position: absolute; bottom: -1px; height: 100px; }
@@ -131,23 +131,23 @@
   /* Wave 3: 中海蓝 */
   .wave-3 {
     top: 44vh; height: 22vh;
-    background: linear-gradient(180deg, #6a9cba 0%, #5485a8 50%, #447292 100%);
+    background: linear-gradient(180deg, #88afc6 0%, #6f9bb6 50%, #5c8ba8 100%);
     z-index: 3;
   }
   .wave-3 svg { position: absolute; bottom: -1px; height: 110px; }
 
-  /* Wave 4: 深蓝 */
+  /* Wave 4: 深蓝 (但不到黑) */
   .wave-4 {
     top: 66vh; height: 22vh;
-    background: linear-gradient(180deg, #355a85 0%, #284870 50%, #1e3a5e 100%);
+    background: linear-gradient(180deg, #5180a0 0%, #42738f 50%, #38677e 100%);
     z-index: 4;
   }
   .wave-4 svg { position: absolute; bottom: -1px; height: 120px; }
 
-  /* Wave 5: 深海黑 */
+  /* Wave 5: 最深的海 (深但不黑, 留余韵) */
   .wave-5 {
     top: 88vh; height: 12vh;
-    background: linear-gradient(180deg, #14365e 0%, #0a2540 50%, #04111f 100%);
+    background: linear-gradient(180deg, #2f5d75 0%, #284f64 50%, #224454 100%);
     z-index: 5;
   }
 
@@ -228,32 +228,34 @@
     color: var(--coral);
   }
 
-  /* Hero 大标题: Instrument Serif, italic 强调 */
+  /* Hero 大标题: Instrument Serif italic, 整体统一深海色,
+     弱化 accent underline (用细线圈, 不再高亮) */
   .hero h1 {
     font-family: "Instrument Serif", "Times New Roman", serif;
     font-weight: 400; font-style: italic;
     font-size: clamp(46px, 8vw, 96px);
-    line-height: 1.02;
+    line-height: 1.05;
     letter-spacing: -0.025em;
     color: var(--deep);
     margin-bottom: 28px;
     max-width: 1100px;
     margin-left: auto; margin-right: auto;
   }
+  /* 整句统一深海色, 只在 'em' 词上有微弱 underline */
+  .hero h1 em {
+    font-style: italic; color: var(--deep);
+  }
   .hero h1 .accent {
-    font-style: italic; color: var(--coral);
+    color: var(--ocean);
     position: relative;
     display: inline-block;
   }
   .hero h1 .accent::after {
     content: ""; position: absolute;
-    left: 6%; right: 6%; bottom: 4%;
-    height: 8px; background: var(--coral-glow);
-    border-radius: 50%;
+    left: 4%; right: 4%; bottom: 6%;
+    height: 2px; background: var(--mist);
+    border-radius: 1px;
     z-index: -1;
-  }
-  .hero h1 .roman {
-    font-style: normal; font-weight: 400;
   }
 
   .hero .subtitle {
@@ -804,15 +806,15 @@
       <span class="v">v2.11</span> &nbsp;·&nbsp; 334 tests pass &nbsp;·&nbsp; AGPL-3.0
     </div>
 
-    <!-- 标题: Instrument Serif italic, 突出"看真实几何" -->
+    <!-- 标题: 整句统一深海色, 弱化强调 -->
     <h1>
       <em>让 LLM</em> 看见<br>
       <span class="accent">真实几何</span>
     </h1>
 
     <p class="subtitle">
-      手绘草图, 文字描述, 通过 <em class="serif">看→想→做→验</em> 范式,
-      生成工业级 <span class="mono" style="font-size: 0.9em; color: var(--coral);">.step</span> 几何.
+      手绘草图, 文字描述, 通过 <em class="serif" style="color: var(--ocean);">看→想→做→验</em> 范式,
+      生成工业级 <span class="mono" style="font-size: 0.9em; color: var(--ocean);">.step</span> 几何.
     </p>
 
     <span class="eyebrow">43 个原子 op &nbsp;·&nbsp; 100% 真实实现 &nbsp;·&nbsp; OpenCascade 内核</span>
@@ -987,28 +989,28 @@
 <section class="demo fadein" id="demo">
   <div class="section-inner">
     <span class="eyebrow-section">Live demo</span>
-    <h2 class="section-title">液压齿轮泵, <em>真实装配</em></h2>
+    <h2 class="section-title">减速器箱座, <em>33 op 全流程</em></h2>
     <p class="section-subtitle">
-      demo 15: housing (12 步 MechKernel pipeline) + 2 真实 involute 齿轮 + 2 轴 + 8 kind 装配验证 + 5 part 碰撞.
+      demo 16: 单级减速器箱座 — 用 MechKernel 33 op 全流程. 草图 → extrude → fillet → chamfer → hole → linear/circular_pattern → mirror → 选边选面 → 排油孔 → 油标 → 顶缘倒角.
     </p>
     <div class="demo-grid">
       <div class="demo-img-wrap">
-        <img src="images/demo15_3d_top.png" alt="Hydraulic Gear Pump top view" loading="lazy"/>
+        <img src="images/demo16_housing_iso.png" alt="Gearbox Housing demo 16" loading="lazy"/>
         <div class="float">
-          housing + 2 真实 involute 齿轮 + 2 轴
-          <span class="v">1.06 M mm³</span>
+          单级减速器箱座
+          <span class="v">200 × 130 × 72 mm</span>
         </div>
       </div>
       <div class="demo-text">
-        <h3>用 8 大类能力造 1 个<em>真零件</em></h3>
-        <p>housing 用 MechKernel 12 步完整 pipeline (草图 → extrude → fillet → chamfer → hole → linear/circular_pattern → mirror), 齿轮用 v2.8 真实 involute, 验证用 v2.7 8 kind, 碰撞用 v2.9.</p>
+        <h3>33 op 完整 pipeline, 造 1 个<em>箱座</em></h3>
+        <p>demo 16: 减速器箱座 — 用 MechKernel 33 op 全流程. 草图 → extrude → fillet → chamfer → hole → linear/circular_pattern → mirror → 选边选面 → 排油孔 → 油标 → 顶缘倒角.</p>
         <ul>
-          <li><b>Housing</b> 200×140×130, 4 mount + 6 bolt + 2 oil + 2 shaft hole, 50 faces</li>
-          <li><b>真实 involute 齿轮</b> m=2.5, z=24/36, 中心距 75mm, 啮合 0 假干涉</li>
-          <li><b>8 kind validate</b> coaxial / parallel / perpendicular / axis_misalign / mounted / inside / gear_mesh / coaxial_aligned → 0 issues</li>
-          <li><b>5 part × 10 pair 碰撞</b> 检出 5 干涉 (housing 切齿轮/轴等), 真实机械诊断</li>
+          <li><b>Housing</b> 200×130×72 mm, 4 mount + 端盖 + 油标 + 排油 + 顶缘倒角</li>
+          <li><b>Select 边 reference</b> v2.11 闭环: 用 select 选面, 倒圆按边引用, 选面/边互联</li>
+          <li><b>Hole 任意面 direction</b> 油标孔斜向, 排油孔带方向, 不只正交</li>
+          <li><b>精确体积</b> 425546 mm³, 参数化重放 + 边引用闭环 100% 测试覆盖</li>
         </ul>
-        <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/mech_kernel/examples/15_hydraulic_pump.py" target="_blank" class="btn btn-ghost" style="color: white; border-color: rgba(255,255,255,0.3); background: transparent;">查看源码 →</a>
+        <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/mech_kernel/examples/16_gearbox_housing.py" target="_blank" class="btn btn-ghost" style="color: white; border-color: rgba(255,255,255,0.3); background: transparent;">查看源码 →</a>
       </div>
     </div>
   </div>
