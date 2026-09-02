@@ -2,7 +2,7 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-329%2F329%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-334%2F334%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
@@ -35,6 +35,31 @@ MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发�
 - **hole 升级**: `direction` 支持从任意面进入 (top/bottom/x+/x-/y+/y-)；countersink 真 90° 锥面（此前是直壁假沉头）。
 - **harness 接口准备**: ID 生成器实例化（多 MechKernel 实例同进程互不污染）；RecoverableError 类型化异常 + suggestion 统一 `{action, fix: {param: value}, reason_code}`（LLM 可直接改参重试）；unknown field 错误附 valid_fields；cut 无切除时警告；修复 orchestrator 重试合并 bug；reference frame 入快照/存档。
 - **装配 10 op 标记 experimental**: `PUBLIC_OPS` 43→33 + `EXPERIMENTAL_OPS`；execute() 默认拒绝、`allow_experimental=True` 放行；LLM 默认能力集不再包含装配 op。
+
+### v2.11 可视化（端到端复杂零件）
+
+多步复杂零件全部走 v2.11 公开 API：选边/选面引用、偏置/自定义 workplane、命中选择、任意面打孔、真弧线剖面。
+
+**Demo 16 — 单级减速器箱座（下箱体）**（仅公开 API，11 步特征）
+> 箱体毛坯→底板→内腔切削→4 条底棱倒圆→2 轴承凸台→2 轴承孔→4 底脚螺栓→排油孔→油标凸台→油标孔→顶缘倒角
+
+| iso | 多视图 | 剖面 |
+|---|---|---|
+| ![housing iso](docs/images/demo16_housing_iso.png) | ![housing views](docs/images/demo16_housing_views.png) | ![housing section](docs/images/demo16_housing_section_x.png) |
+
+**Demo 14 — 两级减速齿轮箱**（装配 + 碰撞检查）
+> 4 真实齿轮 + 3 轴 + 中空外壳 + 参考坐标系 + 装配验证 + 碰撞报告 + RPM 标注
+
+| presentation | iso | 减速比 |
+|---|---|---|
+| ![gearbox](docs/images/demo14_gearbox_presentation.png) | ![gearbox iso](docs/images/demo14_gearbox_iso.png) | ![ratio](docs/images/demo14_gearbox_ratio.png) |
+
+**Demo 15 — 复杂液压齿轮泵**（v2.10，真实 involute 齿轮 + 装配 + 碰撞）
+> 2 段齿轮泵：input 24 齿 → output 36 齿（1.5:1），module=2.5，真 involute 曲线，中空 housing + 4 mount + 6 bolt + 2 oil port
+
+| 3D iso | 3D top | iso |
+|---|---|---|
+| ![pump 3d iso](docs/images/demo15_pump_3d_iso.png) | ![pump 3d top](docs/images/demo15_pump_3d_top.png) | ![pump iso](docs/images/demo15_pump_iso.png) |
 
 ## v2.9.1 专家审查修复
 
@@ -108,9 +133,9 @@ max interference vol: 8275.92 mm³
 
 替换 4 个齿轮 + housing + 3 根轴后, **完全 in-kernel build123d 建模** (不再是 load STEP + translate), 视觉从中空外壳 + 3 根轴 + 4 个啮合齿轮 + RPM 标注 + 减速比 3:1 (input 1500 → intermediate 500 → output 166 RPM).
 
-![v2.9 gearbox presentation](docs/images/gearbox_v29_presentation.png)
-![v2.9 gearbox iso](docs/images/gearbox_v29_iso.png)
-![v2.9 ratio diagram](docs/images/gearbox_v29_ratio.png)
+![v2.11 gearbox presentation](docs/images/demo14_gearbox_presentation.png)
+![v2.11 gearbox iso](docs/images/demo14_gearbox_iso.png)
+![v2.11 ratio diagram](docs/images/demo14_gearbox_ratio.png)
 
 ## v2.7 参考坐标系与装配验证
 
