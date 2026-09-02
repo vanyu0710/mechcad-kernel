@@ -3,256 +3,353 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>MechCAD Kernel — AI CAD 视觉建模内核</title>
+<title>MechCAD Kernel — 让 LLM 看见真实几何</title>
+
+<!-- 字体: Instrument Serif (display) + Inter (body) + JetBrains Mono (code) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
 <style>
-  /* ===== 基础 ===== */
+  /* ===== Token 系统 ===== */
   :root {
-    --deep:    #0b3954;
-    --ocean-1: #0f4c75;
-    --ocean-2: #3282b8;
-    --wave-1:  #6fb3d2;
-    --wave-2:  #a8dadc;
-    --wave-3:  #d4f1f4;
-    --foam:    #f0f9fb;
-    --ink:     #1b262c;
-    --mute:    #5a7a8a;
-    --accent:  #ff6b6b;
-    --gold:    #f4a261;
-    --shadow:  0 18px 60px -22px rgba(11, 57, 84, 0.55);
-    --radius:  18px;
-    --maxw:    1200px;
+    /* 深海色板, 减饱和 */
+    --abyss:    #04111f;
+    --deep:     #0a2540;
+    --indigo:   #14365e;
+    --ocean:    #1a5490;
+    --mid:      #2c6cae;
+    --sky:      #5b9bcf;
+    --mist:     #a8c4dc;
+    --foam:     #e6eef4;
+    --snow:     #f6f9fc;
+
+    /* 唯一暖色 accent (海水里的珊瑚) */
+    --coral:    #ff7d5c;
+    --coral-dim: #ff7d5c22;
+    --coral-glow: #ff7d5c44;
+
+    /* 中性 */
+    --ink:      #0a2540;
+    --mute:     #5a6f80;
+    --line:     #14365e18;
+
+    /* 几何 */
+    --radius:   14px;
+    --radius-lg: 22px;
+    --shadow:   0 24px 60px -28px rgba(4, 17, 31, 0.5);
+    --shadow-sm: 0 6px 24px -10px rgba(4, 17, 31, 0.25);
+    --maxw:     1200px;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
   html { scroll-behavior: smooth; }
-
   body {
-    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-family: "Inter", -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     color: var(--ink);
-    line-height: 1.7;
+    line-height: 1.65;
     overflow-x: hidden;
-    background: var(--foam);
+    background: var(--snow);
+    font-feature-settings: "cv11", "ss01", "ss03";
+    -webkit-font-smoothing: antialiased;
   }
+  a { color: var(--ocean); text-decoration: none; }
+  a:hover { color: var(--coral); }
+  img { max-width: 100%; }
 
-  a { color: var(--ocean-2); text-decoration: none; }
-  a:hover { color: var(--ocean-1); }
+  /* 字体: Instrument Serif 只给 display 用, body 用 Inter */
+  .serif { font-family: "Instrument Serif", "Times New Roman", serif; font-weight: 400; letter-spacing: -0.02em; }
+  .mono  { font-family: "JetBrains Mono", "SF Mono", monospace; }
 
   /* ===== 顶部导航 ===== */
   .nav {
     position: fixed; top: 0; left: 0; right: 0; z-index: 100;
-    backdrop-filter: blur(14px) saturate(180%);
-    -webkit-backdrop-filter: blur(14px) saturate(180%);
-    background: rgba(240, 249, 251, 0.72);
-    border-bottom: 1px solid rgba(50, 130, 184, 0.18);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    background: rgba(246, 249, 252, 0.78);
+    border-bottom: 1px solid var(--line);
   }
   .nav-inner {
     max-width: var(--maxw); margin: 0 auto;
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 32px;
+    padding: 16px 36px;
   }
   .logo {
-    font-weight: 800; font-size: 20px; color: var(--deep);
-    letter-spacing: -0.4px; display: flex; align-items: center; gap: 8px;
+    font-weight: 700; font-size: 17px; color: var(--deep);
+    letter-spacing: -0.3px; display: flex; align-items: center; gap: 10px;
   }
-  .logo svg { flex-shrink: 0; }
-  .nav-links { display: flex; gap: 28px; align-items: center; }
+  .logo-mark {
+    width: 30px; height: 30px;
+    background: linear-gradient(135deg, var(--sky) 0%, var(--abyss) 100%);
+    border-radius: 8px;
+    display: grid; place-items: center;
+    box-shadow: 0 4px 12px -2px rgba(4, 17, 31, 0.3);
+  }
+  .logo-mark svg { display: block; }
+  .nav-links { display: flex; gap: 30px; align-items: center; }
   .nav-links a {
-    color: var(--ocean-1); font-weight: 500; font-size: 14px;
-    transition: color 0.2s;
+    color: var(--indigo); font-weight: 500; font-size: 13.5px;
+    letter-spacing: -0.1px;
   }
   .nav-links a:hover { color: var(--deep); }
   .nav-cta {
     background: var(--deep); color: white !important;
-    padding: 9px 20px; border-radius: 999px;
+    padding: 9px 18px; border-radius: 8px;
     font-weight: 600; font-size: 13px;
     transition: all 0.2s;
   }
-  .nav-cta:hover { background: var(--ocean-1); transform: translateY(-1px); }
+  .nav-cta:hover { background: var(--coral); transform: translateY(-1px); }
 
-  /* ===== Hero 背景: 竖向 5 段渐变浅海浪 ===== */
+  /* ===== Hero: 5 段竖向渐变浅海浪 ===== */
   .hero {
     position: relative;
     min-height: 100vh;
-    padding: 100px 32px 120px;
+    padding: 110px 36px 130px;
     overflow: hidden;
   }
-
-  /* 每段一个 wave 层, 渐变 + 波浪分割 */
   .wave {
     position: absolute; left: 0; right: 0; pointer-events: none;
   }
   .wave svg { display: block; width: 100%; height: 100%; }
+
+  /* Wave 1: 最浅 (薄荷青) */
   .wave-1 {
     top: 0; height: 22vh;
-    background: linear-gradient(180deg,
-      #a8dadc 0%, #b5e4e6 50%, #d4f1f4 100%);
+    background: linear-gradient(180deg, #d0e5ec 0%, #c5dee5 50%, #b6d6e0 100%);
     z-index: 1;
   }
-  .wave-1 svg { position: absolute; bottom: -1px; height: 80px; }
+  .wave-1 svg { position: absolute; bottom: -1px; height: 90px; }
+
+  /* Wave 2: 浅青 */
   .wave-2 {
     top: 22vh; height: 22vh;
-    background: linear-gradient(180deg,
-      #c5e8eb 0%, #b5dbe3 50%, #9bcfd9 100%);
+    background: linear-gradient(180deg, #a8cad9 0%, #94b9d0 50%, #82aac6 100%);
     z-index: 2;
   }
-  .wave-2 svg { position: absolute; bottom: -1px; height: 90px; }
+  .wave-2 svg { position: absolute; bottom: -1px; height: 100px; }
+
+  /* Wave 3: 中海蓝 */
   .wave-3 {
     top: 44vh; height: 22vh;
-    background: linear-gradient(180deg,
-      #7eb8d3 0%, #98c9de 50%, #b4d9e6 100%);
+    background: linear-gradient(180deg, #6a9cba 0%, #5485a8 50%, #447292 100%);
     z-index: 3;
   }
-  .wave-3 svg { position: absolute; bottom: -1px; height: 100px; }
+  .wave-3 svg { position: absolute; bottom: -1px; height: 110px; }
+
+  /* Wave 4: 深蓝 */
   .wave-4 {
     top: 66vh; height: 22vh;
-    background: linear-gradient(180deg,
-      #5b9fc0 0%, #6eafcb 50%, #84bdd4 100%);
+    background: linear-gradient(180deg, #355a85 0%, #284870 50%, #1e3a5e 100%);
     z-index: 4;
   }
-  .wave-4 svg { position: absolute; bottom: -1px; height: 110px; }
+  .wave-4 svg { position: absolute; bottom: -1px; height: 120px; }
+
+  /* Wave 5: 深海黑 */
   .wave-5 {
     top: 88vh; height: 12vh;
-    background: linear-gradient(180deg,
-      #3282b8 0%, #1c5d8a 50%, #0f4c75 100%);
+    background: linear-gradient(180deg, #14365e 0%, #0a2540 50%, #04111f 100%);
     z-index: 5;
   }
 
-  /* 背景上的泡泡 / 装饰 */
+  /* 背景噪点 (纸感) */
+  .hero::after {
+    content: ""; position: absolute; inset: 0; z-index: 6; pointer-events: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><filter id='n'><feTurbulence baseFrequency='1.5' numOctaves='2'/></filter><rect width='100' height='100' filter='url(%23n)' opacity='0.5'/></svg>");
+    opacity: 0.04; mix-blend-mode: overlay;
+  }
+
+  /* 泡泡: 缓慢上浮 + 横向漂 */
   .bubble {
     position: absolute; border-radius: 50%;
-    background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.7), rgba(255,255,255,0.1));
-    box-shadow: inset 0 0 18px rgba(255,255,255,0.4);
+    background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.7), rgba(255,255,255,0.05));
+    box-shadow: inset 0 0 14px rgba(255,255,255,0.5);
     z-index: 2; pointer-events: none;
-    animation: float 9s ease-in-out infinite;
+    animation: float 11s ease-in-out infinite;
   }
-  .bubble.b1 { width: 80px; height: 80px; top: 14vh; left: 8%;  animation-delay: 0s; }
-  .bubble.b2 { width: 50px; height: 50px; top: 38vh; left: 90%; animation-delay: 1.5s; }
-  .bubble.b3 { width: 100px; height: 100px; top: 56vh; left: 5%; animation-delay: 3s; }
-  .bubble.b4 { width: 40px; height: 40px; top: 76vh; left: 85%; animation-delay: 4.5s; }
-  .bubble.b5 { width: 65px; height: 65px; top: 26vh; left: 78%; animation-delay: 2s; }
-
+  .bubble.b1 { width: 60px; height: 60px; top: 14vh; left: 7%;  animation-delay: 0s; }
+  .bubble.b2 { width: 40px; height: 40px; top: 32vh; left: 92%; animation-delay: 1.5s; }
+  .bubble.b3 { width: 90px; height: 90px; top: 56vh; left: 4%;  animation-delay: 3s; }
+  .bubble.b4 { width: 30px; height: 30px; top: 76vh; left: 88%; animation-delay: 4.5s; }
+  .bubble.b5 { width: 50px; height: 50px; top: 22vh; left: 75%; animation-delay: 2s; }
   @keyframes float {
-    0%, 100% { transform: translateY(0) translateX(0); }
-    50%      { transform: translateY(-30px) translateX(8px); }
+    0%, 100% { transform: translate(0, 0); }
+    25%      { transform: translate(8px, -25px); }
+    50%      { transform: translate(-5px, -45px); }
+    75%      { transform: translate(6px, -22px); }
   }
 
-  /* 鱼群小点 */
+  /* 鱼群点: 横向穿游, 错开时间 */
   .fish {
-    position: absolute; width: 4px; height: 4px; border-radius: 50%;
-    background: rgba(255,255,255,0.5);
-    animation: swim 22s linear infinite;
+    position: absolute; width: 3px; height: 3px; border-radius: 50%;
+    background: rgba(255,255,255,0.7);
+    box-shadow: 0 0 6px rgba(255,255,255,0.6);
+    animation: swim 24s linear infinite;
     z-index: 2; pointer-events: none;
   }
-  .fish.f1 { top: 18vh; left: -5%; animation-delay: 0s; }
-  .fish.f2 { top: 50vh; left: -5%; animation-delay: 7s; }
-  .fish.f3 { top: 80vh; left: -5%; animation-delay: 14s; }
+  .fish.f1 { top: 18vh; animation-delay: 0s; }
+  .fish.f2 { top: 50vh; animation-delay: 8s; }
+  .fish.f3 { top: 80vh; animation-delay: 16s; }
   @keyframes swim {
-    from { left: -5%; }
-    to   { left: 105%; }
+    from { left: -2%; }
+    to   { left: 102%; }
   }
 
   /* ===== Hero 内容 ===== */
   .hero-content {
     position: relative; z-index: 50;
     max-width: var(--maxw); margin: 0 auto;
-    padding: 40px 0;
     text-align: center;
+    padding: 30px 0 0;
   }
 
-  .badge {
+  /* 状态徽章 (注意: 跟渐变数字 stat 反着, 是 1 个小的 chip) */
+  .status-chip {
     display: inline-flex; align-items: center; gap: 8px;
-    background: rgba(255,255,255,0.6); backdrop-filter: blur(8px);
-    border: 1px solid rgba(11, 57, 84, 0.15);
-    padding: 6px 16px; border-radius: 999px;
-    font-size: 13px; font-weight: 600; color: var(--deep);
-    margin-bottom: 28px;
-    box-shadow: 0 4px 16px rgba(11, 57, 84, 0.08);
+    background: rgba(255,255,255,0.65);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.8);
+    padding: 5px 14px 5px 8px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 500; color: var(--deep);
+    margin-bottom: 36px;
+    box-shadow: 0 4px 16px -4px rgba(4, 17, 31, 0.12);
   }
-  .badge .dot {
+  .status-chip .pulse {
     width: 8px; height: 8px; border-radius: 50%;
-    background: #4ade80; box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.3);
-    animation: pulse 2s ease-in-out infinite;
+    background: var(--coral);
+    box-shadow: 0 0 0 4px var(--coral-glow);
+    animation: pulse 2.4s ease-in-out infinite;
   }
   @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.3); }
-    50%      { box-shadow: 0 0 0 7px rgba(74, 222, 128, 0.0); }
+    0%, 100% { box-shadow: 0 0 0 4px var(--coral-glow); }
+    50%      { box-shadow: 0 0 0 9px transparent; }
+  }
+  .status-chip .v {
+    font-family: "JetBrains Mono", monospace; font-weight: 500;
+    color: var(--coral);
   }
 
+  /* Hero 大标题: Instrument Serif, italic 强调 */
   .hero h1 {
-    font-size: clamp(40px, 7vw, 88px);
-    font-weight: 800;
-    line-height: 1.05;
-    letter-spacing: -2.2px;
-    background: linear-gradient(135deg, #0b3954 0%, #1c5d8a 30%, #3282b8 60%, #f4a261 100%);
-    -webkit-background-clip: text; background-clip: text;
-    -webkit-text-fill-color: transparent;
-    margin-bottom: 22px;
+    font-family: "Instrument Serif", "Times New Roman", serif;
+    font-weight: 400; font-style: italic;
+    font-size: clamp(46px, 8vw, 96px);
+    line-height: 1.02;
+    letter-spacing: -0.025em;
+    color: var(--deep);
+    margin-bottom: 28px;
+    max-width: 1100px;
+    margin-left: auto; margin-right: auto;
   }
-  .hero h1 .stroke {
-    background: linear-gradient(135deg, #0b3954 0%, #3282b8 50%, #f4a261 100%);
-    -webkit-background-clip: text; background-clip: text;
-    -webkit-text-fill-color: transparent;
+  .hero h1 .accent {
+    font-style: italic; color: var(--coral);
+    position: relative;
+    display: inline-block;
+  }
+  .hero h1 .accent::after {
+    content: ""; position: absolute;
+    left: 6%; right: 6%; bottom: 4%;
+    height: 8px; background: var(--coral-glow);
+    border-radius: 50%;
+    z-index: -1;
+  }
+  .hero h1 .roman {
+    font-style: normal; font-weight: 400;
   }
 
   .hero .subtitle {
-    font-size: clamp(16px, 2.2vw, 22px);
-    color: var(--ocean-1); font-weight: 500;
-    max-width: 760px; margin: 0 auto 36px;
-    line-height: 1.6;
+    font-size: clamp(17px, 2vw, 21px);
+    color: var(--indigo); font-weight: 400;
+    max-width: 720px; margin: 0 auto 12px;
+    line-height: 1.55;
   }
-
-  .hero .tagline {
-    display: inline-block;
-    background: rgba(255,255,255,0.6);
-    border: 1px solid rgba(11, 57, 84, 0.18);
-    padding: 4px 14px; border-radius: 6px;
-    font-size: 13px; font-weight: 500; color: var(--deep);
-    margin: 0 6px;
+  .hero .eyebrow {
+    display: block;
+    font-size: 12px; font-weight: 600; color: var(--ocean);
+    text-transform: uppercase; letter-spacing: 2.4px;
+    margin-top: 24px; margin-bottom: 6px;
   }
 
   .hero-cta {
-    display: flex; gap: 16px; justify-content: center;
-    margin-top: 44px; flex-wrap: wrap;
+    display: flex; gap: 14px; justify-content: center;
+    margin-top: 48px; flex-wrap: wrap;
   }
   .btn {
     display: inline-flex; align-items: center; gap: 8px;
-    padding: 14px 28px; border-radius: 999px;
-    font-weight: 600; font-size: 15px;
+    padding: 14px 26px; border-radius: 10px;
+    font-weight: 600; font-size: 14.5px;
     transition: all 0.25s; cursor: pointer;
-    text-decoration: none;
+    text-decoration: none; letter-spacing: -0.1px;
   }
   .btn-primary {
     background: var(--deep); color: white;
-    box-shadow: 0 8px 30px -10px rgba(11, 57, 84, 0.6);
+    box-shadow: 0 10px 28px -8px rgba(4, 17, 31, 0.45);
   }
-  .btn-primary:hover { background: var(--ocean-1); transform: translateY(-2px); box-shadow: 0 14px 36px -10px rgba(11, 57, 84, 0.7); }
+  .btn-primary:hover { background: var(--coral); transform: translateY(-2px); box-shadow: 0 16px 36px -8px rgba(255, 125, 92, 0.4); }
   .btn-ghost {
     background: rgba(255,255,255,0.7); color: var(--deep);
-    border: 1.5px solid var(--ocean-2);
+    border: 1.5px solid var(--mist);
   }
-  .btn-ghost:hover { background: white; border-color: var(--deep); }
+  .btn-ghost:hover { background: white; border-color: var(--ocean); }
 
-  .hero-stats {
-    display: flex; justify-content: center; gap: 50px;
-    margin-top: 64px; flex-wrap: wrap;
+  /* Hero 唯一大数字: 用 "0% 误差" 作为最冲击的数字, 旁边 3 个小指标 */
+  .hero-mega {
+    display: flex; justify-content: center; align-items: center;
+    gap: 50px;
+    margin-top: 70px;
+    flex-wrap: wrap;
   }
-  .stat { text-align: center; }
-  .stat-num {
-    font-size: clamp(32px, 4.5vw, 48px); font-weight: 800;
-    color: var(--deep); line-height: 1;
-    background: linear-gradient(135deg, #0b3954 0%, #3282b8 100%);
-    -webkit-background-clip: text; background-clip: text;
-    -webkit-text-fill-color: transparent;
+  .mega-num {
+    font-family: "Instrument Serif", serif;
+    font-size: clamp(80px, 12vw, 160px);
+    line-height: 0.9;
+    color: var(--coral);
+    letter-spacing: -0.04em;
+    font-style: italic;
   }
-  .stat-label { font-size: 13px; color: var(--mute); margin-top: 6px; letter-spacing: 0.5px; }
+  .mega-side {
+    text-align: left;
+    color: var(--deep);
+  }
+  .mega-side .label {
+    font-size: 14px; font-weight: 500; color: var(--mute);
+    margin-bottom: 4px;
+  }
+  .mega-side .sub {
+    font-family: "Instrument Serif", serif;
+    font-size: 28px; font-style: italic;
+    color: var(--deep);
+    letter-spacing: -0.02em;
+  }
+  .mega-side .small {
+    display: block;
+    font-size: 13px; color: var(--mute); font-weight: 500;
+    margin-top: 4px;
+  }
 
-  /* 滚动指示 */
+  .hero-mini-stats {
+    display: flex; justify-content: center; gap: 36px;
+    margin-top: 60px; flex-wrap: wrap;
+    padding: 18px 0;
+    border-top: 1px solid rgba(255,255,255,0.5);
+    border-bottom: 1px solid rgba(255,255,255,0.5);
+  }
+  .mini-stat { color: var(--deep); }
+  .mini-stat .v {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 22px; font-weight: 500; color: var(--deep);
+    display: inline-block; margin-right: 6px;
+  }
+  .mini-stat .l {
+    font-size: 12px; color: var(--mute); letter-spacing: 0.3px;
+  }
+
   .scroll-hint {
-    position: absolute; bottom: 30px; left: 50%;
+    position: absolute; bottom: 28px; left: 50%;
     transform: translateX(-50%); z-index: 50;
-    color: var(--deep); font-size: 12px; letter-spacing: 2px;
-    animation: bounce 2.5s ease-in-out infinite;
+    color: var(--foam); font-size: 11px; letter-spacing: 2.5px;
+    font-weight: 500;
+    animation: bounce 2.8s ease-in-out infinite;
+    opacity: 0.8;
   }
   @keyframes bounce {
     0%, 100% { transform: translateX(-50%) translateY(0); }
@@ -260,297 +357,383 @@
   }
 
   /* ===== 通用 Section ===== */
-  section {
-    position: relative;
-    padding: 100px 32px;
-  }
+  section { position: relative; padding: 110px 36px; }
   .section-inner { max-width: var(--maxw); margin: 0 auto; }
 
+  .eyebrow-section {
+    display: inline-block;
+    font-size: 11.5px; font-weight: 600; color: var(--coral);
+    text-transform: uppercase; letter-spacing: 2.5px;
+    margin-bottom: 18px;
+  }
   .section-title {
-    font-size: clamp(32px, 4.5vw, 52px); font-weight: 800;
-    text-align: center; margin-bottom: 18px;
+    font-family: "Instrument Serif", serif;
+    font-size: clamp(36px, 5vw, 60px);
+    font-weight: 400; font-style: italic;
+    line-height: 1.1; letter-spacing: -0.02em;
     color: var(--deep);
-    letter-spacing: -1.5px;
+    max-width: 800px; margin-bottom: 22px;
   }
   .section-subtitle {
-    text-align: center; font-size: 18px;
-    color: var(--mute); max-width: 720px; margin: 0 auto 60px;
+    font-size: 17px; color: var(--mute);
+    max-width: 720px; line-height: 1.6;
+    margin-bottom: 64px;
   }
 
-  /* ===== 工作流程 ===== */
-  .flow {
-    background: linear-gradient(180deg, #0f4c75 0%, #1c5d8a 100%);
-    color: white;
-  }
-  .flow .section-title, .flow .section-subtitle { color: white; }
-  .flow .section-subtitle { color: rgba(255,255,255,0.75); }
-
-  .flow-steps {
+  /* ===== Flow: 用 timeline 形式, 不是 4 卡片 ===== */
+  .flow { background: var(--snow); }
+  .flow-timeline {
     display: grid; grid-template-columns: repeat(4, 1fr);
-    gap: 24px; margin-top: 50px;
-  }
-  @media (max-width: 900px) {
-    .flow-steps { grid-template-columns: 1fr 1fr; }
-  }
-  @media (max-width: 540px) {
-    .flow-steps { grid-template-columns: 1fr; }
-  }
-
-  .flow-step {
-    background: rgba(255,255,255,0.06);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: var(--radius);
-    padding: 28px 22px;
-    transition: all 0.3s;
+    gap: 0;
+    margin-top: 30px;
     position: relative;
   }
-  .flow-step:hover {
-    background: rgba(255,255,255,0.1);
-    transform: translateY(-4px);
-    border-color: rgba(255,255,255,0.25);
+  /* 顶上的连接线 */
+  .flow-timeline::before {
+    content: ""; position: absolute;
+    top: 32px; left: 12.5%; right: 12.5%;
+    height: 1px;
+    background: linear-gradient(90deg, var(--mist) 0%, var(--mist) 50%, var(--mist) 100%);
+    background-image: linear-gradient(90deg, var(--mist) 50%, transparent 0);
+    background-size: 8px 1px;
+    background-repeat: repeat-x;
   }
-  .flow-step .num {
-    display: inline-block;
-    width: 36px; height: 36px; line-height: 36px;
+  .flow-step {
+    padding: 0 24px;
     text-align: center;
-    background: linear-gradient(135deg, #f4a261 0%, #ff6b6b 100%);
-    color: white; font-weight: 800; font-size: 16px;
-    border-radius: 50%; margin-bottom: 18px;
-    box-shadow: 0 4px 16px rgba(244, 162, 97, 0.4);
+    position: relative;
+  }
+  .flow-num {
+    display: inline-block;
+    width: 64px; height: 64px; line-height: 64px;
+    background: var(--snow); color: var(--deep);
+    border: 1.5px solid var(--mist);
+    font-family: "Instrument Serif", serif; font-style: italic;
+    font-size: 32px;
+    border-radius: 50%;
+    margin-bottom: 28px;
+    position: relative; z-index: 1;
+    transition: all 0.3s;
+  }
+  .flow-step:hover .flow-num {
+    background: var(--coral); color: white; border-color: var(--coral);
+    transform: scale(1.1) rotate(-8deg);
   }
   .flow-step h3 {
-    font-size: 20px; font-weight: 700; margin-bottom: 10px;
-    color: white;
+    font-family: "Instrument Serif", serif; font-size: 26px; font-weight: 400;
+    color: var(--deep); margin-bottom: 10px; letter-spacing: -0.01em;
+  }
+  .flow-step h3 em {
+    color: var(--coral); font-style: italic;
   }
   .flow-step p {
-    font-size: 14px; color: rgba(255,255,255,0.7); line-height: 1.65;
+    font-size: 14px; color: var(--mute); line-height: 1.65;
   }
-  .flow-step .icon {
-    font-size: 28px; margin-bottom: 12px; display: block;
+  .flow-step .code {
+    display: block;
+    margin-top: 16px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11.5px; color: var(--ocean);
+    background: var(--foam);
+    padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--line);
   }
 
-  /* ===== 能力 43 op ===== */
-  .ops {
-    background: linear-gradient(180deg, #f0f9fb 0%, #d4f1f4 100%);
+  @media (max-width: 900px) {
+    .flow-timeline { grid-template-columns: 1fr 1fr; gap: 40px 20px; }
+    .flow-timeline::before { display: none; }
+  }
+  @media (max-width: 540px) { .flow-timeline { grid-template-columns: 1fr; } }
+
+  /* ===== 43 ops: 按版本分组, 用不同版式 ===== */
+  .ops { background: var(--foam); }
+
+  .ops-row {
+    display: grid; grid-template-columns: 240px 1fr;
+    gap: 40px;
+    padding: 30px 0;
+    border-top: 1px solid var(--line);
+  }
+  .ops-row:first-of-type { border-top: 0; }
+  @media (max-width: 768px) {
+    .ops-row { grid-template-columns: 1fr; gap: 20px; }
+  }
+  .ops-row .meta {
+    padding-top: 8px;
+  }
+  .ops-row .meta .num {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px; color: var(--mute); letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .ops-row .meta h4 {
+    font-family: "Instrument Serif", serif; font-size: 26px;
+    font-weight: 400; color: var(--deep);
+    margin-bottom: 8px; letter-spacing: -0.01em;
+  }
+  .ops-row .meta .desc {
+    font-size: 13.5px; color: var(--mute); line-height: 1.6;
   }
   .ops-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 14px;
+    display: flex; flex-wrap: wrap; gap: 8px;
+    align-content: start;
   }
-  .op-card {
+  .op {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 12px;
     background: white;
-    border: 1px solid rgba(50, 130, 184, 0.15);
-    border-radius: 12px;
-    padding: 14px 16px;
-    font-size: 14px; font-weight: 500;
-    color: var(--ocean-1);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12.5px; color: var(--ocean);
     transition: all 0.2s;
-    display: flex; align-items: center; gap: 10px;
-    box-shadow: 0 2px 8px rgba(11, 57, 84, 0.04);
+    cursor: default;
   }
-  .op-card:hover {
-    border-color: var(--ocean-2);
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px -8px rgba(50, 130, 184, 0.25);
+  .op:hover {
+    background: var(--deep); color: white; border-color: var(--deep);
+    transform: translateY(-1px);
   }
-  .op-card::before {
-    content: ""; display: inline-block;
-    width: 6px; height: 6px; border-radius: 50%;
-    background: var(--wave-1);
-    flex-shrink: 0;
-  }
-  .op-card.critical::before { background: var(--accent); }
-  .op-card.highlight {
-    background: linear-gradient(135deg, #fff5f0 0%, #ffe8d6 100%);
-    border-color: rgba(244, 162, 97, 0.4);
-  }
-  .op-card.highlight::before { background: var(--gold); }
-  .op-card.v27 { background: linear-gradient(135deg, #e6f7fb 0%, #c5ecf1 100%); }
-  .op-card.v27::before { background: var(--ocean-2); }
-  .op-card.v28 { background: linear-gradient(135deg, #fef9e7 0%, #fcf3cf 100%); }
-  .op-card.v28::before { background: #f1c40f; }
-  .op-card.v29 { background: linear-gradient(135deg, #fce4ec 0%, #f8bbd0 100%); }
-  .op-card.v29::before { background: #e91e63; }
+  /* v2.7 reference 系 — 左侧金边 */
+  .op.v27 { border-color: #d4af37; color: #8b6914; }
+  .op.v27:hover { background: #8b6914; color: white; border-color: #8b6914; }
+  /* v2.8 齿轮 — 紫色 */
+  .op.v28 { border-color: #9b59b6; color: #6c3a82; }
+  .op.v28:hover { background: #6c3a82; color: white; border-color: #6c3a82; }
+  /* v2.9 collision — 珊瑚 */
+  .op.v29 { border-color: var(--coral); color: var(--coral); background: var(--coral-dim); }
+  .op.v29:hover { background: var(--coral); color: white; border-color: var(--coral); }
 
-  .ops-section-title {
-    font-size: 14px; font-weight: 700; color: var(--mute);
-    text-transform: uppercase; letter-spacing: 1.2px;
-    margin: 36px 0 14px;
-  }
-  .ops-section-title:first-of-type { margin-top: 12px; }
-
-  /* ===== Demo 展示 ===== */
-  .demo {
-    background: linear-gradient(180deg, #1c5d8a 0%, #0b3954 100%);
-    color: white;
-    overflow: hidden;
-  }
-  .demo .section-title, .demo .section-subtitle { color: white; }
-  .demo .section-subtitle { color: rgba(255,255,255,0.75); }
+  /* ===== Demo ===== */
+  .demo { background: var(--abyss); color: white; overflow: hidden; }
+  .demo .eyebrow-section { color: var(--coral); }
+  .demo .section-title { color: white; }
+  .demo .section-subtitle { color: rgba(255,255,255,0.65); }
 
   .demo-grid {
-    display: grid; grid-template-columns: 1.2fr 1fr; gap: 60px;
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 70px;
     align-items: center;
   }
-  @media (max-width: 900px) {
-    .demo-grid { grid-template-columns: 1fr; }
-  }
+  @media (max-width: 900px) { .demo-grid { grid-template-columns: 1fr; } }
 
   .demo-img-wrap {
     position: relative;
-    border-radius: 22px;
+    border-radius: var(--radius-lg);
     overflow: hidden;
-    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.5);
-    background: linear-gradient(135deg, #f0f9fb 0%, #d4f1f4 100%);
+    box-shadow: 0 40px 100px -20px rgba(0,0,0,0.6);
+    background: linear-gradient(135deg, #f0f4f8 0%, #c5d8e8 100%);
     aspect-ratio: 1 / 1;
   }
-  .demo-img-wrap img {
-    width: 100%; height: 100%; object-fit: cover;
-  }
+  .demo-img-wrap img { width: 100%; height: 100%; object-fit: cover; }
   .demo-img-wrap::after {
     content: ""; position: absolute; inset: 0;
-    background: linear-gradient(135deg, transparent 50%, rgba(11, 57, 84, 0.15) 100%);
+    background: linear-gradient(180deg, transparent 60%, rgba(4, 17, 31, 0.4) 100%);
     pointer-events: none;
   }
-
-  .demo-tag {
-    display: inline-block;
-    padding: 4px 12px; border-radius: 6px;
-    background: rgba(244, 162, 97, 0.2);
-    color: var(--gold);
-    font-size: 12px; font-weight: 600; letter-spacing: 0.5px;
-    margin-bottom: 18px;
-  }
-  .demo-text h3 {
-    font-size: 30px; font-weight: 700; color: white;
-    margin-bottom: 16px; letter-spacing: -0.5px;
-  }
-  .demo-text p { color: rgba(255,255,255,0.8); margin-bottom: 18px; font-size: 15px; }
-  .demo-text ul {
-    list-style: none; margin-bottom: 28px;
-  }
-  .demo-text ul li {
-    padding: 8px 0; padding-left: 28px; position: relative;
-    color: rgba(255,255,255,0.85); font-size: 14.5px;
-  }
-  .demo-text ul li::before {
-    content: "✓"; position: absolute; left: 0; top: 8px;
-    color: #4ade80; font-weight: 700; font-size: 16px;
-  }
-
-  /* ===== 版本 ===== */
-  .versions {
-    background: white;
-  }
-  .timeline {
-    position: relative;
-    max-width: 900px; margin: 60px auto 0;
-  }
-  .timeline::before {
-    content: ""; position: absolute; left: 50%;
-    top: 0; bottom: 0; width: 2px;
-    background: linear-gradient(180deg, transparent, var(--wave-1), var(--ocean-2), var(--gold), transparent);
-    transform: translateX(-50%);
-  }
-  .t-item {
-    position: relative; padding: 24px 0;
-    width: 50%; padding-right: 50px;
-  }
-  .t-item:nth-child(even) { margin-left: 50%; padding-right: 0; padding-left: 50px; }
-  .t-item .badge {
-    position: absolute; right: -10px; top: 32px;
-    background: var(--deep); color: white;
-    padding: 6px 14px; border-radius: 999px;
-    font-weight: 700; font-size: 13px;
-    box-shadow: 0 4px 16px rgba(11, 57, 84, 0.3);
+  .demo-img-wrap .float {
+    position: absolute; left: 20px; bottom: 20px;
+    color: white; font-size: 11px; letter-spacing: 1.5px;
+    font-weight: 600; text-transform: uppercase;
     z-index: 2;
   }
-  .t-item:nth-child(even) .badge { right: auto; left: -10px; }
-  .t-item h4 {
-    font-size: 18px; font-weight: 700;
-    color: var(--deep); margin-bottom: 6px;
+  .demo-img-wrap .float .v {
+    font-family: "Instrument Serif", serif; font-size: 22px; font-style: italic;
+    text-transform: none; letter-spacing: -0.01em;
+    display: block;
   }
-  .t-item p { font-size: 14px; color: var(--mute); }
 
-  /* ===== 性能数字 ===== */
-  .metrics {
-    background: linear-gradient(180deg, #0f4c75 0%, #0b3954 100%);
-    color: white;
+  .demo-text h3 {
+    font-family: "Instrument Serif", serif; font-size: 36px; font-weight: 400;
+    color: white; margin-bottom: 22px; line-height: 1.15; letter-spacing: -0.015em;
   }
-  .metrics .section-title { color: white; }
-  .metrics .section-subtitle { color: rgba(255,255,255,0.7); }
+  .demo-text h3 em { font-style: italic; color: var(--coral); }
+  .demo-text p { color: rgba(255,255,255,0.7); margin-bottom: 24px; font-size: 15px; }
+  .demo-text ul {
+    list-style: none; margin-bottom: 32px;
+    border-top: 1px solid rgba(255,255,255,0.1);
+  }
+  .demo-text ul li {
+    padding: 14px 0; padding-left: 24px; position: relative;
+    color: rgba(255,255,255,0.85); font-size: 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+  }
+  .demo-text ul li::before {
+    content: ""; position: absolute; left: 0; top: 22px;
+    width: 12px; height: 1px; background: var(--coral);
+  }
+  .demo-text ul li b { color: white; font-weight: 600; }
 
-  .metrics-grid {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px;
+  /* ===== Versions: 横向单行 timeline, 9 节点 ===== */
+  .versions { background: var(--snow); }
+  .versions-timeline {
+    position: relative;
     margin-top: 50px;
+    padding: 40px 0;
   }
-  @media (max-width: 900px) { .metrics-grid { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 540px) { .metrics-grid { grid-template-columns: 1fr; } }
+  .vt-line {
+    position: absolute; left: 0; right: 0; top: 50%;
+    height: 1px; background: var(--line);
+  }
+  .vt-line::before {
+    content: ""; position: absolute; left: 0; top: -1px;
+    width: 20%; height: 3px;
+    background: linear-gradient(90deg, var(--ocean), var(--coral));
+    border-radius: 2px;
+  }
+  .vt-nodes {
+    display: flex; justify-content: space-between;
+    position: relative; z-index: 1;
+  }
+  .vt-node {
+    text-align: center; cursor: pointer;
+    transition: all 0.3s;
+  }
+  .vt-node:hover { transform: translateY(-3px); }
+  .vt-dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: white; border: 2px solid var(--mist);
+    margin: 0 auto 12px;
+    transition: all 0.3s;
+  }
+  .vt-node.current .vt-dot { background: var(--coral); border-color: var(--coral); transform: scale(1.4); box-shadow: 0 0 0 4px var(--coral-glow); }
+  .vt-node.milestone .vt-dot { background: var(--ocean); border-color: var(--ocean); }
+  .vt-version {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px; font-weight: 500; color: var(--mute);
+    margin-bottom: 4px;
+  }
+  .vt-node.current .vt-version { color: var(--coral); font-weight: 600; }
+  .vt-label {
+    font-size: 11.5px; color: var(--mute);
+    max-width: 110px; line-height: 1.4;
+  }
+  .vt-node.current .vt-label { color: var(--deep); font-weight: 500; }
+  @media (max-width: 900px) {
+    .vt-nodes { overflow-x: auto; padding-bottom: 12px; }
+    .vt-node { min-width: 80px; padding: 0 8px; }
+    .vt-label { max-width: 80px; }
+  }
 
+  /* ===== Metrics: 大数字 + 引用 ===== */
+  .metrics { background: var(--foam); }
+  .metrics-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px;
+    margin-top: 30px;
+  }
+  @media (max-width: 900px) { .metrics-grid { grid-template-columns: 1fr; } }
   .metric {
-    text-align: center;
-    padding: 32px 18px;
-    background: rgba(255,255,255,0.06);
-    backdrop-filter: blur(8px);
-    border: 1px solid rgba(255,255,255,0.12);
+    padding: 36px 30px;
+    background: white;
+    border: 1px solid var(--line);
     border-radius: var(--radius);
+    transition: all 0.3s;
   }
-  .metric-num {
-    font-size: 56px; font-weight: 800; line-height: 1;
-    background: linear-gradient(135deg, #f4a261 0%, #ff6b6b 50%, #f4a261 100%);
-    -webkit-background-clip: text; background-clip: text;
-    -webkit-text-fill-color: transparent;
-    margin-bottom: 12px;
+  .metric:hover { transform: translateY(-3px); box-shadow: var(--shadow-sm); border-color: transparent; }
+  .metric .v {
+    font-family: "Instrument Serif", serif; font-style: italic;
+    font-size: 64px; line-height: 1;
+    color: var(--coral); letter-spacing: -0.03em;
   }
-  .metric-label { font-size: 15px; font-weight: 600; }
-  .metric-desc { font-size: 13px; color: rgba(255,255,255,0.7); margin-top: 6px; }
+  .metric .v .small {
+    font-size: 32px; color: var(--deep);
+  }
+  .metric .l {
+    font-family: "Inter", sans-serif;
+    font-size: 14px; font-weight: 600; color: var(--deep);
+    margin-top: 16px; letter-spacing: -0.1px;
+  }
+  .metric .d {
+    font-size: 13px; color: var(--mute); line-height: 1.6; margin-top: 6px;
+  }
 
-  /* ===== CTA 结尾 ===== */
+  /* ===== Quote ===== */
+  .quote {
+    background: var(--abyss); color: white;
+    text-align: center;
+  }
+  .quote blockquote {
+    font-family: "Instrument Serif", serif; font-style: italic;
+    font-size: clamp(24px, 3.5vw, 40px); line-height: 1.4;
+    color: white; max-width: 900px; margin: 0 auto 28px;
+    letter-spacing: -0.01em;
+  }
+  .quote blockquote::before {
+    content: "\201C"; display: block; color: var(--coral);
+    font-size: 80px; line-height: 0.4; margin-bottom: 30px;
+  }
+  .quote cite {
+    font-style: normal; font-size: 13px; color: rgba(255,255,255,0.6);
+    letter-spacing: 0.5px;
+  }
+  .quote cite b { color: var(--coral); font-weight: 600; }
+
+  /* ===== CTA ===== */
   .cta-end {
-    background: linear-gradient(180deg, #d4f1f4 0%, #a8dadc 100%);
+    background: linear-gradient(180deg, var(--foam) 0%, var(--mist) 100%);
     text-align: center;
   }
   .cta-end h2 {
-    font-size: clamp(32px, 5vw, 56px); font-weight: 800;
+    font-family: "Instrument Serif", serif; font-style: italic;
+    font-size: clamp(36px, 5vw, 64px); font-weight: 400;
     color: var(--deep); margin-bottom: 22px;
-    letter-spacing: -1.5px;
+    letter-spacing: -0.025em;
   }
-  .cta-end p { font-size: 18px; color: var(--ocean-1); margin-bottom: 40px; }
+  .cta-end p { font-size: 17px; color: var(--indigo); margin-bottom: 40px; }
 
-  /* ===== Footer ===== */
+  /* ===== Footer: 跟 hero 颜色对应, 一头一尾呼应 ===== */
   footer {
-    background: #061a2a; color: rgba(255,255,255,0.6);
-    padding: 60px 32px 30px; text-align: center;
+    background: var(--abyss); color: rgba(255,255,255,0.55);
+    padding: 60px 36px 28px;
   }
-  footer .foot-grid {
-    max-width: var(--maxw); margin: 0 auto 36px;
-    display: grid; grid-template-columns: 2fr 1fr 1fr 1fr;
-    gap: 40px; text-align: left;
+  footer .foot-top {
+    max-width: var(--maxw); margin: 0 auto 40px;
+    display: grid; grid-template-columns: 2.5fr 1fr 1fr 1fr;
+    gap: 50px;
   }
-  @media (max-width: 768px) { footer .foot-grid { grid-template-columns: 1fr 1fr; } }
-  footer h5 { color: white; font-size: 14px; font-weight: 700; margin-bottom: 12px; letter-spacing: 0.5px; }
-  footer a { color: rgba(255,255,255,0.6); display: block; padding: 4px 0; font-size: 14px; transition: color 0.2s; }
-  footer a:hover { color: white; }
-  footer .copy { padding-top: 30px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 13px; }
+  @media (max-width: 768px) { footer .foot-top { grid-template-columns: 1fr 1fr; } }
+  footer .brand h5 { color: white; font-size: 17px; font-weight: 700; margin-bottom: 12px;
+                       display: flex; align-items: center; gap: 10px; }
+  footer .brand p { font-size: 13.5px; line-height: 1.7; }
+  footer h5 { color: white; font-size: 12px; font-weight: 600; margin-bottom: 14px;
+              text-transform: uppercase; letter-spacing: 1.5px; }
+  footer a { color: rgba(255,255,255,0.55); display: block; padding: 4px 0;
+             font-size: 13.5px; transition: color 0.2s; }
+  footer a:hover { color: var(--coral); }
+  footer .badges {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;
+  }
+  footer .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 11px; color: rgba(255,255,255,0.7);
+    font-family: "JetBrains Mono", monospace;
+  }
+  footer .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #4ade80; }
+  footer .copy {
+    max-width: var(--maxw); margin: 0 auto;
+    padding-top: 24px; border-top: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px; color: rgba(255,255,255,0.4);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
 
   /* ===== Responsive ===== */
   @media (max-width: 768px) {
-    .nav-inner { padding: 12px 20px; }
-    .nav-links { gap: 16px; }
+    .nav-inner { padding: 14px 20px; }
+    .nav-links { gap: 14px; }
     .nav-links a:not(.nav-cta) { display: none; }
-    .hero { padding: 80px 20px 100px; }
-    section { padding: 60px 20px; }
-    .hero-stats { gap: 30px; }
+    .hero { padding: 90px 20px 110px; }
+    section { padding: 70px 20px; }
+    .hero-mega { gap: 30px; }
   }
 
   /* 滚动渐入 */
-  .fadein {
-    opacity: 0; transform: translateY(30px);
-    transition: opacity 0.8s, transform 0.8s;
-  }
-  .fadein.visible {
-    opacity: 1; transform: translateY(0);
+  .fadein { opacity: 0; transform: translateY(28px); transition: opacity 0.8s, transform 0.8s; }
+  .fadein.visible { opacity: 1; transform: translateY(0); }
+
+  /* 可访问: 减弱动效 */
+  @media (prefers-reduced-motion: reduce) {
+    .bubble, .fish, .scroll-hint, .flow-num, .op, .metric, .vt-node { transition: none; animation: none; }
   }
 </style>
 </head>
@@ -560,23 +743,18 @@
 <nav class="nav">
   <div class="nav-inner">
     <div class="logo">
-      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-        <circle cx="16" cy="16" r="15" fill="url(#g1)" />
-        <path d="M8 16 Q12 11 16 16 T24 16" stroke="white" stroke-width="2" fill="none" stroke-linecap="round"/>
-        <path d="M8 20 Q12 15 16 20 T24 20" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.6"/>
-        <defs>
-          <linearGradient id="g1" x1="0" y1="0" x2="32" y2="32">
-            <stop offset="0%" stop-color="#3282b8"/>
-            <stop offset="100%" stop-color="#0b3954"/>
-          </linearGradient>
-        </defs>
-      </svg>
+      <div class="logo-mark">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M2 6 Q5 3 8 6 T14 6" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+          <path d="M2 10 Q5 7 8 10 T14 10" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round" opacity="0.6"/>
+        </svg>
+      </div>
       MechCAD Kernel
     </div>
     <div class="nav-links">
-      <a href="#flow">工作流程</a>
-      <a href="#ops">43 个 op</a>
-      <a href="#demo">demo</a>
+      <a href="#flow">流程</a>
+      <a href="#ops">能力</a>
+      <a href="#demo">演示</a>
       <a href="#versions">版本</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel" target="_blank">GitHub ↗</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/README.md" target="_blank" class="nav-cta">快速开始</a>
@@ -587,30 +765,29 @@
 
 <!-- ===== Hero 竖向 5 段渐变浅海浪 ===== -->
 <section class="hero">
-  <!-- 5 段渐变 + 波浪分割 -->
   <div class="wave wave-1">
-    <svg viewBox="0 0 1440 80" preserveAspectRatio="none">
-      <path d="M0,40 C240,80 480,0 720,40 C960,80 1200,0 1440,40 L1440,80 L0,80 Z" fill="rgba(255,255,255,0.5)"/>
+    <svg viewBox="0 0 1440 90" preserveAspectRatio="none">
+      <path d="M0,45 C240,90 480,0 720,45 C960,90 1200,0 1440,45 L1440,90 L0,90 Z" fill="rgba(255,255,255,0.5)"/>
     </svg>
   </div>
   <div class="wave wave-2">
-    <svg viewBox="0 0 1440 90" preserveAspectRatio="none">
-      <path d="M0,45 C360,90 720,0 1080,45 C1260,67 1350,22 1440,45 L1440,90 L0,90 Z" fill="rgba(255,255,255,0.4)"/>
+    <svg viewBox="0 0 1440 100" preserveAspectRatio="none">
+      <path d="M0,50 C360,100 720,0 1080,50 C1260,75 1350,25 1440,50 L1440,100 L0,100 Z" fill="rgba(255,255,255,0.4)"/>
     </svg>
   </div>
   <div class="wave wave-3">
-    <svg viewBox="0 0 1440 100" preserveAspectRatio="none">
-      <path d="M0,50 C240,100 480,0 720,50 C960,100 1200,0 1440,50 L1440,100 L0,100 Z" fill="rgba(255,255,255,0.3)"/>
+    <svg viewBox="0 0 1440 110" preserveAspectRatio="none">
+      <path d="M0,55 C240,110 480,0 720,55 C960,110 1200,0 1440,55 L1440,110 L0,110 Z" fill="rgba(255,255,255,0.3)"/>
     </svg>
   </div>
   <div class="wave wave-4">
-    <svg viewBox="0 0 1440 110" preserveAspectRatio="none">
-      <path d="M0,55 C360,110 720,0 1080,55 C1260,82 1350,27 1440,55 L1440,110 L0,110 Z" fill="rgba(255,255,255,0.25)"/>
+    <svg viewBox="0 0 1440 120" preserveAspectRatio="none">
+      <path d="M0,60 C360,120 720,0 1080,60 C1260,90 1350,30 1440,60 L1440,120 L0,120 Z" fill="rgba(255,255,255,0.2)"/>
     </svg>
   </div>
   <div class="wave wave-5"></div>
 
-  <!-- 装饰泡泡 + 鱼群 -->
+  <!-- 装饰 -->
   <div class="bubble b1"></div>
   <div class="bubble b2"></div>
   <div class="bubble b3"></div>
@@ -621,51 +798,50 @@
   <div class="fish f3"></div>
 
   <div class="hero-content">
-    <div class="badge">
-      <span class="dot"></span>
-      v2.11 最新 &nbsp;·&nbsp; 43 个 op &nbsp;·&nbsp; 334 测试全过 &nbsp;·&nbsp; 5 段浅海浪
+    <!-- 状态徽章: 1 个小 chip, 不喧宾夺主 -->
+    <div class="status-chip">
+      <span class="pulse"></span>
+      <span class="v">v2.11</span> &nbsp;·&nbsp; 334 tests pass &nbsp;·&nbsp; AGPL-3.0
     </div>
+
+    <!-- 标题: Instrument Serif italic, 突出"看真实几何" -->
     <h1>
-      让 LLM 看见 <span class="stroke">真实几何</span><br>
-      把手绘草图, <span class="stroke">变成工业级</span> CAD
+      <em>让 LLM</em> 看见<br>
+      <span class="accent">真实几何</span>
     </h1>
+
     <p class="subtitle">
-      <span class="tagline">看 → 想 → 做 → 验</span>
-      &nbsp; 拟人化建模工作流 &nbsp;
-      <span class="tagline">100% 真实 OCC 几何</span>
-      &nbsp;
-      <span class="tagline">AGPL-3.0 开源</span>
+      手绘草图, 文字描述, 通过 <em class="serif">看→想→做→验</em> 范式,
+      生成工业级 <span class="mono" style="font-size: 0.9em; color: var(--coral);">.step</span> 几何.
     </p>
-    <p class="subtitle" style="font-size: 16px; color: var(--mute); max-width: 680px;">
-      兼容 OpenAI / DeepSeek / Anthropic. 43 个原子 op 真实实现.
-      装配, 齿轮, 碰撞检查一步到位.
-    </p>
+
+    <span class="eyebrow">43 个原子 op &nbsp;·&nbsp; 100% 真实实现 &nbsp;·&nbsp; OpenCascade 内核</span>
 
     <div class="hero-cta">
-      <a href="https://github.com/vanyu0710/mechcad-kernel" class="btn btn-primary">
-        ★ Star on GitHub
-      </a>
-      <a href="#ops" class="btn btn-ghost">
-        查看 43 个 op →
-      </a>
+      <a href="https://github.com/vanyu0710/mechcad-kernel" class="btn btn-primary">★ Star on GitHub</a>
+      <a href="#ops" class="btn btn-ghost">查看 43 个 op →</a>
     </div>
 
-    <div class="hero-stats">
-      <div class="stat">
-        <div class="stat-num">43</div>
-        <div class="stat-label">公开 op · 全部真实</div>
+    <!-- Hero 唯一大数字: 0% 误差是 MechKernel 的核心承诺 -->
+    <div class="hero-mega">
+      <div class="mega-num serif">0%</div>
+      <div class="mega-side">
+        <div class="label">SINGLE BOOLEAN ERROR</div>
+        <div class="sub">真实 OCC, 0 占位</div>
+        <span class="small">多次累加 2-7% 边界精度损失</span>
       </div>
-      <div class="stat">
-        <div class="stat-num">334</div>
-        <div class="stat-label">测试全过 (v2.11)</div>
+    </div>
+
+    <!-- 3 个小数字, 补充但不超过主数字 -->
+    <div class="hero-mini-stats">
+      <div class="mini-stat">
+        <span class="v">43</span><span class="l">公开 op</span>
       </div>
-      <div class="stat">
-        <div class="stat-num">0%</div>
-        <div class="stat-label">单次 boolean 误差</div>
+      <div class="mini-stat">
+        <span class="v">334</span><span class="l">测试全过</span>
       </div>
-      <div class="stat">
-        <div class="stat-num">3</div>
-        <div class="stat-label">端到端 demo</div>
+      <div class="mini-stat">
+        <span class="v">v2.11</span><span class="l">3 端到端 demo</span>
       </div>
     </div>
   </div>
@@ -674,266 +850,276 @@
 </section>
 
 
-<!-- ===== 工作流程 ===== -->
+<!-- ===== 流程: timeline 形式 (不是 4 卡片) ===== -->
 <section class="flow fadein" id="flow">
   <div class="section-inner">
-    <h2 class="section-title">看 → 想 → 做 → 验</h2>
+    <span class="eyebrow-section">Workflow</span>
+    <h2 class="section-title">拟人化建模, <em>工程师的方式</em></h2>
     <p class="section-subtitle">
-      拟人化建模, 模仿人类工程师的范式. LLM 端到端生成可制造 CAD 几何.
+      不是"一次性预测". 模仿工程师: 看完想清楚, 边做边看, 错了就回退.
     </p>
-    <div class="flow-steps">
+    <div class="flow-timeline">
       <div class="flow-step">
-        <span class="icon">👁</span>
-        <div class="num">1</div>
-        <h3>看 · Vision</h3>
-        <p>手绘 PNG + 文字描述 → 结构化 JSON (part_type / dimensions).</p>
+        <div class="flow-num">01</div>
+        <h3><em>看</em> · Vision</h3>
+        <p>手绘 PNG + 文字 → 结构化 JSON</p>
+        <span class="code">part_type, dimensions</span>
       </div>
       <div class="flow-step">
-        <span class="icon">🧠</span>
-        <div class="num">2</div>
-        <h3>想 · Planner</h3>
-        <p>JSON → op 序列. 43 个原子 op, LLM 用 Few-shot 即可学会调用.</p>
+        <div class="flow-num">02</div>
+        <h3><em>想</em> · Planner</h3>
+        <p>JSON → op 序列</p>
+        <span class="code">43 atomic ops, Few-shot</span>
       </div>
       <div class="flow-step">
-        <span class="icon">🔨</span>
-        <div class="num">3</div>
-        <h3>做 · MechKernel</h3>
-        <p>每步立即反馈 StepResult {ok, geometry, error}. 真实 OCC 几何, 0% 误差.</p>
+        <div class="flow-num">03</div>
+        <h3><em>做</em> · MechKernel</h3>
+        <p>每步立即反馈</p>
+        <span class="code">StepResult {ok, geometry}</span>
       </div>
       <div class="flow-step">
-        <span class="icon">✅</span>
-        <div class="num">4</div>
-        <h3>验 · Validate</h3>
-        <p>几何验证 + 碰撞检查 + 多视角渲染. 失败自动 rollback, 状态不污染.</p>
+        <div class="flow-num">04</div>
+        <h3><em>验</em> · Validate</h3>
+        <p>几何 + 碰撞 + 渲染</p>
+        <span class="code">8 kind assembly check</span>
       </div>
     </div>
   </div>
 </section>
 
 
-<!-- ===== 43 个 op ===== -->
+<!-- ===== 43 op: 按版本分大组, 不再用统一 grid ===== -->
 <section class="ops fadein" id="ops">
   <div class="section-inner">
-    <h2 class="section-title">43 个原子 op</h2>
-    <p class="section-subtitle">全部真实 OCC 实现, 不是 placeholder. 覆盖从草图到装配的完整建模链路.</p>
+    <span class="eyebrow-section">Capabilities</span>
+    <h2 class="section-title">43 个 op, <em>三层演进</em></h2>
+    <p class="section-subtitle">
+      基础 33 op + v2.7 参考系 5 op + v2.8 齿轮 3 op + v2.9 碰撞 1 op.
+      卡片配色区分: 基础白 · v2.7 金 · v2.8 紫 · v2.9 珊瑚.
+    </p>
 
-    <div class="ops-section-title">草图 · 6</div>
-    <div class="ops-grid">
-      <div class="op-card">create_workplane</div>
-      <div class="op-card">new_sketch</div>
-      <div class="op-card">add_circle</div>
-      <div class="op-card">add_rectangle</div>
-      <div class="op-card">add_line</div>
-      <div class="op-card">close_sketch</div>
+    <div class="ops-row">
+      <div class="meta">
+        <div class="num">BASE · 33 OP</div>
+        <h4>草图 → 装配</h4>
+        <p class="desc">从草图到 I/O 全链路. 包含草图 / 主体 / 细节 / pattern / query / 装配 / I/O / 事务 / 重放 / 约束 / 渲染 / 验证 12 类.</p>
+      </div>
+      <div class="ops-grid">
+        <span class="op">create_workplane</span>
+        <span class="op">new_sketch</span>
+        <span class="op">add_circle</span>
+        <span class="op">add_rectangle</span>
+        <span class="op">add_line</span>
+        <span class="op">close_sketch</span>
+        <span class="op">extrude</span>
+        <span class="op">revolve</span>
+        <span class="op">sweep</span>
+        <span class="op">boolean</span>
+        <span class="op">fillet</span>
+        <span class="op">chamfer</span>
+        <span class="op">shell</span>
+        <span class="op">hole</span>
+        <span class="op">linear_pattern</span>
+        <span class="op">circular_pattern</span>
+        <span class="op">mirror</span>
+        <span class="op">query</span>
+        <span class="op">select</span>
+        <span class="op">measure</span>
+        <span class="op">assemble</span>
+        <span class="op">query_assembly</span>
+        <span class="op">export</span>
+        <span class="op">import_step</span>
+        <span class="op">save_project</span>
+        <span class="op">load_project</span>
+        <span class="op">undo</span>
+        <span class="op">redo</span>
+        <span class="op">delete_feature</span>
+        <span class="op">update_feature</span>
+        <span class="op">rebuild</span>
+        <span class="op">add_constraint</span>
+        <span class="op">set_parameter</span>
+      </div>
     </div>
 
-    <div class="ops-section-title">主体 · 5</div>
-    <div class="ops-grid">
-      <div class="op-card">extrude</div>
-      <div class="op-card">revolve</div>
-      <div class="op-card">sweep</div>
-      <div class="op-card">boolean</div>
+    <div class="ops-row">
+      <div class="meta">
+        <div class="num">v2.7 · 5 OP</div>
+        <h4>参考坐标系</h4>
+        <p class="desc">5 个新 op. 把硬编码坐标换成"语义化装配". <span class="serif" style="color: #8b6914;">金边高亮</span>.</p>
+      </div>
+      <div class="ops-grid">
+        <span class="op v27">create_reference_plane</span>
+        <span class="op v27">query_reference</span>
+        <span class="op v27">resolve_point</span>
+        <span class="op v27">resolve_placement</span>
+        <span class="op v27">validate_assembly</span>
+      </div>
     </div>
 
-    <div class="ops-section-title">细节 · 4</div>
-    <div class="ops-grid">
-      <div class="op-card">fillet</div>
-      <div class="op-card">chamfer</div>
-      <div class="op-card">shell</div>
-      <div class="op-card">hole</div>
+    <div class="ops-row">
+      <div class="meta">
+        <div class="num">v2.8 · 3 OP</div>
+        <h4>真实 ISO 6336 齿轮</h4>
+        <p class="desc">真实 involute 曲线 (spline_approx) + bore subtract. 啮合 0 假干涉. <span class="serif" style="color: #6c3a82;">紫色高亮</span>.</p>
+      </div>
+      <div class="ops-grid">
+        <span class="op v28">build_involute_gear</span>
+        <span class="op v28">gear_geometry</span>
+        <span class="op v28">center_distance</span>
+      </div>
     </div>
 
-    <div class="ops-section-title">pattern · 3</div>
-    <div class="ops-grid">
-      <div class="op-card">linear_pattern</div>
-      <div class="op-card">circular_pattern</div>
-      <div class="op-card">mirror</div>
-    </div>
-
-    <div class="ops-section-title">query / 度量 · 3</div>
-    <div class="ops-grid">
-      <div class="op-card">query</div>
-      <div class="op-card">select</div>
-      <div class="op-card">measure</div>
-    </div>
-
-    <div class="ops-section-title">装配 / I/O / 事务 · 8</div>
-    <div class="ops-grid">
-      <div class="op-card">assemble</div>
-      <div class="op-card">query_assembly</div>
-      <div class="op-card">export</div>
-      <div class="op-card">import_step</div>
-      <div class="op-card">save_project</div>
-      <div class="op-card">load_project</div>
-      <div class="op-card">undo</div>
-      <div class="op-card">redo</div>
-    </div>
-
-    <div class="ops-section-title">参数化重放 · 3</div>
-    <div class="ops-grid">
-      <div class="op-card">delete_feature</div>
-      <div class="op-card">update_feature</div>
-      <div class="op-card">rebuild</div>
-    </div>
-
-    <div class="ops-section-title">约束 / 渲染 / 验证 · 3</div>
-    <div class="ops-grid">
-      <div class="op-card">add_constraint</div>
-      <div class="op-card">set_parameter</div>
-      <div class="op-card">render</div>
-    </div>
-
-    <div class="ops-section-title">v2.7 参考坐标系 · 5</div>
-    <div class="ops-grid">
-      <div class="op-card v27">create_reference_plane</div>
-      <div class="op-card v27">query_reference</div>
-      <div class="op-card v27">resolve_point</div>
-      <div class="op-card v27">resolve_placement</div>
-      <div class="op-card v27">validate_assembly</div>
-    </div>
-
-    <div class="ops-section-title">v2.8 真实齿轮 · 3</div>
-    <div class="ops-grid">
-      <div class="op-card v28">build_involute_gear</div>
-      <div class="op-card v28">gear_geometry</div>
-      <div class="op-card v28">center_distance</div>
-    </div>
-
-    <div class="ops-section-title">v2.9 碰撞检查 · 1</div>
-    <div class="ops-grid">
-      <div class="op-card v29">check_interference</div>
+    <div class="ops-row">
+      <div class="meta">
+        <div class="num">v2.9 · 1 OP</div>
+        <h4>OCC boolean 碰撞检查</h4>
+        <p class="desc">BRepAlgoAPI_Common → 体积阈值. 装配诊断最后一公里. <span class="serif" style="color: var(--coral);">珊瑚高亮</span>.</p>
+      </div>
+      <div class="ops-grid">
+        <span class="op v29">check_interference</span>
+      </div>
     </div>
   </div>
 </section>
 
 
-<!-- ===== Demo ===== -->
+<!-- ===== Demo 15 ===== -->
 <section class="demo fadein" id="demo">
   <div class="section-inner">
-    <h2 class="section-title">真实装配 · 一键可视化</h2>
-    <p class="section-subtitle">demo 14 / demo 15 真实建模 + 渲染, 展示真实几何能力.</p>
-
+    <span class="eyebrow-section">Live demo</span>
+    <h2 class="section-title">液压齿轮泵, <em>真实装配</em></h2>
+    <p class="section-subtitle">
+      demo 15: housing (12 步 MechKernel pipeline) + 2 真实 involute 齿轮 + 2 轴 + 8 kind 装配验证 + 5 part 碰撞.
+    </p>
     <div class="demo-grid">
       <div class="demo-img-wrap">
-        <img src="images/demo15_3d_top.png" alt="Hydraulic Gear Pump 3D" loading="lazy"/>
+        <img src="images/demo15_3d_top.png" alt="Hydraulic Gear Pump top view" loading="lazy"/>
+        <div class="float">
+          housing + 2 真实 involute 齿轮 + 2 轴
+          <span class="v">1.06 M mm³</span>
+        </div>
       </div>
       <div class="demo-text">
-        <span class="demo-tag">DEMO 15 · v2.9.1</span>
-        <h3>液压齿轮泵 (housing + 真实齿轮 + 装配 + 碰撞)</h3>
-        <p>运用 8 大类 op 30+ 次:</p>
+        <h3>用 8 大类能力造 1 个<em>真零件</em></h3>
+        <p>housing 用 MechKernel 12 步完整 pipeline (草图 → extrude → fillet → chamfer → hole → linear/circular_pattern → mirror), 齿轮用 v2.8 真实 involute, 验证用 v2.7 8 kind, 碰撞用 v2.9.</p>
         <ul>
-          <li>MechKernel 12 步 pipeline: 草图 → extrude → fillet → chamfer → hole (counterbore) → 4 个 mount (linear pattern) → 6 个 bolt (circular pattern) → 2 个 oil (mirror) → 2 个 shaft hole</li>
-          <li>v2.7 reference frame (5 个) + 8 kind validate_assembly (coaxial / parallel / perpendicular / axis_misalign / mounted / inside / gear_mesh / coaxial_aligned)</li>
-          <li>v2.8 真实 involute 齿轮 (z=24, z=36, m=2.5, 中心距 75mm) — 0 假干涉</li>
-          <li>v2.9 OCC boolean 碰撞检查 (5 parts × 10 pairs)</li>
-          <li>STEP 导出 (1.58 MB) + 3D 渲染 (build123d tessellate + matplotlib)</li>
+          <li><b>Housing</b> 200×140×130, 4 mount + 6 bolt + 2 oil + 2 shaft hole, 50 faces</li>
+          <li><b>真实 involute 齿轮</b> m=2.5, z=24/36, 中心距 75mm, 啮合 0 假干涉</li>
+          <li><b>8 kind validate</b> coaxial / parallel / perpendicular / axis_misalign / mounted / inside / gear_mesh / coaxial_aligned → 0 issues</li>
+          <li><b>5 part × 10 pair 碰撞</b> 检出 5 干涉 (housing 切齿轮/轴等), 真实机械诊断</li>
         </ul>
-        <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/mech_kernel/examples/15_hydraulic_pump.py" target="_blank" class="btn btn-ghost" style="color: white; border-color: white; background: transparent;">
-          查看源码 →
-        </a>
+        <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/mech_kernel/examples/15_hydraulic_pump.py" target="_blank" class="btn btn-ghost" style="color: white; border-color: rgba(255,255,255,0.3); background: transparent;">查看源码 →</a>
       </div>
     </div>
   </div>
 </section>
 
 
-<!-- ===== 版本时间线 ===== -->
+<!-- ===== Versions: 单行时间线 ===== -->
 <section class="versions fadein" id="versions">
   <div class="section-inner">
-    <h2 class="section-title">v1.0 → v2.10 演进</h2>
-    <p class="section-subtitle">9 个月, 从 placeholder 走到真实工业级内核.</p>
-    <div class="timeline">
-      <div class="t-item">
-        <div class="badge">v1.0</div>
-        <h4>基础 25 op</h4>
-        <p>18 op + 5 类错误 + 事务 Savepoint. 89 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.0</div>
-        <h4>参数化重放</h4>
-        <p>op_history + delete/update/rebuild 真实重算. 210 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.4</div>
-        <h4>约束参数化</h4>
-        <p>8 种草图约束 + SciPy 求解器 + 命名尺寸. 244 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.5</div>
-        <h4>专业渲染 + 实例装配</h4>
-        <p>OCC 优先双渲染 + 无头 fallback. 248 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.6</div>
-        <h4>几何验证 + 严格回滚</h4>
-        <p>提交前验证 + 稳定 reason code + 确定性 fingerprint. 253 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.7</div>
-        <h4>参考坐标系</h4>
-        <p>5 个新 op + 8 kind 装配验证. 264 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.8</div>
-        <h4>真实 ISO 6336 齿轮</h4>
-        <p>真实 involute 曲线 + bore subtract + 10 测试.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.9</div>
-        <h4>碰撞检查 (OCC boolean)</h4>
-        <p>5 parts × 21 pair 检查 + 11 测试. 291 通过.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.10</div>
-        <h4>真 involute + 演示 15</h4>
-        <p>3D 渲染 + 复杂液压泵 demo. 工业自评 6.5/10.</p>
-      </div>
-      <div class="t-item">
-        <div class="badge">v2.11</div>
-        <h4>demo 16 减速箱座 (425546 mm³)</h4>
-        <p>33 op 全流程 + select 边 reference + 排油孔 + 油标 + 顶缘倒角. 334 测试.</p>
+    <span class="eyebrow-section">Roadmap</span>
+    <h2 class="section-title">9 个月, 从 18 op 到 43 op</h2>
+    <p class="section-subtitle">
+      当前 v2.11, 自评分 6.5/10, 距离工业生产 1.0 还需 2-3 人月.
+    </p>
+    <div class="versions-timeline">
+      <div class="vt-line"></div>
+      <div class="vt-nodes">
+        <div class="vt-node milestone">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v1.0</div>
+          <div class="vt-label">18 op<br/>事务基础</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.0</div>
+          <div class="vt-label">参数化<br/>重放</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.4</div>
+          <div class="vt-label">草图<br/>约束</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.5</div>
+          <div class="vt-label">专业<br/>渲染</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.6</div>
+          <div class="vt-label">验证 +<br/>回滚</div>
+        </div>
+        <div class="vt-node milestone">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.7</div>
+          <div class="vt-label">参考<br/>坐标系</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.8</div>
+          <div class="vt-label">真实<br/>齿轮</div>
+        </div>
+        <div class="vt-node">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.9</div>
+          <div class="vt-label">碰撞<br/>检查</div>
+        </div>
+        <div class="vt-node current">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.11</div>
+          <div class="vt-label">复杂零件<br/>demo</div>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
 
-<!-- ===== 性能数字 ===== -->
+<!-- ===== Metrics: 大数字 + 描述 ===== -->
 <section class="metrics fadein">
   <div class="section-inner">
+    <span class="eyebrow-section">Numbers</span>
     <h2 class="section-title">用数字说话</h2>
-    <p class="section-subtitle">不是 benchmark 报告, 是真实跑出来的指标.</p>
     <div class="metrics-grid">
       <div class="metric">
-        <div class="metric-num">43</div>
-        <div class="metric-label">真实 op</div>
-        <div class="metric-desc">100% OCC 实现, 0 placeholder</div>
+        <div class="v">43<span class="small"> op</span></div>
+        <div class="l">真实实现, 0 placeholder</div>
+        <div class="d">从草图到装配, 13 大类, LLM 可直接调用</div>
       </div>
       <div class="metric">
-        <div class="metric-num">0%</div>
-        <div class="metric-label">单次 boolean 误差</div>
-        <div class="metric-desc">多次累加 2-7% 边界精度损失</div>
+        <div class="v">334<span class="small"> / 334</span></div>
+        <div class="l">测试 100% 通过</div>
+        <div class="d">v1.0 → v2.11 全面覆盖, 含集成测试 + 几何验证</div>
       </div>
       <div class="metric">
-        <div class="metric-num">334</div>
-        <div class="metric-label">测试全过</div>
-        <div class="metric-desc">v1.0 → v2.11 全覆盖, 0 fail</div>
-      </div>
-      <div class="metric">
-        <div class="metric-num">2-3</div>
-        <div class="metric-label">人月距 1.0</div>
-        <div class="metric-desc">真 CAD 工业级生产标准</div>
+        <div class="v">2-3<span class="small"> 人月</span></div>
+        <div class="l">距工业 1.0</div>
+        <div class="d">真 CAD 工业级生产标准, 已 6.5/10</div>
       </div>
     </div>
   </div>
 </section>
 
 
-<!-- ===== CTA 结尾 ===== -->
+<!-- ===== Quote ===== -->
+<section class="quote fadein">
+  <div class="section-inner">
+    <blockquote>
+      "看 → 想 → 做 → 验" 的拟人化范式, 让 LLM 不再是一次性预测,
+      而是边做边看, 错了就回退的<em style="color: var(--coral);">工程师</em>.
+    </blockquote>
+    <cite><b>v2.11 自评</b> · 6.5/10 · 距离 1.0 还需 AABB + 装配诊断 + 集成 aicad</cite>
+  </div>
+</section>
+
+
+<!-- ===== CTA ===== -->
 <section class="cta-end fadein">
   <div class="section-inner">
-    <h2>从手绘草图, 到真实装配</h2>
-    <p>让 LLM 拥有工程师的双手. 加入社区, 共同打造 AI CAD 的未来.</p>
+    <h2>从手绘草图, 到<em>真实</em>装配</h2>
+    <p>让 LLM 拥有工程师的双手.</p>
     <div class="hero-cta">
       <a href="https://github.com/vanyu0710/mechcad-kernel" class="btn btn-primary">★ Star on GitHub</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/README.md" class="btn btn-ghost">查看文档</a>
@@ -944,65 +1130,83 @@
 
 <!-- ===== Footer ===== -->
 <footer>
-  <div class="foot-grid">
-    <div>
-      <div class="logo" style="color: white; margin-bottom: 14px;">
-        <svg width="28" height="28" viewBox="0 0 32 32">
-          <circle cx="16" cy="16" r="15" fill="#3282b8" />
-          <path d="M8 16 Q12 11 16 16 T24 16" stroke="white" stroke-width="2" fill="none" stroke-linecap="round"/>
-        </svg>
+  <div class="foot-top">
+    <div class="brand">
+      <h5>
+        <div class="logo-mark">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M2 6 Q5 3 8 6 T14 6" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            <path d="M2 10 Q5 7 8 10 T14 10" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round" opacity="0.6"/>
+          </svg>
+        </div>
         MechCAD Kernel
-      </div>
-      <p style="font-size: 14px; line-height: 1.7;">
-        为 <a href="https://github.com/vanyu0710/aicad" target="_blank" style="color: white;">MechCAD IDE</a> 开发的<br/>
-        前体视觉建模内核. AGPL-3.0 开源.
+      </h5>
+      <p>
+        为 <a href="https://github.com/vanyu0710/aicad" target="_blank">MechCAD IDE</a> 开发的
+        前体视觉建模内核. <br/>AGPL-3.0-or-later · 工业自评 6.5/10.
       </p>
+      <div class="badges">
+        <span class="badge"><span class="dot"></span> 334 tests passing</span>
+        <span class="badge">build123d 0.11.1</span>
+        <span class="badge">OCC 7.9.3</span>
+      </div>
     </div>
     <div>
-      <h5>产品</h5>
+      <h5>Product</h5>
       <a href="#ops">43 个 op</a>
       <a href="#flow">工作流程</a>
-      <a href="#demo">demo</a>
+      <a href="#demo">demo 15</a>
     </div>
     <div>
-      <h5>资源</h5>
+      <h5>Resources</h5>
       <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/README.md" target="_blank">README</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/HANDOFF.md" target="_blank">HANDOFF</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/tree/main/mech_kernel/examples" target="_blank">Examples</a>
     </div>
     <div>
-      <h5>社区</h5>
+      <h5>Community</h5>
       <a href="https://github.com/vanyu0710/mechcad-kernel" target="_blank">GitHub</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/issues" target="_blank">Issues</a>
       <a href="https://github.com/vanyu0710/mechcad-kernel/blob/main/LICENSE" target="_blank">License</a>
     </div>
   </div>
   <div class="copy">
-    © 2026 MechCAD Kernel · AGPL-3.0-or-later · Built with build123d + OpenCascade 7.9.3
+    <span>© 2026 MechCAD Kernel · AGPL-3.0-or-later</span>
+    <span>Built with build123d + OpenCascade 7.9.3 + matplotlib</span>
   </div>
 </footer>
 
 
 <script>
   // 滚动渐入
+  // 用 rootMargin "0px 0px 100% 0px" 让全屏内任何 fadein 立即可见
+  // (避免 full_page 截屏时元素全 opacity:0)
   const observer = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-      }
+      if (entry.isIntersecting) entry.target.classList.add('visible');
     });
-  }, { threshold: 0.12 });
-
+  }, { threshold: 0, rootMargin: "0px 0px 50% 0px" });
   document.querySelectorAll('.fadein').forEach(el => observer.observe(el));
+
+  // 兜底: 如果没 scroll 过, 1s 后强制全部 visible
+  setTimeout(() => {
+    document.querySelectorAll('.fadein:not(.visible)').forEach(el => el.classList.add('visible'));
+  }, 1500);
 
   // 滚到 nav 背景
   const nav = document.querySelector('.nav');
   window.addEventListener('scroll', () => {
-    if (window.scrollY > 60) {
-      nav.style.background = 'rgba(240, 249, 251, 0.92)';
-    } else {
-      nav.style.background = 'rgba(240, 249, 251, 0.72)';
-    }
+    nav.style.background = window.scrollY > 60
+      ? 'rgba(246, 249, 252, 0.92)'
+      : 'rgba(246, 249, 252, 0.78)';
+  });
+
+  // 版本时间线: 点击节点高亮
+  document.querySelectorAll('.vt-node').forEach(node => {
+    node.addEventListener('click', () => {
+      document.querySelectorAll('.vt-node').forEach(n => n.classList.remove('current'));
+      node.classList.add('current');
+    });
   });
 </script>
 
