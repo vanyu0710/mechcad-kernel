@@ -1,7 +1,8 @@
 # MechKernel × aicad — 带 CAD 的 Codex：harness 化 + 人机协作集成路线图
 
 > 状态：规划文档 · 供接手对话直接开工
-> 更新：2026-09-02
+> 更新：2026-09-03
+> 进度：**P0 ✅ / P1 ✅ / P2 ✅（已落地）**；P3（改动清单）、P4（打磨）待做。P0-P2 的落地说明见文末「已落地进度」。
 > 范围：本文件只描述方案与分阶段任务，不含可执行代码。接手对话应从这里开工，从 Phase 0 + Phase 1 的"单会话垂直切片"做起。
 
 ---
@@ -159,3 +160,28 @@ FeaturePlanV3 一步 `box_base` ≈ MechKernel 四步（create_workplane→new_s
 3. 先读：内核 `docs/HANDOFF.md`（v2.11）+ `mech_kernel/kernel.py` 的 execute/feature_graph；aicad `HANDOFF.md` + `backend/cad.py` + `cad_worker/freecad_executor.py`（学习 RPC/工件契约参考）。
 4. 建议首任务：**P0** — 写 `mech_kernel/server.py` 薄 JSON-RPC 壳，用 `mech_kernel/examples/01_cylinder.py` 的建模序列冒烟；然后 **P1** — 用最小 agent loop 接真实 LLM，跑通"文字 → 3D"单会话切片。
 5. 每阶段保持两仓各自测试可跑：内核 `PYTHONPATH=. .\.venv\Scripts\python.exe mech_kernel/tests`（当前 334/334）；aicad `python -m unittest discover -s tests`。
+
+---
+
+## 已落地进度（2026-09-03）
+
+- **P0 ✅**：`mech_kernel/server.py` —— 常驻 stdio JSON-lines RPC 薄壳（capabilities/execute/feature_tree/
+  select_refs/update_feature/delete_feature/undo/redo/rebuild/query/measure/validate_geometry/render/
+  export/export_mesh/save_project/load_project/snapshot/restore/state/shutdown）+ `export_mesh`（STL 直导当前几何，
+  补 kernel.export 只支持 STEP 的缺口）。26 项测试 + `scripts/smoke_kernel_server.py` 冒烟。
+- **P1 ✅**：aicad `backend/agent/` + `backend/kernel_worker.py` —— 原生 function calling 逐步驱动 33 公开 op，
+  RECOVERABLE 自修复（schema 过滤 fix），体积变化导 STL、收尾验证+导 STEP、提交快照。
+- **P2 ✅（本轮，弱化 FeaturePlanV3）**：aicad 主路径全面切 MechKernel harness。
+  - `backend/agent/approvals.py` `ApprovalBroker`：agent 线程 `request()` 阻塞等用户答复，`POST /agent/resolve`
+    approve/reject/edit；超时 `MECHCAD_AGENT_APPROVAL_TIMEOUT`（默认 600s）自动跳过。
+  - 三类确认点：破坏性操作（delete_feature / confirm_replace / shell）、破坏性修复（RECOVERABLE 且 fix 含
+    confirm_replace）、`ask_user` 合成工具；WS 事件 `approval_required`，前端 `ApprovalPanel`（批准/改参/拒绝）。
+  - kernel 直连 REST：`/kernel/feature_tree`、`/kernel/update_feature`、`/kernel/delete_feature`、
+    `/kernel/undo`、`/kernel/redo`（参数化重放 + 重导 STL/STEP + 提交快照）；`/undo` `/redo` 在 kernel worker
+    存活时走内核，否则回退 legacy 快照。
+  - 前端：主按钮/Ctrl+G → agent/start；`KernelFeatureTree`（op_history + nodes + 状态徽标 + 删除）、
+    `KernelFeatureForm`（改参数→update_feature）；agent 状态入 store；hasModel 只看 stl。
+  - agent 开局含 feature_graph 上下文，支撑"暂停接管 → 手动编辑 → 交还继续"。
+  - FeaturePlanV3 链路**冻结保留**（免删，UI 不再暴露旧入口）。
+- **测试**：内核 360/360；aicad 后端 315/315、前端 64/64；质量门 compileall + `git diff --check` 全绿。
+- **待做**：P3（改动清单 diff 面板）、P4（worker 崩溃 _op_history 重放恢复、多会话并发池、事件/取消等）。
