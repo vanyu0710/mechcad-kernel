@@ -50,3 +50,6 @@ mech_kernel/examples/rocket_motor_out/nozzle_section.png
 mech_kernel/examples/gearbox_out/
 
 mech_kernel/examples/gearbox_housing_out/
+
+# Local agent/session artifacts (ZCode plans, not part of the kernel).
+.zcode/
