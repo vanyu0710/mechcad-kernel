@@ -201,6 +201,22 @@ harness 集成阶段 (v2.11 已铺路, 集成时做):
 - 会话管理壳 (每会话一 kernel 实例 + RPC/队列)
 - ⚠️ AGPL-3.0 许可证: 闭源商业集成前需法律评估或双授权
 
+### 已落地: P0 worker RPC server (2026-09-03)
+
+- `mech_kernel/server.py`: 常驻子进程 stdio JSON-lines RPC 薄壳 (协议见模块 docstring),
+  持单实例 MechKernel, 每请求独立 try/except。命令: ping/capabilities/execute/
+  feature_tree/select_refs/update_feature/delete_feature/undo/redo/rebuild/query/
+  measure/validate_geometry/render/export/export_mesh/save_project/load_project/
+  snapshot/restore/state/shutdown
+- `export_mesh` 补 STL 网格导出 (build123d export_stl 直导当前几何, 不进参数化历史;
+  kernel.export 仍只支持 STEP); render PNG 走 base64
+- 失败 StepResult 是成功的 RPC (`ok:true, data.success:false`); RPC 级 `ok:false`
+  仅协议/内部错误 (UNKNOWN_CMD / BAD_REQUEST / INTERNAL)
+- 测试 `mech_kernel/tests/test_server.py` (26 项, 可独立直跑) + 真子进程冒烟
+  `scripts/smoke_kernel_server.py` (box+hole→导出→undo/redo→snapshot/restore)
+- 集成方 (aicad) 靠 cwd=仓库根 / PYTHONPATH 导入 kernel; 协议强制 UTF-8
+- 集成路线图: `docs/mechkernel-harness-roadmap.md` (aicad agent loop 接入方案)
+
 ## Self-Review Summary (v2.9.1)
 
 | 项 | 数量 | 状态 |
@@ -228,6 +244,10 @@ sys.exit(mock.main(['mech_kernel/tests']))
 
 # v2.11 新测试
 PYTHONPATH=. ./.venv/Scripts/python.exe mech_kernel/tests/test_v11_part_modeling.py
+
+# P0 worker server 测试 (26 项) + 真子进程冒烟
+PYTHONPATH=. ./.venv/Scripts/python.exe mech_kernel/tests/test_server.py
+./.venv/Scripts/python.exe scripts/smoke_kernel_server.py
 
 # 跑 demo 14 (v3.1 in-kernel gearbox)
 PYTHONPATH=. python3 mech_kernel/examples/14_gearbox.py
