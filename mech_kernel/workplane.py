@@ -63,9 +63,12 @@ class Workplane:
             self.y_dir = (0.0, 0.0, 1.0)
             self.normal = (1.0, 0.0, 0.0)
         elif self.type == WorkplaneType.XZ:
+            # v2.13.2: 原 (x, +z, +y) 是左手系（x×y = -y ≠ 声明的 normal），几何构建
+            # 时被 build123d 按右手系重算，导致草图 v 轴与声明相反、模型反复试探平面
+            # 映射。现保持 v=+z（工程直觉：XZ 平面横 x 纵 z），法向取 -y 恢复右手系。
             self.x_dir = (1.0, 0.0, 0.0)
             self.y_dir = (0.0, 0.0, 1.0)
-            self.normal = (0.0, 1.0, 0.0)
+            self.normal = (0.0, -1.0, 0.0)
     
     def to_dict(self) -> dict:
         return {

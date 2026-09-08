@@ -155,6 +155,48 @@ k.extrude(sketch_name="sk", depth=5)
 
 # ---------- entrypoint ----------
 
+
+
+
+def _plane_bbox(wp_type: str):
+    """在给定标准平面画 center=(30,50) r=5 的圆、depth=10 拉伸，返回 bbox。"""
+    k = MechKernel()
+    k.create_workplane(name="w", type=wp_type)
+    k.new_sketch(workplane_name="w", sketch_name="s")
+    k.add_circle(sketch_name="s", center=(30, 50), radius=5)
+    k.close_sketch(sketch_name="s")
+    k.extrude(sketch_name="s", depth=10)
+    return k.execute("query", target="_current_geometry", what="bounding_box").value
+def test_standard_plane_axes_match_declaration():
+    """v2.13.2: XZ 曾因左手系声明被 build123d 重算，u/v 方向与声明相反，
+    模型只能反复试探平面映射。此回归锁死三个标准平面的 (u,v,normal) 语义。"""
+    cases = {
+        # 平面: (期望 xmin,xmax,ymin,ymax,zmin,zmax)
+        "XY": (25, 35, 45, 55, 0, 10),      # u=x, v=y, 法向 +z
+        "YZ": (0, 10, 25, 35, 45, 55),      # u=y, v=z, 法向 +x
+        "XZ": (25, 35, -10, 0, 45, 55),     # u=x, v=z, 法向 -y（右手系）
+    }
+    for wp_type, (x0, x1, y0, y1, z0, z1) in cases.items():
+        bb = _plane_bbox(wp_type)
+        got = (round(bb["xmin"]), round(bb["xmax"]), round(bb["ymin"]),
+               round(bb["ymax"]), round(bb["zmin"]), round(bb["zmax"]))
+        expect = (x0, x1, y0, y1, z0, z1)
+        assert all(abs(a - b) <= 1 for a, b in zip(got, expect)), \
+            f"{wp_type}: 实测 {got}，期望 {expect}"
+    print("  ✓ test_standard_plane_axes_match_declaration")
+def test_standard_planes_are_right_handed():
+    """声明的 (x_dir, y_dir, normal) 必须构成右手系，否则几何构建必然走样。"""
+    from mech_kernel.workplane import Workplane, WorkplaneType
+    for t in (WorkplaneType.XY, WorkplaneType.YZ, WorkplaneType.XZ):
+        wp = Workplane(id="x", name="x", type=t)
+        xd, yd, nd = wp.x_dir, wp.y_dir, wp.normal
+        cross = (xd[1] * yd[2] - xd[2] * yd[1],
+                 xd[2] * yd[0] - xd[0] * yd[2],
+                 xd[0] * yd[1] - xd[1] * yd[0])
+        assert all(abs(cross[i] - nd[i]) < 1e-9 for i in range(3)), \
+            f"{t}: x×y={cross} != normal={nd}（左手系）"
+    print("  ✓ test_standard_planes_are_right_handed")
+
 def main():
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]
     print(f"找到 {len(tests)} 个 v2.13 run_script 测试\n")

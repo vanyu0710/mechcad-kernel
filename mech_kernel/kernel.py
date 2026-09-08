@@ -507,7 +507,7 @@ class MechKernel:
         wp_origin = (0.0, 0.0, 0.0)
         wp_x = {"XY": (1.0, 0.0, 0.0), "YZ": (0.0, 1.0, 0.0), "XZ": (1.0, 0.0, 0.0),
                 "custom": (1.0, 0.0, 0.0), "face": (1.0, 0.0, 0.0)}[type]
-        wp_normal = {"XY": (0.0, 0.0, 1.0), "YZ": (1.0, 0.0, 0.0), "XZ": (0.0, 1.0, 0.0),
+        wp_normal = {"XY": (0.0, 0.0, 1.0), "YZ": (1.0, 0.0, 0.0), "XZ": (0.0, -1.0, 0.0),
                      "custom": None, "face": None}[type]
         reference = None
         history_kwargs = dict(name=name, type=type, offset=offset)
@@ -572,8 +572,16 @@ class MechKernel:
 
         with Transaction(self, "create_workplane") as txn:
             entry = self._record_history("create_workplane", **history_kwargs)
+            # v2.13.2: custom/face 平面显式推导 y_dir（normal × x_dir，右手系）。
+            # 此前只给 x_dir/normal，y_dir 保持默认 (0,1,0)，当法向或 x_dir 恰为 Y 时
+            # 二者平行，构造 build123d 平面会报 "x_dir and y_dir must not be parallel"。
+            wp_y = (
+                wp_normal[1] * wp_x[2] - wp_normal[2] * wp_x[1],
+                wp_normal[2] * wp_x[0] - wp_normal[0] * wp_x[2],
+                wp_normal[0] * wp_x[1] - wp_normal[1] * wp_x[0],
+            )
             wp = Workplane(id=f"wp_{name}_{self._ids.next_workplane_id()}", name=name, type=WorkplaneType(type),
-                           origin=wp_origin, x_dir=wp_x, normal=wp_normal, reference=reference)
+                           origin=wp_origin, x_dir=wp_x, y_dir=wp_y, normal=wp_normal, reference=reference)
             self.workplanes.register(wp)
             self.narrative.append(f"创建工作平面 {name} ({type})")
             txn.commit()
@@ -4236,10 +4244,15 @@ class MechKernel:
     def _sketch_plane(self, sketch, direction: str = "Z"):
         """v2.11: 草图所属 workplane 的真实 build123d 平面。
 
-        - standard 过原点平面：返回 None（沿用 direction 参数选择 Plane.XY/YZ/XZ，
-          完全向后兼容）
-        - custom / face / offset 平面：按 workplane 的 origin/x_dir/normal 构造，
-          草图 2D 坐标 (u, v) 映射到 origin + u*x_dir + v*y_dir，沿 normal 拉伸
+        - 过原点、且 u/v/normal 与 direction 一致的标准平面：返回 None
+          （沿用 direction 参数选 Plane.XY/YZ/XZ，完全向后兼容）
+        - 其余（custom / face / offset，或标准平面但轴定义与 direction 不符）：
+          按 workplane 的 origin/x_dir/normal 构造，草图 2D 坐标 (u, v) 映射到
+          origin + u*x_dir + v*y_dir，沿 normal 拉伸。
+
+        v2.13.2 修复：此前所有"过原点标准平面"一律返回 None，于是 XZ 草图
+        被 direction="Z" 退化成 Plane.XY——声明的 u=x/v=z 从未生效，模型只能
+        反复试探平面映射。现在只有在真实等价时才走 None 快路径。
         """
         from build123d import Plane as B3DPlane
         try:
@@ -4248,11 +4261,33 @@ class MechKernel:
             return None
         if wp is None:
             return None
-        is_standard = (wp.type in (WorkplaneType.XY, WorkplaneType.YZ, WorkplaneType.XZ)
-                       and tuple(wp.origin) == (0.0, 0.0, 0.0))
-        if is_standard:
+        # 声明轴与 direction 隐含平面是否一致（一致才可用 None 快路径）
+        dir_axes = {
+            "X": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0)),  # YZ
+            "Y": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),  # XZ
+            "Z": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),  # XY
+        }.get(direction)
+        axes_match = dir_axes is not None and all(
+            abs(wp.x_dir[i] - dir_axes[0][i]) < 1e-9
+            and abs(wp.y_dir[i] - dir_axes[1][i]) < 1e-9
+            and abs(wp.normal[i] - dir_axes[2][i]) < 1e-9
+            for i in range(3)
+        )
+        is_origin = tuple(float(v) for v in wp.origin) == (0.0, 0.0, 0.0)
+        if is_origin and axes_match:
             return None
-        return B3DPlane(origin=tuple(wp.origin), x_dir=tuple(wp.x_dir), z_dir=tuple(wp.normal))
+        # build123d 由 x_dir × y_dir 推出 z_dir（拉伸方向）。声明坐标系必须右手系
+        # （normal = x_dir × y_dir）；若反向则说明该平面用了"左手"约定，这里按声明的
+        # normal 翻转 y_dir，保证 v 轴朝向与拉伸方向都与 Workplane 一致。
+        xd = tuple(float(v) for v in wp.x_dir)
+        yd = tuple(float(v) for v in wp.y_dir)
+        nd = tuple(float(v) for v in wp.normal)
+        cross = (xd[1] * yd[2] - xd[2] * yd[1],
+                 xd[2] * yd[0] - xd[0] * yd[2],
+                 xd[0] * yd[1] - xd[1] * yd[0])
+        if sum(cross[i] * nd[i] for i in range(3)) < 0:
+            yd = tuple(-v for v in yd)
+        return B3DPlane(origin=tuple(wp.origin), x_dir=xd, y_dir=yd)
 
     def _record_ref_births(self, refs: List[str]) -> None:
         """v2.11: select 发放引用时记录其诞生 revision"""
