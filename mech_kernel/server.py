@@ -24,6 +24,8 @@
     ping             健康检查 → {"pong": true, "kernel_version": ...}
     capabilities     公开/实验 op 的 LLM schema（cap.list_public/list_experimental）
     execute          {op, args, allow_experimental} → StepResult JSON
+    run_script       {code, name?} → StepResult JSON（v2.13：模型脚本经 k 门面调公开 op；
+                     执行前检查点、脚本异常整体回滚并回传原始 traceback）
     feature_tree     feature_graph.to_dict()
     select_refs      select(filter_type, element_type, face_index) → StepResult
     update_feature   {feature_id, new_params} → StepResult
@@ -155,6 +157,14 @@ class KernelServer:
             result = self.kernel.execute(op, allow_experimental=allow_experimental, **args)
             return _step_to_dict(result, include_render=bool(payload.get("include_render", False)))
 
+        if cmd == "run_script":
+            # v2.13: 建模脚本通道（沙箱边界见 mech_kernel/script_sandbox.py）
+            code = self._require(payload, "code")
+            if not isinstance(code, str):
+                raise ValueError("code 必须是字符串")
+            result = self.kernel.run_script(code, name=str(payload.get("name") or ""))
+            return _step_to_dict(result, include_render=bool(payload.get("include_render", True)))
+
         if cmd == "feature_tree":
             graph = self.kernel.feature_graph.to_dict()
             return {
@@ -257,6 +267,13 @@ class KernelServer:
 
         if cmd == "state":
             return _jsonable(self.kernel.get_state())
+
+        if cmd == "reset":
+            # v2.12: 进程内重建全新 MechKernel（ID 生成器/特征图/几何全清）。
+            # 供上层"逐件建模"流程：一个零件归档导出后清空，开始下一件。
+            self.kernel = MechKernel()
+            self._memory_snapshot = None
+            return {"reset": True, "kernel_version": KERNEL_VERSION}
 
         if cmd == "shutdown":
             return {"bye": True}

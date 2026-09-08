@@ -115,7 +115,7 @@ def main() -> int:
         check("ping", ping.get("pong") is True, f"version={ping.get('kernel_version')}")
 
         caps = server.ok("capabilities")
-        check("capabilities 33 ops", caps.get("public_count") == 33, f"got {caps.get('public_count')}")
+        check("capabilities 34 ops", caps.get("public_count") == 34, f"got {caps.get('public_count')}")
         check("experimental 10 ops", len(caps.get("experimental", [])) == 10)
         tool_names = {c["name"] for c in caps["public"]}
         check("schema 可用于 LLM tools", {"extrude", "hole", "select", "set_parameter"} <= tool_names)

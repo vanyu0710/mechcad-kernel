@@ -77,11 +77,20 @@ def test_gear_bore_reduces_volume():
     g_with_bore = build_involute_gear(module=2.0, teeth=20, width=18, bore=17)
     # bore 17 → bore_vol = π·8.5²·18 = 4084
     bore_vol = math.pi * (17/2) ** 2 * 18
-    # g_with_bore ≈ g_no_bore - bore_vol (近似)
+    # g_with_bore ≈ g_no_bore - bore_vol（v2.12.1 修复后应为真实通孔，偏差 < 3%）
     diff = g_no_bore.volume - g_with_bore.volume
-    assert abs(diff - bore_vol) / bore_vol < 0.05, \
-        f"bore 减少的体积 ({diff:.0f}) 与理论 ({bore_vol:.0f}) 差 > 5%"
+    assert abs(diff - bore_vol) / bore_vol < 0.03, \
+        f"bore 减少的体积 ({diff:.0f}) 与理论通孔 ({bore_vol:.0f}) 差 > 3%"
     print("  ✓ test_gear_bore_reduces_volume")
+
+
+def test_gear_is_single_connected_solid():
+    """v2.12.1 回归门：齿必须与毂盘连成单一实体（此前渐开线齿悬浮在基圆上，STEP 里 18 个 solid）。"""
+    for bore in (0, 14):
+        g = build_involute_gear(module=2.0, teeth=17, width=16, bore=bore)
+        n = len(g.solids())
+        assert n == 1, f"bore={bore}: 齿轮应为 1 个实体，实际 {n}（齿未连接到毂盘）"
+    print("  ✓ test_gear_is_single_connected_solid")
 
 
 def test_gear_various_teeth_count():

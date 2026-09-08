@@ -23,6 +23,7 @@ class FeatureType(str, Enum):
     REVOLVE = "revolve"
     SWEEP = "sweep"
     BOOLEAN = "boolean"
+    GEAR = "gear"  # v2.12: make_gear 直接生成齿轮坯（渐开线/梯形）
     
     # I/O 类 (v1.5)
     EXPORT = "export"
