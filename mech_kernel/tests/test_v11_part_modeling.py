@@ -351,6 +351,35 @@ def test_revolve_on_custom_workplane_honest_error():
     print("  ✓ test_revolve_on_custom_workplane_honest_error")
 
 
+def test_revolve_cross_axis_profile_is_recoverable():
+    """v2.12: 剖面跨旋转轴 → 提前抛 RecoverableError（带引导），不再让 OCC 崩溃成未预期错误"""
+    k = MechKernel()
+    k.create_workplane("xy", "XY")
+    k.new_sketch("xy", "cross")
+    k.add_rectangle("cross", 10, 20, center=(0, 0))  # 跨 Y 轴（x 从 -5 到 +5）
+    k.close_sketch("cross")
+    try:
+        k.revolve("cross", axis=[0, 0, 0, 0, 1, 0], angle=360, mode="new_body")
+        assert False, "跨轴剖面应抛 RecoverableError"
+    except RecoverableError as e:
+        assert "跨" in str(e) or "轴" in str(e)
+        assert e.reason_code == "revolve_profile_crosses_axis"
+        assert (e.suggestion or {}).get("reason_code") == "revolve_profile_crosses_axis"
+    print("  ✓ test_revolve_cross_axis_profile_is_recoverable")
+
+
+def test_revolve_valid_lathe_still_works():
+    """v2.12 回归：剖面整体在轴一侧（x≥0）的合法车削件仍应成功"""
+    k = MechKernel()
+    k.create_workplane("xy", "XY")
+    k.new_sketch("xy", "lathe")
+    k.add_rectangle("lathe", 10, 20, center=(40, 0))  # 全在 Y 轴一侧
+    k.close_sketch("lathe")
+    r = k.revolve("lathe", axis=[0, 0, 0, 0, 1, 0], angle=360, mode="new_body")
+    assert r.success, r.error
+    print("  ✓ test_revolve_valid_lathe_still_works")
+
+
 def test_custom_workplane_origin_respected():
     """custom workplane origin/normal 真实生效（不再被丢弃）"""
     k = MechKernel()
@@ -420,7 +449,7 @@ def test_unknown_field_suggestion_has_valid_fields():
 def test_experimental_gate():
     """装配 op 默认拒绝, allow_experimental=True 放行"""
     k = MechKernel()
-    assert len(PUBLIC_OPS) == 33
+    assert len(PUBLIC_OPS) == 34  # v2.12: + make_gear
     assert len(EXPERIMENTAL_OPS) == 10
     assert "assemble" in EXPERIMENTAL_OPS and "assemble" not in PUBLIC_OPS
     r = k.execute("query_assembly")

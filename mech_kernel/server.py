@@ -24,6 +24,11 @@
     ping             健康检查 → {"pong": true, "kernel_version": ...}
     capabilities     公开/实验 op 的 LLM schema（cap.list_public/list_experimental）
     execute          {op, args, allow_experimental} → StepResult JSON
+    run_script       {code, name?} → StepResult JSON（v2.13：模型脚本经 k 门面调公开 op；
+                     执行前检查点、脚本异常整体回滚并回传原始 traceback）
+    export_assembly  {parts:[{path,name?,color?,pose?}], out_step} → 无状态装配 XCAF STEP 导出（v2.14）
+    assembly_interference {parts, tolerance?, expected_overlaps?} → 全对干涉+bbox 预过滤+豁免（v2.14）
+    render_assembly  {parts, views?, size?} → 装配分色四视角 PNG（v2.14）
     feature_tree     feature_graph.to_dict()
     select_refs      select(filter_type, element_type, face_index) → StepResult
     update_feature   {feature_id, new_params} → StepResult
@@ -155,6 +160,41 @@ class KernelServer:
             result = self.kernel.execute(op, allow_experimental=allow_experimental, **args)
             return _step_to_dict(result, include_render=bool(payload.get("include_render", False)))
 
+        if cmd == "run_script":
+            # v2.13: 建模脚本通道（沙箱边界见 mech_kernel/script_sandbox.py）
+            code = self._require(payload, "code")
+            if not isinstance(code, str):
+                raise ValueError("code 必须是字符串")
+            result = self.kernel.run_script(code, name=str(payload.get("name") or ""))
+            return _step_to_dict(result, include_render=bool(payload.get("include_render", True)))
+
+        # ---- v2.14 装配场景命令（F2a）：无状态计算，不读写 kernel 实例 ----
+        if cmd in ("export_assembly", "assembly_interference", "render_assembly"):
+            # 绝对导入：server.py 以脚本方式启动（python mech_kernel/server.py），
+            # 相对导入会 ImportError（包内测试导入发现不了，必须绝对）。
+            from mech_kernel.assembly_scene import (
+                assembly_interference as _interference,
+                export_assembly as _export, render_assembly as _render,
+            )
+
+            parts = self._require(payload, "parts")
+            if cmd == "export_assembly":
+                return _export(parts, str(self._require(payload, "out_step")))
+            if cmd == "assembly_interference":
+                return _interference(
+                    parts,
+                    tolerance=float(payload.get("tolerance", 0.001)),
+                    expected_overlaps=payload.get("expected_overlaps"),
+                )
+            png = _render(
+                parts,
+                views=payload.get("views"),
+                size=int(payload.get("size", 480)),
+                quality=str(payload.get("quality", "presentation")),
+            )
+            import base64 as _b64
+            return {"ok": bool(png), "render_base64": _b64.b64encode(png).decode() if png else None}
+
         if cmd == "feature_tree":
             graph = self.kernel.feature_graph.to_dict()
             return {
@@ -257,6 +297,13 @@ class KernelServer:
 
         if cmd == "state":
             return _jsonable(self.kernel.get_state())
+
+        if cmd == "reset":
+            # v2.12: 进程内重建全新 MechKernel（ID 生成器/特征图/几何全清）。
+            # 供上层"逐件建模"流程：一个零件归档导出后清空，开始下一件。
+            self.kernel = MechKernel()
+            self._memory_snapshot = None
+            return {"reset": True, "kernel_version": KERNEL_VERSION}
 
         if cmd == "shutdown":
             return {"bye": True}

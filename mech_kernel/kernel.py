@@ -57,7 +57,7 @@ from .validators import (
 # allow_experimental=True 或直接方法调用可用（代码冻结保留）。
 PUBLIC_OPS = frozenset({
     "create_workplane", "new_sketch", "add_circle", "add_rectangle", "add_line", "close_sketch",
-    "extrude", "revolve", "sweep", "boolean",
+    "extrude", "revolve", "sweep", "boolean", "make_gear",
     "hole", "fillet", "chamfer", "shell",
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
@@ -246,6 +246,37 @@ class MechKernel:
             },
             permission="public",
         ))
+        # v2.12: 齿轮坯直接生成（渐开线齿形，免草图）
+        self.cap.set_capability(Capability(
+            name="make_gear", category="body",
+            description="直接生成直齿圆柱齿轮坯（中心在原点，沿 +Z 拉伸 width，齿形数学 ISO 21771，"
+                        "无需草图）。teeth > involute_teeth_threshold（默认 30）自动走梯形近似齿（OCC boolean "
+                        "在大齿数下慢）；要全渐开线把阈值调大（如 400，代价是慢）。mode 语义与 extrude 一致："
+                        "new_body/add/cut，已有几何时 new_body 必须 confirm_replace=True",
+            input_schema={
+                "module": FieldSchema(type="number", required=True, min=0.1,
+                                      description="齿轮模数 m (mm)，标准第一系列 1/1.25/1.5/2/2.5/3/4/5/6/8/10"),
+                "teeth": FieldSchema(type="integer", required=True, min=6, max=400, description="齿数 z (>=6)"),
+                "width": FieldSchema(type="number", required=True, min=0.1, description="齿宽 (mm)"),
+                "bore": FieldSchema(type="number", required=False, default=0.0, min=0.0,
+                                    description="中心孔直径 (0=无孔, mm)"),
+                "pressure_angle_deg": FieldSchema(type="number", required=False, default=20.0,
+                                                  min=14.5, max=25.0),
+                "mode": FieldSchema(type="enum", required=False, default="new_body",
+                                    enum=["new_body", "add", "cut"]),
+                "name": FieldSchema(type="string", required=False),
+                "confirm_replace": FieldSchema(type="boolean", required=False, default=False),
+                "involute_teeth_threshold": FieldSchema(type="integer", required=False, default=30,
+                                                        min=0, max=400,
+                                                        description="齿数 > 此值自动用梯形近似；设大强制渐开线"),
+                "fallback_to_trapezoid": FieldSchema(type="boolean", required=False, default=True,
+                                                     description="渐开线构造失败时自动回退梯形齿"),
+            },
+            permission="public",
+            examples=[{"module": 2.0, "teeth": 20, "width": 18, "bore": 12},
+                      {"module": 2.0, "teeth": 60, "width": 18, "bore": 0,
+                       "involute_teeth_threshold": 100}],
+        ))
         # undo/redo
         self.cap.set_capability(Capability(
             name="undo", category="edit", description="撤销",
@@ -333,7 +364,7 @@ class MechKernel:
                        "depth": FieldSchema(type="number", required=False, min=0.001,
                                             description="拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm")},
             "query": {"target": FieldSchema(type="string", required=True),
-                      "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"])},
+                      "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count", "solid_count"])},
             "select": {"filter_type": FieldSchema(type="enum", required=False, default="all",
                                                   enum=["all", "plane", "cylinder", "cone", "sphere", "torus",
                                                         "line", "circle", "ellipse", "bezier", "bspline"]),
@@ -476,7 +507,7 @@ class MechKernel:
         wp_origin = (0.0, 0.0, 0.0)
         wp_x = {"XY": (1.0, 0.0, 0.0), "YZ": (0.0, 1.0, 0.0), "XZ": (1.0, 0.0, 0.0),
                 "custom": (1.0, 0.0, 0.0), "face": (1.0, 0.0, 0.0)}[type]
-        wp_normal = {"XY": (0.0, 0.0, 1.0), "YZ": (1.0, 0.0, 0.0), "XZ": (0.0, 1.0, 0.0),
+        wp_normal = {"XY": (0.0, 0.0, 1.0), "YZ": (1.0, 0.0, 0.0), "XZ": (0.0, -1.0, 0.0),
                      "custom": None, "face": None}[type]
         reference = None
         history_kwargs = dict(name=name, type=type, offset=offset)
@@ -541,8 +572,16 @@ class MechKernel:
 
         with Transaction(self, "create_workplane") as txn:
             entry = self._record_history("create_workplane", **history_kwargs)
+            # v2.13.2: custom/face 平面显式推导 y_dir（normal × x_dir，右手系）。
+            # 此前只给 x_dir/normal，y_dir 保持默认 (0,1,0)，当法向或 x_dir 恰为 Y 时
+            # 二者平行，构造 build123d 平面会报 "x_dir and y_dir must not be parallel"。
+            wp_y = (
+                wp_normal[1] * wp_x[2] - wp_normal[2] * wp_x[1],
+                wp_normal[2] * wp_x[0] - wp_normal[0] * wp_x[2],
+                wp_normal[0] * wp_x[1] - wp_normal[1] * wp_x[0],
+            )
             wp = Workplane(id=f"wp_{name}_{self._ids.next_workplane_id()}", name=name, type=WorkplaneType(type),
-                           origin=wp_origin, x_dir=wp_x, normal=wp_normal, reference=reference)
+                           origin=wp_origin, x_dir=wp_x, y_dir=wp_y, normal=wp_normal, reference=reference)
             self.workplanes.register(wp)
             self.narrative.append(f"创建工作平面 {name} ({type})")
             txn.commit()
@@ -1004,6 +1043,186 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
+    def _profile_2d_points(self, sk) -> list:
+        """取剖面在草图平面(2D)上的代表点，用于跨轴/自交判定。"""
+        import math
+        pts: list = []
+        for e in sk.entities:
+            t, p = e.type, e.params
+            if t == "circle":
+                cx, cy = p.get("center", (0, 0)); r = float(p["radius"])
+                pts += [(cx - r, cy), (cx + r, cy), (cx, cy - r), (cx, cy + r)]
+            elif t == "rectangle":
+                w, h = float(p["width"]), float(p["height"])
+                cx, cy = p.get("center", (0, 0))
+                pts += [(cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+                        (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2)]
+            elif t == "line":
+                pts += [tuple(p["start"]), tuple(p["end"])]
+            elif t == "polyline":
+                pts += [tuple(q) for q in p["points"]]
+            elif t == "arc":
+                cx, cy = p.get("center", (0, 0)); r = float(p["radius"])
+                a0, a1 = float(p["start_angle"]), float(p["end_angle"])
+                for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+                    ang = math.radians(a0 + (a1 - a0) * frac)
+                    pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        return pts
+
+    def _check_revolve_axis_crossing(self, sk, axis) -> None:
+        """v2.12: 剖面不能跨旋转轴（否则 build123d/OCC 抛 BRep_API 崩溃且无引导）。
+        提前判定并抛 RecoverableError，让 agent 自修复能接住（把剖面移到轴一侧或改用 extrude）。"""
+        import math
+        ox, oy, oz, dx, dy, dz = axis
+        # 剖面在 XY 面：取轴在 XY 面的投影方向；垂直于剖面的轴无法用 2D 侧向判定
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return
+        n = math.hypot(dx, dy)
+        ux, uy = dx / n, dy / n
+        nx_, ny_ = -uy, ux  # 面内法向
+        pts = self._profile_2d_points(sk)
+        if not pts:
+            return
+        vals = [(px - ox) * nx_ + (py - oy) * ny_ for (px, py) in pts]
+        eps = 1e-6
+        if min(vals) < -eps and max(vals) > eps:
+            raise RecoverableError(
+                "revolve 剖面跨过了旋转轴（旋转会自交，内核无法生成）。"
+                "请把整个剖面移到旋转轴的同一侧（例如所有点 x ≥ 0 或 ≤ 0），或改用 extrude。",
+                suggestion={
+                    "action": "把剖面整体平移到旋转轴一侧（不跨轴）后重试，或改用 extrude",
+                    "alternatives": [{"fix": {"op": "extrude"}}],
+                    "reason_code": "revolve_profile_crosses_axis",
+                },
+                reason_code="revolve_profile_crosses_axis",
+            )
+
+    def make_gear(self, module: float, teeth: int, width: float, bore: float = 0.0,
+                  pressure_angle_deg: float = 20.0, mode: str = "new_body", name: str = "",
+                  confirm_replace: bool = False, involute_teeth_threshold: int = 30,
+                  fallback_to_trapezoid: bool = True) -> StepResult:
+        """v2.12: 直接生成齿轮坯（免草图）。
+
+        在 XY 平面生成直齿圆柱齿轮 Part（分度圆中心在原点，沿 +Z 拉伸 width），
+        齿形数学见 mech_kernel.gear（ISO 21771 渐开线，大齿数回退梯形近似）。
+        mode 语义与 extrude 一致：new_body/add/cut；new_body 覆盖已有几何需 confirm_replace。
+        参数全部可由 _op_history 重放（update_feature 改模数/齿数即重建）。
+        """
+        start = time.time()
+        require_positive("module", module)
+        require_positive("width", width)
+        if not isinstance(teeth, int) or isinstance(teeth, bool) or teeth < 6:
+            raise InvalidRequestError(f"teeth 必须是 >= 6 的整数（当前 {teeth!r}）")
+        if teeth > 400:
+            raise InvalidRequestError(f"teeth 上限 400（当前 {teeth}）")
+        require_non_negative("bore", bore)
+        if mode not in ("new_body", "add", "cut"):
+            raise InvalidRequestError(f"mode 必须是 new_body/add/cut（当前 {mode}）")
+        if mode == "cut" and self._current_geometry is None:
+            raise InvalidRequestError("make_gear mode='cut' 需要先有几何（先建基体再切齿轮形）")
+        # 与 extrude/revolve 一致的新基体守护
+        if mode == "new_body" and self._current_geometry is not None and not confirm_replace:
+            raise RecoverableError(
+                "make_gear mode='new_body' 会清空已有零件。叠加用 mode='add'，切除用 mode='cut'；"
+                "确实要替换请传 confirm_replace=True",
+                suggestion={
+                    "action": "选择修正参数后重试",
+                    "fix": {"mode": "add"},
+                    "alternatives": [
+                        {"fix": {"mode": "cut"}},
+                        {"fix": {"confirm_replace": True}},
+                    ],
+                    "reason_code": "new_body_would_replace",
+                },
+                reason_code="new_body_would_replace",
+            )
+
+        from .gear import build_involute_gear
+        try:
+            gear = build_involute_gear(
+                module=module, teeth=teeth, width=width, bore=bore,
+                pressure_angle_deg=pressure_angle_deg,
+                fallback_to_trapezoid=fallback_to_trapezoid,
+                involute_teeth_threshold=involute_teeth_threshold,
+            )
+        except Exception as e:
+            self._step_counter += 1
+            return self._wrap_step_result(make_failure(
+                error=f"齿轮构造失败: {e}",
+                error_kind="GEOMETRY_FAILURE",
+                suggestion={
+                    "action": "检查参数或允许梯形回退后重试",
+                    "fix": {"fallback_to_trapezoid": True},
+                    "reason_code": "gear_build_failed",
+                },
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            ))
+        if gear is None:
+            self._step_counter += 1
+            return self._wrap_step_result(make_failure(
+                error="齿轮构造返回空几何",
+                error_kind="GEOMETRY_FAILURE",
+                suggestion={"action": "改用 mode='add' 或检查 build123d 环境",
+                            "reason_code": "gear_build_failed"},
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            ))
+
+        profile = "trapezoid" if teeth > involute_teeth_threshold else "involute"
+        with Transaction(self, "make_gear") as txn:
+            entry = self._record_history(
+                "make_gear", module=module, teeth=teeth, width=width, bore=bore,
+                pressure_angle_deg=pressure_angle_deg, mode=mode, name=name,
+                confirm_replace=confirm_replace,
+                involute_teeth_threshold=involute_teeth_threshold,
+                fallback_to_trapezoid=fallback_to_trapezoid,
+            )
+            feature_id = self._ids.next_feature_id()
+            entry["feature_id"] = feature_id
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.GEAR,
+                parameters={"module": module, "teeth": teeth, "width": width, "bore": bore,
+                            "pressure_angle_deg": pressure_angle_deg, "mode": mode, "name": name},
+                name=name or f"gear_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            if mode == "new_body":
+                self._current_geometry = gear
+            elif mode == "add":
+                self._current_geometry = (
+                    gear if self._current_geometry is None else self._current_geometry + gear
+                )
+            else:  # cut
+                self._current_geometry = self._current_geometry - gear
+            self.narrative.append(
+                f"生成齿轮 m={module} z={teeth} b={width}（{profile} 齿形）→ {feature.name}"
+            )
+            txn.commit()
+            self._feature_geometries[feature_id] = self._current_geometry
+
+        render_level = self.adaptive_renderer.should_render(
+            op="make_gear", op_params={"module": module, "teeth": teeth, "width": width},
+            has_geometry=(self._geometry_internal is not None),
+        )
+        render_png = None
+        if render_level != "none":
+            renders = self.renderer.render(self._geometry_internal, level=render_level, geometry_revision=self._geometry_revision)
+            render_png = renders.get("iso") or renders.get("default")
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"生成齿轮 m={module} z={teeth} b={width}（{profile} 齿形，中心孔 {bore}）",
+            render_png=render_png, render_level=render_level,
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+
     def revolve(self, sketch_name: str, axis: list = None, angle: float = 360.0, mode: str = "new_body", name: str = "", confirm_replace: bool = False) -> StepResult:
         """
         v1.3.1 真实 revolve（车削件）— build123d revolve 调试成功！
@@ -1040,6 +1259,8 @@ class MechKernel:
             raise InvalidRequestError(
                 "revolve 暂只支持标准基准面（XY/YZ/XZ 过原点）上的草图；"
                 "草图位于 custom/face/偏置 workplane，请改用 extrude")
+        # v2.12: 剖面跨轴 → 提前给可恢复建议（否则 OCC 抛 BRep_API 崩溃、agent 无从自修复）
+        self._check_revolve_axis_crossing(sk, axis)
         # v2.11: new_body 会清空整个已有零件，必须显式确认（与 extrude/sweep 一致）
         if mode == "new_body" and self._current_geometry is not None and not confirm_replace:
             raise RecoverableError(
@@ -2201,7 +2422,8 @@ class MechKernel:
             what: "bounding_box" | "volume" | "centroid" | "face_count" | "edge_count" | "vertex_count"
         """
         start = time.time()
-        if what not in ("bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count"):
+        if what not in ("bounding_box", "volume", "centroid", "face_count", "edge_count",
+                        "vertex_count", "solid_count"):
             raise InvalidRequestError(f"what 必须是 bounding_box/volume/centroid/face_count/edge_count/vertex_count（当前 {what}）")
         
         # 选几何（v1.16 修复：支持 feature_id 目标 → 该 feature 完成时的几何）
@@ -2221,6 +2443,39 @@ class MechKernel:
 
         if geom is None:
             raise InvalidRequestError("query 需要先有几何")
+
+        # v2.13: solid_count —— 独立实体计数（finish_part 单实体复检契约用）
+        if what == "solid_count":
+            count = None
+            if hasattr(geom, "solids"):
+                try:
+                    count = len(geom.solids())
+                except Exception:
+                    count = None
+            if count is None:
+                from OCP.TopAbs import TopAbs_SOLID
+                from OCP.TopExp import TopExp_Explorer
+                shape = geom.wrapped if hasattr(geom, "wrapped") else geom
+                exp = TopExp_Explorer(shape, TopAbs_SOLID)
+                count = 0
+                while exp.More():
+                    count += 1
+                    exp.Next()
+            self._step_counter += 1
+            result = make_success(
+                feature_id=f"Q_{self._step_counter:03d}",
+                narrative=f"query {target} solid_count = {count}",
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"queried": [target, what]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+            result.value = count
+            result.target = target
+            result.what = what
+            if warning:
+                result.warning = warning
+            return result
 
         # Adapter/mock geometry has no TopoDS wrapper.  Use the same public
         # summary contract instead of passing it to OCP TopExp_Explorer.
@@ -3989,10 +4244,15 @@ class MechKernel:
     def _sketch_plane(self, sketch, direction: str = "Z"):
         """v2.11: 草图所属 workplane 的真实 build123d 平面。
 
-        - standard 过原点平面：返回 None（沿用 direction 参数选择 Plane.XY/YZ/XZ，
-          完全向后兼容）
-        - custom / face / offset 平面：按 workplane 的 origin/x_dir/normal 构造，
-          草图 2D 坐标 (u, v) 映射到 origin + u*x_dir + v*y_dir，沿 normal 拉伸
+        - 过原点、且 u/v/normal 与 direction 一致的标准平面：返回 None
+          （沿用 direction 参数选 Plane.XY/YZ/XZ，完全向后兼容）
+        - 其余（custom / face / offset，或标准平面但轴定义与 direction 不符）：
+          按 workplane 的 origin/x_dir/normal 构造，草图 2D 坐标 (u, v) 映射到
+          origin + u*x_dir + v*y_dir，沿 normal 拉伸。
+
+        v2.13.2 修复：此前所有"过原点标准平面"一律返回 None，于是 XZ 草图
+        被 direction="Z" 退化成 Plane.XY——声明的 u=x/v=z 从未生效，模型只能
+        反复试探平面映射。现在只有在真实等价时才走 None 快路径。
         """
         from build123d import Plane as B3DPlane
         try:
@@ -4001,11 +4261,33 @@ class MechKernel:
             return None
         if wp is None:
             return None
-        is_standard = (wp.type in (WorkplaneType.XY, WorkplaneType.YZ, WorkplaneType.XZ)
-                       and tuple(wp.origin) == (0.0, 0.0, 0.0))
-        if is_standard:
+        # 声明轴与 direction 隐含平面是否一致（一致才可用 None 快路径）
+        dir_axes = {
+            "X": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0)),  # YZ
+            "Y": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),  # XZ
+            "Z": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),  # XY
+        }.get(direction)
+        axes_match = dir_axes is not None and all(
+            abs(wp.x_dir[i] - dir_axes[0][i]) < 1e-9
+            and abs(wp.y_dir[i] - dir_axes[1][i]) < 1e-9
+            and abs(wp.normal[i] - dir_axes[2][i]) < 1e-9
+            for i in range(3)
+        )
+        is_origin = tuple(float(v) for v in wp.origin) == (0.0, 0.0, 0.0)
+        if is_origin and axes_match:
             return None
-        return B3DPlane(origin=tuple(wp.origin), x_dir=tuple(wp.x_dir), z_dir=tuple(wp.normal))
+        # build123d 由 x_dir × y_dir 推出 z_dir（拉伸方向）。声明坐标系必须右手系
+        # （normal = x_dir × y_dir）；若反向则说明该平面用了"左手"约定，这里按声明的
+        # normal 翻转 y_dir，保证 v 轴朝向与拉伸方向都与 Workplane 一致。
+        xd = tuple(float(v) for v in wp.x_dir)
+        yd = tuple(float(v) for v in wp.y_dir)
+        nd = tuple(float(v) for v in wp.normal)
+        cross = (xd[1] * yd[2] - xd[2] * yd[1],
+                 xd[2] * yd[0] - xd[0] * yd[2],
+                 xd[0] * yd[1] - xd[1] * yd[0])
+        if sum(cross[i] * nd[i] for i in range(3)) < 0:
+            yd = tuple(-v for v in yd)
+        return B3DPlane(origin=tuple(wp.origin), x_dir=xd, y_dir=yd)
 
     def _record_ref_births(self, refs: List[str]) -> None:
         """v2.11: select 发放引用时记录其诞生 revision"""
@@ -4565,6 +4847,122 @@ class MechKernel:
         if self._geometry_internal is None:
             return None
         return self._geometry_summary_for(self._geometry_internal)
+
+    # =============================================================
+    # v2.13: run_script —— 模型编写建模脚本（DSH 式：检查点 + 回滚 + 原始 traceback）
+    # =============================================================
+
+    def run_script(self, code: str, name: str = "") -> StepResult:
+        """执行模型编写的建模脚本（只准调 kernel 公开 op）。
+
+        边界见 mech_kernel/script_sandbox.py：AST 白名单（只许 import math、禁 `_` 属性）、
+        受限命名空间（k 门面 + math + 安全 builtins）。执行前 `_snapshot()` 检查点，
+        脚本抛异常则 `_restore()` 整体回滚并回传原始 traceback；成功执行的 op 照常
+        进 `_op_history`/`feature_graph` → 代码件与 op 件一样可参数重放。
+        """
+        start = time.time()
+        import contextlib
+        import io
+        import math
+        import traceback as _traceback
+
+        from .script_sandbox import (
+            SCRIPT_OP_BLACKLIST, ScriptKernel, ScriptSandboxError,
+            safe_builtins, validate_script_code,
+        )
+
+        try:
+            validate_script_code(code)
+        except ScriptSandboxError as exc:
+            self._step_counter += 1
+            return make_failure(
+                error=f"脚本静态校验被拒: {exc}",
+                error_kind="INVALID_REQUEST",
+                suggestion={
+                    "action": "改脚本：import 只许 math；不能访问下划线属性；"
+                              "几何只能通过 k.<公开op>() 产生",
+                    "reason_code": "script_static_rejected",
+                },
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+
+        allowed_ops = sorted(self.PUBLIC_OPS - SCRIPT_OP_BLACKLIST)
+        snapshot = self._snapshot()
+        ops_before = len(self._op_history)
+        captured = io.StringIO()
+        namespace = {
+            "k": ScriptKernel(self, allowed_ops),
+            "math": math,
+            "__builtins__": safe_builtins(),
+        }
+        script_error: Optional[BaseException] = None
+        try:
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                exec(compile(code, f"<run_script:{name or 'script'}>", "exec"), namespace)
+        except BaseException as exc:  # noqa: BLE001 —— 任何脚本异常都要回滚
+            script_error = exc
+        stdout_text = captured.getvalue()[-2000:]
+
+        if script_error is not None:
+            self._restore(snapshot)  # 几何/历史/特征树整体回滚（DSH 检查点语义）
+            tb = "".join(_traceback.format_exception(
+                type(script_error), script_error, script_error.__traceback__))
+            self._step_counter += 1
+            return make_failure(
+                error=f"脚本执行失败（状态已回滚到执行前，可安全改脚本重试）:\n{tb[-4000:]}",
+                error_kind="RECOVERABLE",
+                suggestion={
+                    "action": "按 traceback 修正脚本后重跑 run_script；几何已回滚，无需清理",
+                    "reason_code": "script_failed",
+                },
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+
+        ops_executed = len(self._op_history) - ops_before
+        geometry = self._geometry_internal
+        solids = 0
+        if geometry is not None:
+            try:
+                solids = len(geometry.solids())
+            except Exception:
+                solids = 1
+        summary = self._geometry_summary_for(geometry)
+        self._step_counter += 1
+        result = make_success(
+            feature_id=f"S_{self._step_counter:03d}",
+            narrative=f"run_script {name or 'script'} 完成: {ops_executed} 个 op, solids={solids}",
+            geometry_summary=summary,
+            current_narrative=self.narrative.copy(),
+            warning=(None if ops_executed else
+                     "脚本执行成功但没有调用任何 op（没有产生几何变化）"),
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        )
+        result.value = {
+            "ops_executed": ops_executed,
+            "solids": solids,
+            "volume": summary.volume,
+            "bounding_box": list(summary.bounding_box),
+            "stdout": stdout_text,
+        }
+        # 脚本频率低，直接产 iso 证据渲染
+        if geometry is not None:
+            try:
+                renders = self.renderer.render(
+                    geometry, level="iso_only", geometry_revision=self._geometry_revision)
+                png = renders.get("iso") or renders.get("default")
+                if png:
+                    import base64 as _b64
+                    result.render_png = png
+                    result.render_base64 = _b64.b64encode(png).decode()
+                    result.render_level = "iso_only"
+            except Exception:
+                pass
+        return result
     
     def get_state(self) -> dict:
         wp_count = 0

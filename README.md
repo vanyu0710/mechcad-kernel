@@ -12,8 +12,9 @@
 
 MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
 
-**核心能力 (v2.11)**：
-- **33 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线
+**核心能力 (v2.14)**：
+- **34 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线；v2.12 新增 `make_gear`（真渐开线齿轮坯公开 op）+ worker `reset` RPC；**v2.12.1 修复 make_gear 两处几何缺陷**（渐开线齿悬浮于毂盘、bore 参数反写致假孔），新增单实体/真通孔回归门
+- **v2.13 代码通道 `run_script`**：模型写 Python 脚本、几何只能经 `k` 门面调公开 op（AST 白名单只许 import math、禁 `_` 属性、`__import__` 守卫版）；执行前检查点、失败整体回滚并回传原始 traceback；**脚本内 op 照常进 _op_history，代码件可参数重放**；query 新增 solid_count（单实体复检契约）
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean / 真弧线剖面）
 - **v2.11 选边/选面闭环**: select 返回可回喂引用 (F03/E12) → fillet/chamfer 指定边 / shell 指定开口面 / 面上草图
 - **v2.11 安全基线**: new_body 防护（不再静默清空零件）+ 结构化自修复建议 ({fix: {...}}) + cut 无切除警告
@@ -374,6 +375,10 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.9.1** | **2026-09-01** | **专家审查修复 (P0/P1): coaxial 反向 + collision strict + 旋转 docstring + 死代码清理** | **291+** | **43** |
 | **+ v2.10** | **2026-09-01** | **真 involute 齿轮曲线 + 13 测试 (z≤30 involute, 大齿数梯形 fallback)** | **302** | **43** |
 | **+ v2.11** | **2026-09-01** | **零件建模全流程: 选边/选面闭环 + new_body 防护 + 真弧线剖面 + 面上草图 + hole 任意面 + harness 接口; 装配 10 op 标 experimental** | **329** | **33+10** |
+| **+ v2.12** | **2026-09-06** | **make_gear 公开 op（真渐开线齿轮坯，threshold 控齿形回退，参数化重放）+ worker reset RPC + revolve 半重构缺陷修复（弧/折线剖面 new_solid 未绑定）** | **374** | **34+10** |
+| **+ v2.12.1** | **2026-09-07** | **make_gear 几何修复: 渐开线齿延伸至齿根域（与毂盘融合为单实体）+ bore 半径/高修正（真实通孔）；新增 solids/通孔回归测试** | **377** | **34+10** |
+| **+ v2.13** | **2026-09-08** | **代码通道 run_script: ScriptKernel 门面 + AST 白名单沙箱 + 检查点回滚 + 原始 traceback 反馈 + query solid_count；脚本 op 可参数重放** | **384** | **34+10** |
+| **+ v2.14** | **2026-09-09** | **F2a 装配场景命令: export_assembly（XCAF 具名装配 STEP）+ assembly_interference（bbox 预过滤+豁免表）+ render_assembly（分件着色）；无状态，不动单几何契约** | **391** | **34+10** |
 
 ## 安装
 

@@ -143,6 +143,7 @@ def _build_involute_tooth_face(
     r = m * z / 2.0
     rb = r * math.cos(alpha)
     ra = r + m
+    rf = r - 1.25 * m
 
     # left_flank: involute from (rb, 0) to (ra, +y_top)
     max_t = math.sqrt((ra / rb) ** 2 - 1)
@@ -165,7 +166,18 @@ def _build_involute_tooth_face(
         top_arc.append((ra * math.cos(th), ra * math.sin(th), 0.0))
 
     # 闭合 wire: left_flank + top_arc + right_flank reversed (skip start)
+    # v2.12.1 修复：齿廓原先闭合在基圆 rb 的单尖点上，而 hub 圆盘半径是齿根 rf，
+    # 齿与毂盘之间存在 ~1.5mm 环缝 → 17 个齿全是悬浮独立实体（STEP 里 18 个 solid）。
+    # 现在把齿廓沿径向延伸进齿根圆（rf 根域加宽到 0.9×角节距），保证与毂盘重叠融合。
     pts = left_flank + top_arc + right_flank[::-1][1:]
+    phi = 0.45 * (2.0 * math.pi / teeth)  # 齿根处半角（< 半角节距，不侵邻齿）
+    n_root = 6
+    # 从右齿廓根部 (rb, 0) 径向内收到 rf 右角
+    pts.append((rf * math.cos(-phi), -rf * math.sin(phi), 0.0))
+    for i in range(1, n_root + 1):
+        a = -phi + (2 * phi) * i / n_root
+        pts.append((rf * math.cos(a), rf * math.sin(a), 0.0))
+    # 闭合线自动连回 left_flank 起点 (rb, 0)
     return pts
 
 
@@ -254,10 +266,12 @@ def build_involute_gear(
         gear = bp2.part
 
         # bore subtract
+        # v2.12.1 修复：原 `Cylinder(width, bore/2)` 半径/高写反且居中 z=0，
+        # 实际切掉的是底部环带而非通孔。改为 半径=bore/2、高=width、从 z=0 起。
         if bore > 0:
-            from build123d import Cylinder
+            from build123d import Align, Cylinder
             with BuildPart(Plane.XY) as bp3:
-                add(Cylinder(width, bore / 2.0))
+                add(Cylinder(bore / 2.0, width, align=(Align.CENTER, Align.CENTER, Align.MIN)))
             bore_cyl = bp3.part
             gear = gear - bore_cyl
         return gear

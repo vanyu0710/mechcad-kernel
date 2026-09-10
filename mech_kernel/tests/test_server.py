@@ -121,7 +121,7 @@ def test_missing_required_payload_field():
 
 def test_capabilities_public_and_experimental():
     data = expect_ok(make_server(), "capabilities")
-    assert data["public_count"] == 33
+    assert data["public_count"] == 34  # v2.12: + make_gear
     names = [c["name"] for c in data["public"]]
     for expected in ("create_workplane", "extrude", "hole", "select", "undo", "set_parameter"):
         assert expected in names
@@ -328,6 +328,66 @@ def test_execute_allow_experimental_gate():
     server = make_server()
     denied = expect_ok(server, "execute", {"op": "query_reference", "args": {}})
     assert denied["success"] is False  # 默认拒绝实验 op
+
+
+def test_capabilities_includes_make_gear():
+    """v2.12: make_gear 是公开 op，出现在 capabilities.public 中。"""
+    data = expect_ok(make_server(), "capabilities", {})
+    names = [c["name"] for c in data["public"]]
+    assert "make_gear" in names
+    assert data["public_count"] == len(names)
+
+
+def test_execute_make_gear_over_rpc():
+    """v2.12: execute 走 make_gear 生成真渐开线齿轮（RPC 序列化不丢几何摘要）。"""
+    server = make_server()
+    data = expect_ok(
+        server,
+        "execute",
+        {"op": "make_gear", "args": {"module": 2.0, "teeth": 20, "width": 18, "bore": 12}},
+    )
+    assert data["success"] is True, data
+    assert data["feature_id"], data
+    summary = data["geometry_summary"]
+    assert summary is not None and summary["volume"] > 0
+    # m=2 z=20 b=18 齿轮（带 Ø12 孔）体积量级校核：dedendum 圆柱减孔 < v < addendum 圆柱减孔
+    import math as _m
+    v_lo = _m.pi * 17.5 ** 2 * 18 - _m.pi * 6 ** 2 * 18
+    v_hi = _m.pi * 22 ** 2 * 18 - _m.pi * 6 ** 2 * 18
+    assert v_lo < summary["volume"] < v_hi, summary
+
+
+def test_reset_command_clears_kernel():
+    """v2.12: reset 进程内重建内核——特征树/op_history/几何全清，实例换新。"""
+    server = make_server()
+    run_cylinder(server)
+    old_kernel = server.kernel
+    before = expect_ok(server, "feature_tree", {})
+    assert before["node_count"] > 0
+    data = expect_ok(server, "reset", {})
+    assert data["reset"] is True
+    assert server.kernel is not old_kernel  # 全新实例（ID 生成器隔离）
+    after = expect_ok(server, "feature_tree", {})
+    assert after["node_count"] == 0
+    assert after["op_history"] == []
+    state = expect_ok(server, "state", {})
+    assert state["feature_count"] == 0
+    # reset 后可继续正常建模（ID 从 F_0001 重新开始）
+    data = expect_ok(
+        server,
+        "execute",
+        {"op": "make_gear", "args": {"module": 1.5, "teeth": 18, "width": 10}},
+    )
+    assert data["success"] is True
+    assert data["feature_id"] == "F_0001"
+
+
+def test_reset_clears_memory_snapshot():
+    """reset 后 restore 应报无快照（旧 snapshot 指向已废弃的内核状态）。"""
+    server = make_server()
+    expect_ok(server, "snapshot", {})
+    expect_ok(server, "reset", {})
+    expect_err(server, "restore", {}, kind="BAD_REQUEST")
 
 
 def test_serve_loop_and_shutdown():
