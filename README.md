@@ -2,15 +2,21 @@
 
 > AI CAD 建模内核：让 LLM 通过自然语言/手绘草图生成真实 OCC 几何
 
-[![Tests](https://img.shields.io/badge/tests-334%2F334%20passing-brightgreen)]()
-[![Python](https://img.shields.io/badge/python-3.11+-blue)]()
+<p>
+  <a href="https://vanyu0710.github.io/mechcad-kernel/"><b>🌊 产品落地页</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/vanyu0710/aicad">Varen CAD IDE</a> &nbsp;·&nbsp;
+  <a href="docs/mechkernel-harness-roadmap.md">Harness 路线图</a>
+</p>
+
+[![Tests](https://img.shields.io/badge/tests-391%2F391%20passing-brightgreen)]()
+[![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.11](https://img.shields.io/badge/version-v2.11-blue)]()
+[![v2.11](https://img.shields.io/badge/version-v2.14-blue)]()
 
 ## 概述
 
-MechCAD Kernel 是为 [MechCAD IDE](https://github.com/vanyu0710/aicad) 开发的**前体视觉建模内核**。它实现了"看→想→做→验"的拟人化建模流程，让 LLM 端到端生成可制造的 CAD 几何。
+MechCAD Kernel 是 [Varen CAD](https://github.com/vanyu0710/aicad) 的**参数化 CAD 内核**。它让 LLM 通过**受控代码通道**（`run_script`，几何只能经内核门面调公开 op）逐步建模，端到端生成可制造的 CAD 几何，并支持多零件装配导出。
 
 **核心能力 (v2.14)**：
 - **34 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线；v2.12 新增 `make_gear`（真渐开线齿轮坯公开 op）+ worker `reset` RPC；**v2.12.1 修复 make_gear 两处几何缺陷**（渐开线齿悬浮于毂盘、bore 参数反写致假孔），新增单实体/真通孔回归门
