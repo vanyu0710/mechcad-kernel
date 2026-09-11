@@ -8,11 +8,11 @@
   <a href="docs/mechkernel-harness-roadmap.md">Harness 路线图</a>
 </p>
 
-[![Tests](https://img.shields.io/badge/tests-402%2F402%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-409%2F409%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.11](https://img.shields.io/badge/version-v2.15-blue)]()
+[![v2.11](https://img.shields.io/badge/version-v2.16-blue)]()
 
 ## 概述
 
@@ -22,9 +22,10 @@ MechCAD Kernel 是 [Varen CAD](https://github.com/vanyu0710/aicad) 的**参数�
 
 ![render before/after](docs/images/render-before-after.png)
 
-**核心能力 (v2.15)**：
+**核心能力 (v2.16)**：
 - **34 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线；v2.12 新增 `make_gear`（真渐开线齿轮坯公开 op）+ worker `reset` RPC；**v2.12.1 修复 make_gear 两处几何缺陷**（渐开线齿悬浮于毂盘、bore 参数反写致假孔），新增单实体/真通孔回归门
 - **v2.13 代码通道 `run_script`**：模型写 Python 脚本、几何只能经 `k` 门面调公开 op（AST 白名单只许 import math、禁 `_` 属性、`__import__` 守卫版）；执行前检查点、失败整体回滚并回传原始 traceback；**脚本内 op 照常进 _op_history，代码件可参数重放**；query 新增 solid_count（单实体复检契约）
+- **v2.16 可靠性硬门控（P0 修复）**：`run_script` 默认 abort——脚本内任一 op 失败即整体回滚并返回 `SCRIPT_OP_FAILED + failed_op`（半成品绝不静默交付），可选 best_effort；op 返回失败由 ScriptOpError 显式化，try/except 仍可条件回退
 - **v2.15 渲染净化（证据图质量）**：渲染器改用 OCP 角向细分 + 跨面顶点焊接（装配实测开边 0）；show_edges 只画二面角 >30° 的特征边（旧版整张三角边全描 = 平面对角线噪声根源，实测 50304→9660 条）；crease-aware 平滑法线消除曲面色带；边以朝视点细 quad 并入面片集合，被正面正确遮挡。零 API 变更
 - 真实 OpenCascade (OCC) 几何 — 0% 体积误差（单次 boolean / 真弧线剖面）
 - **v2.11 选边/选面闭环**: select 返回可回喂引用 (F03/E12) → fillet/chamfer 指定边 / shell 指定开口面 / 面上草图
@@ -391,6 +392,7 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.13** | **2026-09-08** | **代码通道 run_script: ScriptKernel 门面 + AST 白名单沙箱 + 检查点回滚 + 原始 traceback 反馈 + query solid_count；脚本 op 可参数重放** | **384** | **34+10** |
 | **+ v2.14** | **2026-09-09** | **F2a 装配场景命令: export_assembly（XCAF 具名装配 STEP）+ assembly_interference（bbox 预过滤+豁免表）+ render_assembly（分件着色）；无状态，不动单几何契约** | **391** | **34+10** |
 | **+ v2.15** | **2026-09-11** | **渲染净化: OCP 角向细分+焊接水密网格, show_edges 只画特征边(二面角>30°), crease-aware 平滑法线, ribbon 边深度排序; 另修坏系统字体阻断 build123d 导入(fontTools 惰性校验过滤)** | **402** | **34+10** |
+| **+ v2.16** | **2026-09-11** | **run_script 失败策略：默认 abort（op 失败即回滚+SCRIPT_OP_FAILED+failed_op 结构），可选 best_effort（收集失败但绝不静默成功）；ScriptOpError 可被脚本 try/except** | **409** | **34+10** |
 
 ## 安装
 

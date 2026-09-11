@@ -38,6 +38,27 @@ class ScriptSandboxError(ValueError):
     """脚本静态校验失败。message 面向 LLM，要能指导改脚本。"""
 
 
+class ScriptOpError(RuntimeError):
+    """脚本内某个建模 op 返回 success=false（v2.16 abort 策略）。
+
+    携带结构化失败信息（op 名、实参、内层 error_kind/error/suggestion），
+    让 run_script 能整体回滚并回传 failed_op，而不是让半成品静默交付。
+    脚本内可用 `try/except Exception` 做条件回退（本异常是 RuntimeError 子类）。
+    """
+
+    def __init__(self, op: str, op_args: tuple, op_kwargs: dict, result) -> None:
+        self.op = op
+        self.op_args = op_args
+        self.op_kwargs = op_kwargs
+        self.inner_error_kind = getattr(result, "error_kind", None) or (
+            result.get("error_kind") if isinstance(result, dict) else None)
+        self.inner_error = getattr(result, "error", None) or (
+            result.get("error") if isinstance(result, dict) else None)
+        self.inner_suggestion = getattr(result, "suggestion", None) or (
+            result.get("suggestion") if isinstance(result, dict) else None)
+        super().__init__(f"op {op} 失败: {self.inner_error_kind}: {self.inner_error}")
+
+
 def validate_script_code(code: str) -> ast.Module:
     """AST 白名单校验；违规抛 ScriptSandboxError（含可读原因）。"""
     if not isinstance(code, str) or not code.strip():
@@ -106,24 +127,55 @@ def safe_builtins() -> dict:
 class ScriptKernel:
     """脚本里的 `k`：只暴露 kernel 公开 op（减去黑名单）为同名方法 + 守卫版 execute()。
 
-    返回 StepResult（支持下标：r["success"]），模型可在脚本内判断/raise。
+    v2.16 失败策略（P0-3）：op 返回 success=false 不再被静默吞掉——
+    - `failure_policy="abort"`（默认）：任一 op 失败立即抛 ScriptOpError，
+      run_script 整体回滚并回传 failed_op（半成品绝不交付）；
+    - `failure_policy="best_effort"`：失败被收集进 `failed_ops` 并继续执行，
+      run_script 以 success=false + failed_ops 结束（仍不允许静默成功）。
+
+    成功 op 照常返回 StepResult（支持下标：r["success"]）。脚本内如需条件回退，
+    用 `try/except Exception` 包住单个调用即可（ScriptOpError 是 RuntimeError 子类）。
     """
 
-    def __init__(self, kernel, allowed_ops) -> None:
+    def __init__(self, kernel, allowed_ops, failure_policy: str = "abort") -> None:
         self._kernel = kernel
         self._allowed = frozenset(allowed_ops)
+        self._failure_policy = failure_policy
+        self.failed_ops: list[dict] = []
         self.op_names = sorted(self._allowed)
         for op in self._allowed:
             method = getattr(kernel, op, None)
             if callable(method):
-                setattr(self, op, method)
+                setattr(self, op, self._checked(op, method))
+
+    def _checked(self, op: str, method):
+        def wrapper(*args, **kwargs):
+            result = method(*args, **kwargs)
+            if isinstance(result, dict):
+                ok = result.get("success")
+            else:
+                ok = getattr(result, "success", True)
+            if ok is False:
+                if self._failure_policy == "best_effort":
+                    self.failed_ops.append({
+                        "op": op,
+                        "error_kind": str(getattr(result, "error_kind", None) or
+                                          (result.get("error_kind") if isinstance(result, dict) else "") or ""),
+                        "error": str(getattr(result, "error", None) or
+                                     (result.get("error") if isinstance(result, dict) else "") or ""),
+                    })
+                else:
+                    raise ScriptOpError(op, args, kwargs, result)
+            return result
+        wrapper.__name__ = op
+        return wrapper
 
     def execute(self, op, **kwargs):
         if op not in self._allowed:
             raise ScriptSandboxError(
                 f"op 不在脚本可用集: {op}（公开 op 减去导出/存档黑名单；"
                 f"可用示例: {self.op_names[:10]} …）")
-        return self._kernel.execute(op, **kwargs)
+        return self._checked(op, lambda **kw: self._kernel.execute(op, **kw))(**kwargs)
 
     def capabilities(self) -> dict:
         return {"ops": self.op_names,

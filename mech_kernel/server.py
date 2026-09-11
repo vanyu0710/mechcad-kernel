@@ -24,7 +24,7 @@
     ping             健康检查 → {"pong": true, "kernel_version": ...}
     capabilities     公开/实验 op 的 LLM schema（cap.list_public/list_experimental）
     execute          {op, args, allow_experimental} → StepResult JSON
-    run_script       {code, name?} → StepResult JSON（v2.13：模型脚本经 k 门面调公开 op；
+    run_script       {code, name?, failure_policy?} → StepResult JSON（v2.13：模型脚本经 k 门面调公开 op；
                      执行前检查点、脚本异常整体回滚并回传原始 traceback）
     export_assembly  {parts:[{path,name?,color?,pose?}], out_step} → 无状态装配 XCAF STEP 导出（v2.14）
     assembly_interference {parts, tolerance?, expected_overlaps?} → 全对干涉+bbox 预过滤+豁免（v2.14）
@@ -165,7 +165,9 @@ class KernelServer:
             code = self._require(payload, "code")
             if not isinstance(code, str):
                 raise ValueError("code 必须是字符串")
-            result = self.kernel.run_script(code, name=str(payload.get("name") or ""))
+            result = self.kernel.run_script(
+                code, name=str(payload.get("name") or ""),
+                failure_policy=str(payload.get("failure_policy") or "abort"))
             return _step_to_dict(result, include_render=bool(payload.get("include_render", True)))
 
         # ---- v2.14 装配场景命令（F2a）：无状态计算，不读写 kernel 实例 ----

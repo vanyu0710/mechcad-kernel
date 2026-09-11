@@ -4852,13 +4852,20 @@ class MechKernel:
     # v2.13: run_script —— 模型编写建模脚本（DSH 式：检查点 + 回滚 + 原始 traceback）
     # =============================================================
 
-    def run_script(self, code: str, name: str = "") -> StepResult:
+    def run_script(self, code: str, name: str = "", failure_policy: str = "abort") -> StepResult:
         """执行模型编写的建模脚本（只准调 kernel 公开 op）。
 
         边界见 mech_kernel/script_sandbox.py：AST 白名单（只许 import math、禁 `_` 属性）、
         受限命名空间（k 门面 + math + 安全 builtins）。执行前 `_snapshot()` 检查点，
         脚本抛异常则 `_restore()` 整体回滚并回传原始 traceback；成功执行的 op 照常
         进 `_op_history`/`feature_graph` → 代码件与 op 件一样可参数重放。
+
+        v2.16 失败策略（P0-3：脚本内 op 失败绝不静默交付半成品）：
+        - failure_policy="abort"（默认）：任一 op 返回 success=false → 立即抛
+          ScriptOpError → 整体回滚 → 返回 SCRIPT_OP_FAILED + failed_op（含内层
+          error_kind/error/suggestion 与原始 traceback）；
+        - failure_policy="best_effort"：失败 op 被收集并继续执行，最终以
+          SCRIPT_OP_FAILED + failed_ops 结束（几何保留，但绝不 success=true）。
         """
         start = time.time()
         import contextlib
@@ -4867,9 +4874,19 @@ class MechKernel:
         import traceback as _traceback
 
         from .script_sandbox import (
-            SCRIPT_OP_BLACKLIST, ScriptKernel, ScriptSandboxError,
+            SCRIPT_OP_BLACKLIST, ScriptKernel, ScriptOpError, ScriptSandboxError,
             safe_builtins, validate_script_code,
         )
+
+        if failure_policy not in ("abort", "best_effort"):
+            self._step_counter += 1
+            return make_failure(
+                error=f"failure_policy 非法: {failure_policy!r}（只许 'abort' 或 'best_effort'）",
+                error_kind="INVALID_REQUEST",
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
 
         try:
             validate_script_code(code)
@@ -4892,8 +4909,9 @@ class MechKernel:
         snapshot = self._snapshot()
         ops_before = len(self._op_history)
         captured = io.StringIO()
+        facade = ScriptKernel(self, allowed_ops, failure_policy=failure_policy)
         namespace = {
-            "k": ScriptKernel(self, allowed_ops),
+            "k": facade,
             "math": math,
             "__builtins__": safe_builtins(),
         }
@@ -4904,6 +4922,37 @@ class MechKernel:
         except BaseException as exc:  # noqa: BLE001 —— 任何脚本异常都要回滚
             script_error = exc
         stdout_text = captured.getvalue()[-2000:]
+
+        if isinstance(script_error, ScriptOpError):
+            # abort 策略下某个建模 op 失败：整体回滚 + 结构化 failed_op。
+            self._restore(snapshot)
+            tb = "".join(_traceback.format_exception(
+                type(script_error), script_error, script_error.__traceback__))
+            self._step_counter += 1
+            failed_op = {
+                "name": script_error.op,
+                "args": [repr(a)[-200:] for a in script_error.op_args],
+                "kwargs": {k: repr(v)[-200:] for k, v in script_error.op_kwargs.items()},
+                "inner_error_kind": str(script_error.inner_error_kind or ""),
+                "inner_error": str(script_error.inner_error or ""),
+            }
+            return make_failure(
+                error="脚本内 op 失败，整个脚本已回滚（半成品绝不交付）: "
+                      f"{failed_op['name']} → {failed_op['inner_error_kind']}: {failed_op['inner_error']}\n"
+                      f"{tb[-4000:]}",
+                error_kind="SCRIPT_OP_FAILED",
+                suggestion={
+                    "action": "按 failed_op 修正该步参数（或改建模顺序）后重跑 run_script；"
+                              "几何已回滚，无需清理；需要条件回退时用 try/except 包住单个 op",
+                    "reason_code": "script_op_failed",
+                    "failed_op": failed_op,
+                    "rollback": True,
+                    "inner_suggestion": script_error.inner_suggestion,
+                },
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
 
         if script_error is not None:
             self._restore(snapshot)  # 几何/历史/特征树整体回滚（DSH 检查点语义）
@@ -4932,6 +4981,27 @@ class MechKernel:
                 solids = 1
         summary = self._geometry_summary_for(geometry)
         self._step_counter += 1
+
+        if facade.failed_ops:
+            # best_effort：几何保留（已成功的 op 不白做），但失败必须显式上报——
+            # 绝不因"脚本没抛异常"就返回 success=true。
+            return make_failure(
+                error=f"脚本以 best_effort 完成，但存在 {len(facade.failed_ops)} 个失败 op"
+                      f"（未回滚，已保留成功部分）: {facade.failed_ops}",
+                error_kind="SCRIPT_OP_FAILED",
+                suggestion={
+                    "action": "逐个修复 failed_ops 后重跑对应步骤，或改用默认 abort 策略；"
+                              "不要把这些失败当作已完成",
+                    "reason_code": "script_partial_failures",
+                    "failed_ops": facade.failed_ops,
+                    "rollback": False,
+                },
+                geometry_summary=summary,
+                current_narrative=self.narrative.copy(),
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+
         result = make_success(
             feature_id=f"S_{self._step_counter:03d}",
             narrative=f"run_script {name or 'script'} 完成: {ops_executed} 个 op, solids={solids}",
