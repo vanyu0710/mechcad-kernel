@@ -8,6 +8,13 @@ MechKernel Renderer（v2.5 工程视觉版）
 - 任何异常都隔离，**绝不**让 kernel 崩溃
 - 面向视觉模型的干净正交/ISO 工程证据图，不输出调试坐标轴
 - 默认使用无网格线实体着色；需要检查拓扑时可打开 show_edges
+
+v2.15 渲染质量修复（"面上乱三角和线条"）：
+- OCP BRepMesh 角向细分：曲面相邻三角形法线差被硬性封顶，粗圆角不再成阶梯
+- show_edges 改为只画特征边（二面角 > SHARP_EDGE_DEG），平面扇形三角化的
+  对角线噪声全部消失；边以朝视点的细 quad 并入面片集合，靠 mplot3d 的
+  per-patch 深度排序被正面正确遮挡（Line3DCollection 整体绘制会穿面浮线）
+- crease-aware 平滑法线：曲面色带抹平，棱角处法线不跨 crease 聚类混合
 """
 from typing import Any, Optional, Dict, List, Tuple
 from collections import OrderedDict
@@ -39,7 +46,24 @@ class Renderer:
     - LRU 限制（默认 32 个）
     - 任何异常都隔离，**绝不**让 kernel 崩溃
     """
-    
+
+    # Feature-edge dihedral threshold: edges whose adjacent faces differ by
+    # more than this are real CAD edges and get drawn (v2.15).
+    SHARP_EDGE_DEG = 30.0
+    # Vertex-normal smoothing must not cross a crease this wide, otherwise
+    # box corners would blur into fillet-like gradients.
+    CREASE_DEG = 30.0
+    # OCP tessellation angular cap (~20 deg max per facet step).
+    ANG_DEFLECT_RAD = 0.35
+    # Chord tolerance as a share of the part diagonal, clamped.
+    LIN_DEFLECT_RATIO = 0.0004
+    LIN_DEFLECT_MIN = 0.005
+    LIN_DEFLECT_MAX = 0.1
+    # Groups above this triangle count skip the O(n) style analysis and fall
+    # back to flat shading without edge lines (keeps huge meshes renderable).
+    STYLE_BUDGET = 400_000
+    EDGE_RGB = (0.16, 0.22, 0.30, 0.55)
+
     def __init__(
         self,
         image_size: tuple = (640, 480),
@@ -174,6 +198,18 @@ class Renderer:
                 offset += len(group_vertices)
         except Exception:
             return {"iso": None, "front": None, "top": None, "side": None, "default": None}
+
+        # v2.15: per-group feature edges + smooth normals, computed once for
+        # all views. A failure (or over-budget group) yields None and that
+        # group renders as a plain flat-shaded triangle soup.
+        try:
+            mesh_styles = [
+                self._analyze_group(group_vertices, group_faces)
+                if len(group_faces) <= self.STYLE_BUDGET else None
+                for group_vertices, group_faces, _, _ in mesh_groups
+            ]
+        except Exception:
+            mesh_styles = [None] * len(mesh_groups)
         
         if not vertices or not faces:
             return {"iso": None, "front": None, "top": None, "side": None, "default": None}
@@ -233,6 +269,7 @@ class Renderer:
                     vertices, faces, bbox, camera_pos, view_name,
                     cx, cy, cz, lim, size, image_size=image_size,
                     mesh_groups=mesh_groups, quality=quality, show_edges=show_edges,
+                    mesh_styles=mesh_styles,
                 )
                 if png_bytes and annotate:
                     png_bytes = self._annotate_png(png_bytes, f"{view_name.upper()}  |  {dims_label}")
@@ -361,6 +398,77 @@ class Renderer:
             render_config,
         )
     
+    def _lin_deflection(self, geometry: Any, fallback: float) -> float:
+        """Chord tolerance scaled to the part size, clamped to sane bounds."""
+        try:
+            diagonal = geometry.bounding_box().diagonal
+            if diagonal and math.isfinite(diagonal) and diagonal > 0:
+                return min(self.LIN_DEFLECT_MAX,
+                           max(self.LIN_DEFLECT_MIN, diagonal * self.LIN_DEFLECT_RATIO))
+        except Exception:
+            pass
+        return fallback
+
+    def _tessellate_ocp(self, geometry: Any, lin_deflection: float) -> Optional[Tuple[List, List]]:
+        """Tessellate through OCP with both linear and angular deflection caps.
+
+        Walks every face's Poly_Triangulation, applies the face location, and
+        welds coincident node positions across faces so shared edges land on
+        the same vertex indices (the renderer's edge/normal analysis needs a
+        watertight index structure). Face orientation is applied to keep all
+        windings outward-facing. Any failure returns None and the caller falls
+        back to the duck-typed paths below.
+        """
+        shape = getattr(geometry, "wrapped", None)
+        if shape is None:
+            return None
+        try:
+            from OCP.BRep import BRep_Tool
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.TopoDS import TopoDS
+
+            BRepMesh_IncrementalMesh(
+                shape, float(lin_deflection), False, self.ANG_DEFLECT_RAD, True
+            )
+            verts: List = []
+            tris: List = []
+            vmap: Dict = {}
+            explorer = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+            while explorer.More():
+                face = TopoDS.Face_s(explorer.Current())
+                face_reversed = face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
+                location = TopLoc_Location()
+                triangulation = BRep_Tool.Triangulation_s(face, location)
+                if triangulation is not None:
+                    transform = location.Transformation()
+                    index_map: List[int] = []
+                    for i in range(1, triangulation.NbNodes() + 1):
+                        point = triangulation.Node(i).Transformed(transform)
+                        key = (round(point.X(), 5), round(point.Y(), 5), round(point.Z(), 5))
+                        idx = vmap.get(key)
+                        if idx is None:
+                            idx = len(verts)
+                            vmap[key] = idx
+                            verts.append((point.X(), point.Y(), point.Z()))
+                        index_map.append(idx)
+                    for i in range(1, triangulation.NbTriangles() + 1):
+                        triangle = triangulation.Triangle(i)
+                        a = index_map[triangle.Value(1) - 1]
+                        b = index_map[triangle.Value(2) - 1]
+                        c = index_map[triangle.Value(3) - 1]
+                        if face_reversed:
+                            b, c = c, b
+                        tris.append([a, b, c])
+                explorer.Next()
+            if len(verts) >= 4 and len(tris) >= 4:
+                return verts, tris
+        except Exception:
+            return None
+        return None
+
     def _extract_mesh(self, geometry: Any, tolerance: float = 0.1) -> Tuple[List, List]:
         """提取 vertices 和 faces（P0-4 异常隔离版）
         
@@ -372,7 +480,14 @@ class Renderer:
         """
         vertices = None
         faces = None
-        
+
+        # 0. OCP BRepMesh（v2.15 首选）：带角向细分上限。build123d 的
+        # tessellate 只约束线性弦差，小圆角/齿面会切出几十度的粗刻面，
+        # 着色与特征边都救不回来；角向封顶从源头解决。
+        ocp_mesh = self._tessellate_ocp(geometry, self._lin_deflection(geometry, tolerance))
+        if ocp_mesh is not None:
+            return ocp_mesh
+
         # 1. 优先用 tessellate（build123d 真实 mesh）
         # P1-3（v8 DeepSeek）：缓存键含 tolerance（防止 0.1/0.01 缓存混淆）
         if hasattr(geometry, "tessellate"):
@@ -513,6 +628,7 @@ class Renderer:
         mesh_groups: Optional[list] = None,
         quality: str = "evidence",
         show_edges: bool = False,
+        mesh_styles: Optional[list] = None,
     ) -> bytes:
         """渲染单个视角（P0-4: 异常隔离）"""
         try:
@@ -524,38 +640,58 @@ class Renderer:
             )
             ax = fig.add_subplot(111, projection="3d")
             ax.set_facecolor(self.background)
-            
+
+            effective_edges = show_edges or quality == "presentation" or self.show_edges
             triangles = []
             triangle_colors = []
+            feature_edges: List[Tuple[tuple, tuple]] = []
             groups = mesh_groups or [(vertices, faces, self.body_color, False)]
-            for group_vertices, group_faces, group_color, highlighted in groups:
-                group_triangles = []
-                for face in group_faces:
-                    if len(face) >= 3:
-                        try:
-                            group_triangles.append([
-                                group_vertices[face[0]],
-                                group_vertices[face[1]],
-                                group_vertices[face[2]],
-                            ])
-                        except (IndexError, TypeError):
-                            continue
-                triangles.extend(group_triangles)
+            styles = mesh_styles if mesh_styles is not None else [None] * len(groups)
+            for (group_vertices, group_faces, group_color, highlighted), style in zip(groups, styles):
                 color = tuple(min(1.0, float(channel) * (1.18 if highlighted else 1.0)) for channel in group_color)
-                triangle_colors.extend(self._triangle_colors(group_triangles, color))
-            
+                if style is not None:
+                    group_triangles = style["triangles"]
+                    triangles.extend(group_triangles)
+                    triangle_colors.extend(
+                        self._triangle_colors(group_triangles, color, normals=style["normals"])
+                    )
+                    if effective_edges:
+                        feature_edges.extend(style["edges"])
+                else:
+                    # Analysed as too odd or over-budget: plain flat shading,
+                    # still no per-facet lines (v2.15 removed that mode).
+                    group_triangles = []
+                    for face in group_faces:
+                        if len(face) >= 3:
+                            try:
+                                group_triangles.append([
+                                    group_vertices[face[0]],
+                                    group_vertices[face[1]],
+                                    group_vertices[face[2]],
+                                ])
+                            except (IndexError, TypeError):
+                                continue
+                    triangles.extend(group_triangles)
+                    triangle_colors.extend(self._triangle_colors(group_triangles, color))
+
             if not triangles:
                 plt.close(fig)
                 return b""
-            
-            effective_edges = show_edges or quality == "presentation" or self.show_edges
-            edge_color = (0.16, 0.22, 0.30, 0.34) if effective_edges else "none"
+
+            if effective_edges and feature_edges:
+                edge_triangles = self._edge_ribbons(
+                    feature_edges,
+                    (camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz),
+                    max(size) if size else 1.0,
+                )
+                triangles.extend(edge_triangles)
+                triangle_colors.extend([self.EDGE_RGB] * len(edge_triangles))
+
             mesh = Poly3DCollection(
                 triangles,
                 facecolors=triangle_colors,
                 alpha=1.0,
-                edgecolor=edge_color,
-                linewidth=0.18 if effective_edges else 0.0,
+                edgecolor="none",
             )
             ax.add_collection3d(mesh)
 
@@ -600,25 +736,207 @@ class Renderer:
                 pass
             return b""
 
-    def _triangle_colors(self, triangles: List[List[Tuple[float, float, float]]], color: Optional[Tuple[float, float, float]] = None) -> List[Tuple[float, float, float, float]]:
-        """Apply stable light shading without relying on matplotlib's version-specific shade API."""
+    def _triangle_colors(
+        self,
+        triangles: List[List[Tuple[float, float, float]]],
+        color: Optional[Tuple[float, float, float]] = None,
+        normals: Optional[List[Tuple[float, float, float]]] = None,
+    ) -> List[Tuple[float, float, float, float]]:
+        """Apply stable light shading without relying on matplotlib's version-specific shade API.
+
+        ``normals`` supplies v2.15 crease-aware smooth normals; when absent the
+        flat per-triangle normal is used (legacy behaviour).
+        """
         light = (-0.45, -0.55, 0.70)
         light_len = math.sqrt(sum(value * value for value in light)) or 1.0
         light = tuple(value / light_len for value in light)
         colors = []
         body_color = color or self.body_color
-        for tri in triangles:
+        for position, tri in enumerate(triangles):
+            normal = normals[position] if normals is not None and position < len(normals) else None
             try:
-                ax, ay, az = (tri[1][i] - tri[0][i] for i in range(3))
-                bx, by, bz = (tri[2][i] - tri[0][i] for i in range(3))
-                nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
-                normal_len = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
-                illumination = abs((nx * light[0] + ny * light[1] + nz * light[2]) / normal_len)
+                if normal is None:
+                    ax, ay, az = (tri[1][i] - tri[0][i] for i in range(3))
+                    bx, by, bz = (tri[2][i] - tri[0][i] for i in range(3))
+                    nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+                    normal_len = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+                    normal = (nx / normal_len, ny / normal_len, nz / normal_len)
+                illumination = abs(normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2])
                 factor = 0.58 + 0.42 * illumination
             except (IndexError, TypeError, ValueError):
                 factor = 0.78
             colors.append(tuple(min(1.0, max(0.0, channel * factor)) for channel in body_color) + (1.0,))
         return colors
+
+    @staticmethod
+    def _edge_ribbons(
+        edges: List[Tuple[tuple, tuple]],
+        view_vector: Tuple[float, float, float],
+        max_dim: float,
+    ) -> List[List[Tuple[float, float, float]]]:
+        """Expand feature edges into camera-facing ribbon quads.
+
+        mplot3d paints each artist as one unit, so a Line3DCollection of edge
+        lines would float over the front faces of the model (the old renderer
+        hid this by drawing lines per facet *inside* the face collection at
+        0.18pt). Ribbons join the same Poly3DCollection, where per-patch depth
+        sorting occludes back-side edges behind the body correctly.
+        """
+        vx, vy, vz = view_vector
+        vlen = math.sqrt(vx * vx + vy * vy + vz * vz) or 1.0
+        vx, vy, vz = vx / vlen, vy / vlen, vz / vlen
+        half_width = max(max_dim * 0.00035, 1e-4)
+        offset = max_dim * 0.0008
+        ribbons: List[List[Tuple[float, float, float]]] = []
+        for point_a, point_b in edges:
+            try:
+                ex = point_b[0] - point_a[0]
+                ey = point_b[1] - point_a[1]
+                ez = point_b[2] - point_a[2]
+            except (TypeError, IndexError):
+                continue
+            # ribbon width direction = edge cross view
+            wx, wy, wz = ey * vz - ez * vy, ez * vx - ex * vz, ex * vy - ey * vx
+            wlen = math.sqrt(wx * wx + wy * wy + wz * wz)
+            if wlen < 1e-12:
+                continue  # edge parallel to view: zero silhouette, skip
+            wx, wy, wz = wx / wlen * half_width, wy / wlen * half_width, wz / wlen * half_width
+            ox, oy, oz = vx * offset, vy * offset, vz * offset
+            a1 = (point_a[0] + ox - wx, point_a[1] + oy - wy, point_a[2] + oz - wz)
+            a2 = (point_a[0] + ox + wx, point_a[1] + oy + wy, point_a[2] + oz + wz)
+            b1 = (point_b[0] + ox - wx, point_b[1] + oy - wy, point_b[2] + oz - wz)
+            b2 = (point_b[0] + ox + wx, point_b[1] + oy + wy, point_b[2] + oz + wz)
+            ribbons.append([a1, a2, b2])
+            ribbons.append([a1, b2, b1])
+        return ribbons
+
+    def _analyze_group(self, vertices: List, faces: List) -> Optional[Dict]:
+        """Merge coincident vertices, then derive feature edges and smooth normals.
+
+        Raw triangle soup has both problems v2.15 fixes: planar faces expose
+        fan diagonals once anything is drawn along every triangle edge, and
+        flat per-triangle shading bands on curved faces. Position merging gives
+        one shared structure for the dihedral edge test and the crease-aware
+        normal clustering. Returns None when the input cannot be analysed; the
+        caller then falls back to plain flat shading.
+        """
+        try:
+            merged: Dict = {}
+            mverts: List = []
+            remap: List = []
+            for vertex in vertices:
+                key = (round(vertex[0], 5), round(vertex[1], 5), round(vertex[2], 5))
+                target = merged.get(key)
+                if target is None:
+                    target = len(mverts)
+                    merged[key] = target
+                    mverts.append((float(vertex[0]), float(vertex[1]), float(vertex[2])))
+                remap.append(target)
+            tris: List[Tuple[int, int, int]] = []
+            for face in faces:
+                if len(face) < 3:
+                    continue
+                a, b, c = remap[face[0]], remap[face[1]], remap[face[2]]
+                if a != b and b != c and a != c:
+                    tris.append((a, b, c))
+            if len(tris) < 3:
+                return None
+            normals: List[Tuple[float, float, float]] = []
+            for a, b, c in tris:
+                va, vb, vc = mverts[a], mverts[b], mverts[c]
+                ex, ey, ez = vb[0] - va[0], vb[1] - va[1], vb[2] - va[2]
+                fx, fy, fz = vc[0] - va[0], vc[1] - va[1], vc[2] - va[2]
+                nx, ny, nz = ey * fz - ez * fy, ez * fx - ex * fz, ex * fy - ey * fx
+                length = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+                normals.append((nx / length, ny / length, nz / length))
+
+            sharp_cos = math.cos(math.radians(self.SHARP_EDGE_DEG))
+            edge_faces: Dict[Tuple[int, int], Any] = {}
+            for index, (a, b, c) in enumerate(tris):
+                for u, w in ((a, b), (b, c), (c, a)):
+                    key = (u, w) if u < w else (w, u)
+                    bucket = edge_faces.get(key)
+                    if bucket is None and key not in edge_faces:
+                        edge_faces[key] = index
+                    elif isinstance(bucket, int):
+                        edge_faces[key] = (bucket, index)
+                    else:
+                        edge_faces[key] = None  # non-manifold: leave un-drawn
+            feature_edges: List[Tuple[tuple, tuple]] = []
+            for (u, w), bucket in edge_faces.items():
+                if bucket is None:
+                    continue
+                if isinstance(bucket, int):
+                    keep = True  # real open boundary
+                else:
+                    n1, n2 = normals[bucket[0]], normals[bucket[1]]
+                    keep = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] < sharp_cos
+                if keep:
+                    feature_edges.append((mverts[u], mverts[w]))
+
+            smooth = self._crease_normals(tris, normals, mverts)
+            triangles = [[mverts[a], mverts[b], mverts[c]] for a, b, c in tris]
+            return {"triangles": triangles, "normals": smooth, "edges": feature_edges}
+        except Exception:
+            return None
+
+    def _crease_normals(
+        self,
+        tris: List[Tuple[int, int, int]],
+        face_normals: List[Tuple[float, float, float]],
+        mverts: List,
+    ) -> List[Tuple[float, float, float]]:
+        """Average face normals per vertex, but only within direction clusters.
+
+        Curved faces (fillets, gear flanks, cylinders) collapse to one cluster
+        and shade smooth; faces meeting across a crease wider than CREASE_DEG
+        land in separate clusters, so box corners stay crisp. Shared OCC
+        triangulations do not weld across sharp edges, but position merging can,
+        hence the clustering instead of a naive average.
+        """
+        crease_cos = math.cos(math.radians(self.CREASE_DEG))
+        clusters: Dict[int, List[List[float]]] = {}
+        for index, (a, b, c) in enumerate(tris):
+            n = face_normals[index]
+            for vertex in (a, b, c):
+                bucket = clusters.get(vertex)
+                if bucket is None:
+                    clusters[vertex] = [[n[0], n[1], n[2]]]
+                    continue
+                best = None
+                best_dot = -2.0
+                for acc in bucket:
+                    length = math.sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]) or 1.0
+                    dot = (acc[0] * n[0] + acc[1] * n[1] + acc[2] * n[2]) / length
+                    if dot > best_dot:
+                        best_dot = dot
+                        best = acc
+                if best is not None and best_dot >= crease_cos:
+                    best[0] += n[0]
+                    best[1] += n[1]
+                    best[2] += n[2]
+                else:
+                    bucket.append([n[0], n[1], n[2]])
+        smooth: List[Tuple[float, float, float]] = []
+        for index, (a, b, c) in enumerate(tris):
+            n = face_normals[index]
+            sx = sy = sz = 0.0
+            for vertex in (a, b, c):
+                best = None
+                best_dot = -2.0
+                for acc in clusters[vertex]:
+                    length = math.sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]) or 1.0
+                    dot = (acc[0] * n[0] + acc[1] * n[1] + acc[2] * n[2]) / length
+                    if dot > best_dot:
+                        best_dot = dot
+                        best = (acc[0] / length, acc[1] / length, acc[2] / length)
+                if best is not None:
+                    sx += best[0]
+                    sy += best[1]
+                    sz += best[2]
+            length = math.sqrt(sx * sx + sy * sy + sz * sz) or 1.0
+            smooth.append((sx / length, sy / length, sz / length))
+        return smooth
     
     def clear_cache(self):
         """清空缓存（kernel.undo/redo 时自动调用）"""

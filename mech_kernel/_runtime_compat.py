@@ -9,6 +9,40 @@ from pathlib import Path
 from typing import Any
 
 
+def _parseable_font(path: str) -> bool:
+    """True when fontTools can at least open the file (header + table index).
+
+    A magic-number sniff alone is not enough: Windows ships metrics-only
+    files whose sfnt version is garbage, and users install corrupt fonts.
+    Lazy loading reads the directory, not glyph outlines, so this stays fast
+    while rejecting everything build123d's TTFont call would crash on.
+    """
+    try:
+        if Path(path).stat().st_size < 1024:
+            return False
+    except OSError:
+        return False
+    try:
+        from fontTools.ttLib import TTFont, ttCollection
+    except ImportError:
+        return True
+    handle = None
+    try:
+        if path.lower().endswith(".ttc"):
+            handle = ttCollection.TTCollection(path)
+        else:
+            handle = TTFont(path, lazy=True)
+    except Exception:
+        return False
+    finally:
+        try:
+            if handle is not None:
+                handle.close()
+        except Exception:
+            pass
+    return True
+
+
 def _font_safe_glob(original: Any):
     """Return a glob function that ignores malformed Windows font files.
 
@@ -18,24 +52,11 @@ def _font_safe_glob(original: Any):
     kernel from starting.
     """
 
-    sfnt_magics = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf")
-
     def safe_glob(pattern: str, *args: Any, **kwargs: Any) -> list[str]:
         paths = original(pattern, *args, **kwargs)
         if not any(token in pattern.lower() for token in ("ttf", "otf", "ttc")):
             return paths
-        valid: list[str] = []
-        for path in paths:
-            try:
-                if Path(path).stat().st_size < 1024:
-                    continue
-                with open(path, "rb") as stream:
-                    magic = stream.read(4)
-            except (OSError, ValueError):
-                continue
-            if magic in sfnt_magics:
-                valid.append(path)
-        return valid
+        return [path for path in paths if _parseable_font(path)]
 
     return safe_glob
 
