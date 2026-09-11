@@ -51,7 +51,7 @@ def test_cylinder_band_has_no_facet_lines_only_rims():
     assert style is not None
     assert len(style["triangles"]) > 40
     assert style["edges"], "rims should still be drawn"
-    for pa, pb in style["edges"]:
+    for pa, pb, _bisector in style["edges"]:
         assert abs(pa[2] - pb[2]) < 1e-9, f"facet line leaked: {pa} -> {pb}"
     # ~53 facets per rim (linear cap governs here), definitely not thousands
     assert len(style["edges"]) < 400
@@ -78,10 +78,12 @@ def test_planar_grid_keeps_only_boundary_edges():
     expected_boundary = 4 * (n - 1)
     assert len(style["edges"]) == expected_boundary
     limit = float(n - 1)
-    for pa, pb in style["edges"]:
+    for pa, pb, _bisector in style["edges"]:
         on_boundary = (pa[0] in (0.0, limit) or pa[1] in (0.0, limit) or
                        pb[0] in (0.0, limit) or pb[1] in (0.0, limit))
         assert on_boundary, "interior diagonal leaked into feature edges"
+        # open boundary edges carry the face normal as bisector
+        assert abs(_bisector[2]) > 0.99
 
 
 def test_crease_normals_do_not_blur_box_corners():
@@ -96,9 +98,24 @@ def test_crease_normals_do_not_blur_box_corners():
 
 def test_edge_ribbons_orient_and_skip_parallel():
     r = Renderer()
-    ribbons = r._edge_ribbons([((0, 0, 0), (10, 0, 0))], (0, -100, 0), 100.0)
+    edge = ((0, 0, 0), (10, 0, 0), (0, -1, 0))  # bisector faces camera
+    ribbons = r._edge_ribbons([edge], (0, -100, 0), 0.5)
     assert len(ribbons) == 2  # one edge -> one ribbon -> two triangles
-    assert r._edge_ribbons([((0, 0, 0), (0, -10, 0))], (0, -100, 0), 100.0) == []
+    # ribbon sits at the requested width around the edge line (edge along x,
+    # view along -y -> the width axis is z)
+    zs = [p[2] for tri in ribbons for p in tri]
+    assert max(zs) - min(zs) == 1.0
+    parallel = ((0, 0, 0), (0, -10, 0), (0, -1, 0))
+    assert r._edge_ribbons([parallel], (0, -100, 0), 0.5) == []
+
+
+def test_backfacing_edges_are_culled():
+    """Far-side rims must not bleed through front plates (ghost circles)."""
+    r = Renderer()
+    edge = ((0, 0, 0), (10, 0, 0), (0, 1, 0))  # bisector points away from camera
+    assert r._edge_ribbons([edge], (0, -100, 0), 0.5) == []
+    # same edge seen from the other side is drawn
+    assert len(r._edge_ribbons([edge], (0, 100, 0), 0.5)) == 2
 
 
 # ---------- end-to-end render ----------

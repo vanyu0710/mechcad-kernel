@@ -62,7 +62,7 @@ class Renderer:
     # Groups above this triangle count skip the O(n) style analysis and fall
     # back to flat shading without edge lines (keeps huge meshes renderable).
     STYLE_BUDGET = 400_000
-    EDGE_RGB = (0.16, 0.22, 0.30, 0.55)
+    EDGE_RGB = (0.13, 0.19, 0.27, 0.78)
 
     def __init__(
         self,
@@ -642,9 +642,25 @@ class Renderer:
             ax.set_facecolor(self.background)
 
             effective_edges = show_edges or quality == "presentation" or self.show_edges
+            # The camera direction that actually matters for back-face culling
+            # and limb darkening is matplotlib's, derived from the SAME elev/azim
+            # we hand view_init — NOT the nominal camera_pos vector, whose axis
+            # mapping differs (azim=0 puts the camera on +X, not -Y). Using the
+            # wrong axis let far-side rims bleed through and darkened front faces.
+            dx, dy, dz = camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz
+            cam_norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if cam_norm > 0:
+                elev_rad = math.asin(max(-1.0, min(1.0, dz / cam_norm)))
+                azim_rad = math.atan2(dx, -dy)
+            else:
+                elev_rad, azim_rad = 0.0, 0.0
+            cos_elev = math.cos(elev_rad)
+            view_dir = (cos_elev * math.cos(azim_rad),
+                        cos_elev * math.sin(azim_rad),
+                        math.sin(elev_rad))
             triangles = []
             triangle_colors = []
-            feature_edges: List[Tuple[tuple, tuple]] = []
+            feature_edges: List[Tuple[tuple, tuple, tuple]] = []
             groups = mesh_groups or [(vertices, faces, self.body_color, False)]
             styles = mesh_styles if mesh_styles is not None else [None] * len(groups)
             for (group_vertices, group_faces, group_color, highlighted), style in zip(groups, styles):
@@ -653,7 +669,7 @@ class Renderer:
                     group_triangles = style["triangles"]
                     triangles.extend(group_triangles)
                     triangle_colors.extend(
-                        self._triangle_colors(group_triangles, color, normals=style["normals"])
+                        self._triangle_colors(group_triangles, color, normals=style["normals"], view_dir=view_dir)
                     )
                     if effective_edges:
                         feature_edges.extend(style["edges"])
@@ -672,17 +688,20 @@ class Renderer:
                             except (IndexError, TypeError):
                                 continue
                     triangles.extend(group_triangles)
-                    triangle_colors.extend(self._triangle_colors(group_triangles, color))
+                    triangle_colors.extend(self._triangle_colors(group_triangles, color, view_dir=view_dir))
 
             if not triangles:
                 plt.close(fig)
                 return b""
 
             if effective_edges and feature_edges:
+                # Resolution-aware stroke: a fixed share of the part size made
+                # big assemblies (522 mm gearbox) draw sub-pixel rims that
+                # alias into dashed ghosts. Target ~1.7 px at this image size.
+                view_span = max((v * 1.18 for v in size), default=1.0)
+                mm_per_px = view_span / max(min(img_size), 1)
                 edge_triangles = self._edge_ribbons(
-                    feature_edges,
-                    (camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz),
-                    max(size) if size else 1.0,
+                    feature_edges, view_dir, max(mm_per_px * 1.05, 1e-4),
                 )
                 triangles.extend(edge_triangles)
                 triangle_colors.extend([self.EDGE_RGB] * len(edge_triangles))
@@ -709,13 +728,7 @@ class Renderer:
             ax.set_ylim(cy - half[1], cy + half[1])
             ax.set_zlim(cz - half[2], cz + half[2])
             
-            dx, dy, dz = camera_pos[0] - cx, camera_pos[1] - cy, camera_pos[2] - cz
-            norm = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if norm > 0:
-                ax.view_init(
-                    elev=math.degrees(math.asin(dz / norm)),
-                    azim=math.degrees(math.atan2(dx, -dy)),
-                )
+            ax.view_init(elev=math.degrees(elev_rad), azim=math.degrees(azim_rad))
             
             ax.set_box_aspect((size[0] or 1, size[1] or 1, size[2] or 1))
             try:
@@ -741,11 +754,16 @@ class Renderer:
         triangles: List[List[Tuple[float, float, float]]],
         color: Optional[Tuple[float, float, float]] = None,
         normals: Optional[List[Tuple[float, float, float]]] = None,
+        view_dir: Optional[Tuple[float, float, float]] = None,
     ) -> List[Tuple[float, float, float, float]]:
         """Apply stable light shading without relying on matplotlib's version-specific shade API.
 
         ``normals`` supplies v2.15 crease-aware smooth normals; when absent the
-        flat per-triangle normal is used (legacy behaviour).
+        flat per-triangle normal is used (legacy behaviour). ``view_dir`` adds
+        limb darkening: surfaces seen at grazing angles (bore walls glimpsed
+        through the shaft/bore annular gap, cylinder silhouettes) darken toward
+        ambient instead of lighting up per-facet, so interiors read as uniform
+        shadow rather than a dotted ring of bright facets.
         """
         light = (-0.45, -0.55, 0.70)
         light_len = math.sqrt(sum(value * value for value in light)) or 1.0
@@ -763,6 +781,9 @@ class Renderer:
                     normal = (nx / normal_len, ny / normal_len, nz / normal_len)
                 illumination = abs(normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2])
                 factor = 0.58 + 0.42 * illumination
+                if view_dir is not None:
+                    facing = abs(normal[0] * view_dir[0] + normal[1] * view_dir[1] + normal[2] * view_dir[2])
+                    factor *= 0.55 + 0.45 * facing
             except (IndexError, TypeError, ValueError):
                 factor = 0.78
             colors.append(tuple(min(1.0, max(0.0, channel * factor)) for channel in body_color) + (1.0,))
@@ -770,25 +791,33 @@ class Renderer:
 
     @staticmethod
     def _edge_ribbons(
-        edges: List[Tuple[tuple, tuple]],
+        edges: List[Tuple[tuple, tuple, tuple]],
         view_vector: Tuple[float, float, float],
-        max_dim: float,
+        half_width: float,
     ) -> List[List[Tuple[float, float, float]]]:
-        """Expand feature edges into camera-facing ribbon quads.
+        """Expand visible feature edges into camera-facing ribbon quads.
 
         mplot3d paints each artist as one unit, so a Line3DCollection of edge
         lines would float over the front faces of the model (the old renderer
         hid this by drawing lines per facet *inside* the face collection at
         0.18pt). Ribbons join the same Poly3DCollection, where per-patch depth
-        sorting occludes back-side edges behind the body correctly.
+        sorting occludes them behind nearer geometry.
+
+        Each edge carries the bisector of its two adjacent face normals (the
+        "outside" direction of the crease, convex or concave). Edges whose
+        bisector faces away from the camera are culled outright: painter's
+        sorting alone let far-side rims bleed through flat front plates once
+        the toward-camera offset lifted them in front of the occluder.
         """
         vx, vy, vz = view_vector
         vlen = math.sqrt(vx * vx + vy * vy + vz * vz) or 1.0
         vx, vy, vz = vx / vlen, vy / vlen, vz / vlen
-        half_width = max(max_dim * 0.00035, 1e-4)
-        offset = max_dim * 0.0008
+        half_width = max(half_width, 1e-4)
+        offset = half_width * 2.0
         ribbons: List[List[Tuple[float, float, float]]] = []
-        for point_a, point_b in edges:
+        for point_a, point_b, bisector in edges:
+            if bisector[0] * vx + bisector[1] * vy + bisector[2] * vz <= 0.0:
+                continue  # back-facing crease: never visible here
             try:
                 ex = point_b[0] - point_a[0]
                 ey = point_b[1] - point_a[1]
@@ -862,17 +891,22 @@ class Renderer:
                         edge_faces[key] = (bucket, index)
                     else:
                         edge_faces[key] = None  # non-manifold: leave un-drawn
-            feature_edges: List[Tuple[tuple, tuple]] = []
+            feature_edges: List[Tuple[tuple, tuple, tuple]] = []
             for (u, w), bucket in edge_faces.items():
                 if bucket is None:
                     continue
                 if isinstance(bucket, int):
-                    keep = True  # real open boundary
+                    bisector = normals[bucket]  # open boundary: face normal
                 else:
                     n1, n2 = normals[bucket[0]], normals[bucket[1]]
-                    keep = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] < sharp_cos
-                if keep:
-                    feature_edges.append((mverts[u], mverts[w]))
+                    if n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] >= sharp_cos:
+                        continue
+                    bisector = (n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2])
+                blen = math.sqrt(bisector[0] ** 2 + bisector[1] ** 2 + bisector[2] ** 2)
+                if blen < 1e-9:
+                    continue  # 180 deg fold: no meaningful outside direction
+                feature_edges.append((mverts[u], mverts[w],
+                                      (bisector[0] / blen, bisector[1] / blen, bisector[2] / blen)))
 
             smooth = self._crease_normals(tris, normals, mverts)
             triangles = [[mverts[a], mverts[b], mverts[c]] for a, b, c in tris]

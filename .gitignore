@@ -53,3 +53,10 @@ mech_kernel/examples/gearbox_housing_out/
 
 # Local agent/session artifacts (ZCode plans, not part of the kernel).
 .zcode/
+
+caps_out.txt
+gear_pinion*.step
+input_shaft.step
+part_01_gear_pinion.step
+work_*.png
+work_*.py

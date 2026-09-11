@@ -8,7 +8,7 @@
   <a href="docs/mechkernel-harness-roadmap.md">Harness 路线图</a>
 </p>
 
-[![Tests](https://img.shields.io/badge/tests-401%2F401%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-402%2F402%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
@@ -17,6 +17,10 @@
 ## 概述
 
 MechCAD Kernel 是 [Varen CAD](https://github.com/vanyu0710/aicad) 的**参数化 CAD 内核**。它让 LLM 通过**受控代码通道**（`run_script`，几何只能经内核门面调公开 op）逐步建模，端到端生成可制造的 CAD 几何，并支持多零件装配导出。
+
+**证据渲染质量 (v2.15)** — 同一装配，逐三角画边 → 只画特征边：
+
+![render before/after](docs/images/render-before-after.png)
 
 **核心能力 (v2.15)**：
 - **34 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线；v2.12 新增 `make_gear`（真渐开线齿轮坯公开 op）+ worker `reset` RPC；**v2.12.1 修复 make_gear 两处几何缺陷**（渐开线齿悬浮于毂盘、bore 参数反写致假孔），新增单实体/真通孔回归门
@@ -386,7 +390,7 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.12.1** | **2026-09-07** | **make_gear 几何修复: 渐开线齿延伸至齿根域（与毂盘融合为单实体）+ bore 半径/高修正（真实通孔）；新增 solids/通孔回归测试** | **377** | **34+10** |
 | **+ v2.13** | **2026-09-08** | **代码通道 run_script: ScriptKernel 门面 + AST 白名单沙箱 + 检查点回滚 + 原始 traceback 反馈 + query solid_count；脚本 op 可参数重放** | **384** | **34+10** |
 | **+ v2.14** | **2026-09-09** | **F2a 装配场景命令: export_assembly（XCAF 具名装配 STEP）+ assembly_interference（bbox 预过滤+豁免表）+ render_assembly（分件着色）；无状态，不动单几何契约** | **391** | **34+10** |
-| **+ v2.15** | **2026-09-11** | **渲染净化: OCP 角向细分+焊接水密网格, show_edges 只画特征边(二面角>30°), crease-aware 平滑法线, ribbon 边深度排序; 另修坏系统字体阻断 build123d 导入(fontTools 惰性校验过滤)** | **401** | **34+10** |
+| **+ v2.15** | **2026-09-11** | **渲染净化: OCP 角向细分+焊接水密网格, show_edges 只画特征边(二面角>30°), crease-aware 平滑法线, ribbon 边深度排序; 另修坏系统字体阻断 build123d 导入(fontTools 惰性校验过滤)** | **402** | **34+10** |
 
 ## 安装
 
