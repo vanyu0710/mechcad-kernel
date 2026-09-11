@@ -51,7 +51,7 @@ def test_cylinder_band_has_no_facet_lines_only_rims():
     assert style is not None
     assert len(style["triangles"]) > 40
     assert style["edges"], "rims should still be drawn"
-    for pa, pb, _bisector in style["edges"]:
+    for pa, pb, _n1, _n2 in style["edges"]:
         assert abs(pa[2] - pb[2]) < 1e-9, f"facet line leaked: {pa} -> {pb}"
     # ~53 facets per rim (linear cap governs here), definitely not thousands
     assert len(style["edges"]) < 400
@@ -78,12 +78,12 @@ def test_planar_grid_keeps_only_boundary_edges():
     expected_boundary = 4 * (n - 1)
     assert len(style["edges"]) == expected_boundary
     limit = float(n - 1)
-    for pa, pb, _bisector in style["edges"]:
+    for pa, pb, _n1, _n2 in style["edges"]:
         on_boundary = (pa[0] in (0.0, limit) or pa[1] in (0.0, limit) or
                        pb[0] in (0.0, limit) or pb[1] in (0.0, limit))
         assert on_boundary, "interior diagonal leaked into feature edges"
-        # open boundary edges carry the face normal as bisector
-        assert abs(_bisector[2]) > 0.99
+        # open boundary edges carry the face normal as first adjacent normal
+        assert _n2 is None and abs(_n1[2]) > 0.99
 
 
 def test_crease_normals_do_not_blur_box_corners():
@@ -98,21 +98,21 @@ def test_crease_normals_do_not_blur_box_corners():
 
 def test_edge_ribbons_orient_and_skip_parallel():
     r = Renderer()
-    edge = ((0, 0, 0), (10, 0, 0), (0, -1, 0))  # bisector faces camera
+    edge = ((0, 0, 0), (10, 0, 0), (0, -1, 0), None)  # boundary normal faces camera
     ribbons = r._edge_ribbons([edge], (0, -100, 0), 0.5)
     assert len(ribbons) == 2  # one edge -> one ribbon -> two triangles
     # ribbon sits at the requested width around the edge line (edge along x,
     # view along -y -> the width axis is z)
     zs = [p[2] for tri in ribbons for p in tri]
     assert max(zs) - min(zs) == 1.0
-    parallel = ((0, 0, 0), (0, -10, 0), (0, -1, 0))
+    parallel = ((0, 0, 0), (0, -10, 0), (0, -1, 0), None)
     assert r._edge_ribbons([parallel], (0, -100, 0), 0.5) == []
 
 
 def test_backfacing_edges_are_culled():
     """Far-side rims must not bleed through front plates (ghost circles)."""
     r = Renderer()
-    edge = ((0, 0, 0), (10, 0, 0), (0, 1, 0))  # bisector points away from camera
+    edge = ((0, 0, 0), (10, 0, 0), (0, 1, 0), None)  # boundary normal points away
     assert r._edge_ribbons([edge], (0, -100, 0), 0.5) == []
     # same edge seen from the other side is drawn
     assert len(r._edge_ribbons([edge], (0, 100, 0), 0.5)) == 2
@@ -146,3 +146,62 @@ def test_degenerate_mesh_analyse_returns_none():
     r = Renderer()
     assert r._analyze_group([(0, 0, 0), (1, 0, 0)], [[0, 1, 0]]) is None
     assert r._analyze_group([], []) is None
+
+
+# ---------- v2.16.1 audit regressions (review-2026-09-11/rendering-review.md) ----------
+
+def test_cube_silhouette_edges_survive_culling():
+    """P1-1: an edge with one adjacent face toward the camera is a silhouette
+    candidate and must survive culling. Cube seen from (1,0.2,0.1): three
+    faces visible, so 9 of its 12 edges are candidates (only the 3 edges of
+    the far corner have both faces away)."""
+    import io
+
+    from PIL import Image
+
+    r = Renderer()
+    v, f = r._extract_mesh(Box(20, 20, 20))
+    st = r._analyze_group(v, f)
+    view = (1.0, 0.2, 0.1)
+    ribbons = r._edge_ribbons(st["edges"], view, 0.5)
+    # 9 candidate edges x 2 triangles per ribbon
+    assert len(ribbons) == 18, f"{len(ribbons)} ribbons, expected 18 (9 silhouette edges)"
+
+
+def test_hidden_edges_do_not_bleed_through_front_plate():
+    """P1-2: a closed cube fully behind a thin front plate must contribute no
+    edge pixels. Stroke width must not be used as a depth bias: the old
+    offset(half_width*2) lifted hidden rims in front of the 0.05 mm plate."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    r = Renderer()
+
+    def style_of(shape):
+        vs, fs = r._extract_mesh(shape)
+        return (vs, fs, r.body_color, False), r._analyze_group(vs, fs)
+
+    g_plate, s_plate = style_of(Box(0.05, 20, 20).translate((0.075, 0, 0)))
+    g_cube, s_cube = style_of(Box(2, 10, 10).translate((-1, 0, 0)))
+    common = dict(
+        vertices=[], faces=[], bbox=(-2, -10, -10, 0.1, 10, 10),
+        camera_pos=(-0.95, -40, 0), view_name="front",
+        cx=-0.95, cy=0, cz=0, lim=20, size=(2.1, 20, 20),
+        show_edges=True, image_size=(480, 480),
+    )
+    both = r._render_view(**common, mesh_groups=[g_plate, g_cube], mesh_styles=[s_plate, s_cube])
+    front = r._render_view(**common, mesh_groups=[g_plate], mesh_styles=[s_plate])
+    a = np.asarray(Image.open(io.BytesIO(both)).convert("RGB")).astype(int)
+    b = np.asarray(Image.open(io.BytesIO(front)).convert("RGB")).astype(int)
+    diff = int(np.count_nonzero(np.max(np.abs(a - b), axis=2) > 5))
+    # Pre-HLE the cube's full edge box bled through the 0.05 mm plate (~1375 px
+    # at 480). Hidden-line elimination removes every hidden ribbon; what
+    # remains (~150 px) is a 1 px anti-aliased seam along the plate's own
+    # triangulation diagonal, where the two coplanar front-face triangles blend
+    # with whatever lies behind them (plate back face alone vs the cube face).
+    # The review's acceptance allows small AA differences but forbids the
+    # hidden geometry box — that box is gone. A per-fragment depth pass
+    # (review requirements 4-5, future face/edge channel) would erase the seam.
+    assert diff < 400, f"hidden cube bleeds through plate: {diff} px differ"

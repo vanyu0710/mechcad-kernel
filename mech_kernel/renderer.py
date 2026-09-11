@@ -702,6 +702,7 @@ class Renderer:
                 mm_per_px = view_span / max(min(img_size), 1)
                 edge_triangles = self._edge_ribbons(
                     feature_edges, view_dir, max(mm_per_px * 1.05, 1e-4),
+                    occluders=triangles,
                 )
                 triangles.extend(edge_triangles)
                 triangle_colors.extend([self.EDGE_RGB] * len(edge_triangles))
@@ -789,11 +790,12 @@ class Renderer:
             colors.append(tuple(min(1.0, max(0.0, channel * factor)) for channel in body_color) + (1.0,))
         return colors
 
-    @staticmethod
     def _edge_ribbons(
-        edges: List[Tuple[tuple, tuple, tuple]],
+        self,
+        edges: List[Tuple[tuple, tuple, tuple, Optional[tuple]]],
         view_vector: Tuple[float, float, float],
         half_width: float,
+        occluders: Optional[List] = None,
     ) -> List[List[Tuple[float, float, float]]]:
         """Expand visible feature edges into camera-facing ribbon quads.
 
@@ -803,25 +805,43 @@ class Renderer:
         0.18pt). Ribbons join the same Poly3DCollection, where per-patch depth
         sorting occludes them behind nearer geometry.
 
-        Each edge carries the bisector of its two adjacent face normals (the
-        "outside" direction of the crease, convex or concave). Edges whose
-        bisector faces away from the camera are culled outright: painter's
-        sorting alone let far-side rims bleed through flat front plates once
-        the toward-camera offset lifted them in front of the occluder.
+        v2.16.1 (rendering audit): an edge carries its two adjacent face
+        normals (open boundaries carry one, n2=None). It is a draw candidate
+        when ANY adjacent face points toward the camera — silhouette edges
+        (one face front, one back) are legitimate visible geometry; the old
+        bisector test deleted them. Visibility is then decided by hidden-line
+        elimination against camera-facing triangles (occluders), not by
+        pushing edges toward the camera: the stroke-width-derived offset
+        punched rims through thin front plates and its size changed with the
+        image resolution. The remaining tiny bias only breaks painter's-sort
+        ties between a ribbon and its coplanar faces.
         """
         vx, vy, vz = view_vector
         vlen = math.sqrt(vx * vx + vy * vy + vz * vz) or 1.0
         vx, vy, vz = vx / vlen, vy / vlen, vz / vlen
-        half_width = max(half_width, 1e-4)
-        offset = half_width * 2.0
-        ribbons: List[List[Tuple[float, float, float]]] = []
-        for point_a, point_b, bisector in edges:
-            if bisector[0] * vx + bisector[1] * vy + bisector[2] * vz <= 0.0:
-                continue  # back-facing crease: never visible here
+        graze = -1e-9  # tolerance for faces exactly edge-on to the view
+        candidates: List[Tuple[tuple, tuple]] = []
+        for edge in edges:
             try:
-                ex = point_b[0] - point_a[0]
-                ey = point_b[1] - point_a[1]
-                ez = point_b[2] - point_a[2]
+                pa, pb, n1 = edge[0], edge[1], edge[2]
+                n2 = edge[3] if len(edge) > 3 else None
+            except (TypeError, IndexError):
+                continue
+            front1 = n1[0] * vx + n1[1] * vy + n1[2] * vz > graze
+            front2 = n2 is not None and n2[0] * vx + n2[1] * vy + n2[2] * vz > graze
+            if not (front1 or front2):
+                continue  # every adjacent face points away: never visible here
+            candidates.append((pa, pb))
+        if occluders and candidates:
+            candidates = self._visible_edge_segments(candidates, occluders, (vx, vy, vz))
+        half_width = max(half_width, 1e-4)
+        offset = half_width * 0.5  # numeric tie-breaker only, never an occluder
+        ribbons: List[List[Tuple[float, float, float]]] = []
+        for pa, pb in candidates:
+            try:
+                ex = pb[0] - pa[0]
+                ey = pb[1] - pa[1]
+                ez = pb[2] - pa[2]
             except (TypeError, IndexError):
                 continue
             # ribbon width direction = edge cross view
@@ -831,13 +851,129 @@ class Renderer:
                 continue  # edge parallel to view: zero silhouette, skip
             wx, wy, wz = wx / wlen * half_width, wy / wlen * half_width, wz / wlen * half_width
             ox, oy, oz = vx * offset, vy * offset, vz * offset
-            a1 = (point_a[0] + ox - wx, point_a[1] + oy - wy, point_a[2] + oz - wz)
-            a2 = (point_a[0] + ox + wx, point_a[1] + oy + wy, point_a[2] + oz + wz)
-            b1 = (point_b[0] + ox - wx, point_b[1] + oy - wy, point_b[2] + oz - wz)
-            b2 = (point_b[0] + ox + wx, point_b[1] + oy + wy, point_b[2] + oz + wz)
+            a1 = (pa[0] + ox - wx, pa[1] + oy - wy, pa[2] + oz - wz)
+            a2 = (pa[0] + ox + wx, pa[1] + oy + wy, pa[2] + oz + wz)
+            b1 = (pb[0] + ox - wx, pb[1] + oy - wy, pb[2] + oz - wz)
+            b2 = (pb[0] + ox + wx, pb[1] + oy + wy, pb[2] + oz + wz)
             ribbons.append([a1, a2, b2])
             ribbons.append([a1, b2, b1])
         return ribbons
+
+    def _visible_edge_segments(
+        self,
+        segments: List[Tuple[tuple, tuple]],
+        triangles: List,
+        view_unit: Tuple[float, float, float],
+    ) -> List[Tuple[tuple, tuple]]:
+        """Hidden-line elimination: keep the parameter intervals of each edge
+        segment that are not behind any camera-facing triangle.
+
+        A point on a segment is hidden by a front-facing triangle when its
+        projection falls inside the triangle's projection and the point lies
+        on the far side of the triangle's plane. For a convex triangle that
+        is one interval per segment: intersect the projected line-triangle
+        interval with the behind-plane half-interval, merge, then subtract.
+        """
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - numpy ships with matplotlib
+            return segments
+        tris = np.asarray(triangles, dtype=float)
+        if tris.ndim != 3 or tris.shape[1:] != (3, 3) or not segments:
+            return segments
+        vx, vy, vz = view_unit
+        v = np.array((vx, vy, vz), dtype=float)
+        normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+        nlen = np.linalg.norm(normals, axis=1)
+        valid = nlen > 1e-12
+        tris, normals, nlen = tris[valid], normals[valid], nlen[valid]
+        normals = normals / nlen[:, None]
+        front = normals @ v > 1e-9  # only camera-facing surfaces occlude closed solids
+        tris, normals = tris[front], normals[front]
+        if len(tris) == 0:
+            return segments
+        up = np.array((0.0, 0.0, 1.0)) if abs(vz) < 0.9 else np.array((0.0, 1.0, 0.0))
+        u = np.cross(up, v)
+        u /= np.linalg.norm(u)
+        w = np.cross(v, u)
+        tri2d = np.stack([tris @ u, tris @ w], axis=2)  # (n, 3, 2)
+        visible: List[Tuple[tuple, tuple]] = []
+        for pa, pb in segments:
+            try:
+                a = np.array(pa, dtype=float)
+                b = np.array(pb, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            d = b - a
+            dlen = float(np.linalg.norm(d))
+            if dlen < 1e-9:
+                continue
+            tol = max(1e-6, dlen * 1e-6)
+            d_a = ((a - tris[:, 0]) * normals).sum(axis=1)
+            d_b = ((b - tris[:, 0]) * normals).sum(axis=1)
+            hits = np.nonzero(np.minimum(d_a, d_b) < -tol)[0]
+            if hits.size == 0:
+                visible.append((tuple(a), tuple(b)))
+                continue
+            a2 = np.array((float(a @ u), float(a @ w)))
+            b2 = np.array((float(b @ u), float(b @ w)))
+            hidden: List[List[float]] = []
+            for i in hits:
+                # clip [0,1] against the triangle's projected half-planes
+                lo, hi = 0.0, 1.0
+                inside = True
+                p0, p1, p2 = tri2d[i]
+                for e0, e1, ref in ((p0, p1, p2), (p1, p2, p0), (p2, p0, p1)):
+                    exx, eyy = float(e1[0] - e0[0]), float(e1[1] - e0[1])
+                    s_ref = exx * (float(ref[1]) - float(e0[1])) - eyy * (float(ref[0]) - float(e0[0]))
+                    if abs(s_ref) < 1e-12:
+                        continue  # degenerate projected edge
+                    fa = (exx * (float(a2[1]) - float(e0[1])) - eyy * (float(a2[0]) - float(e0[0]))) * s_ref
+                    fb = (exx * (float(b2[1]) - float(e0[1])) - eyy * (float(b2[0]) - float(e0[0]))) * s_ref
+                    if fa >= 0.0 and fb >= 0.0:
+                        continue
+                    if fa < 0.0 and fb < 0.0:
+                        inside = False
+                        break
+                    t_cross = fa / (fa - fb)
+                    if fa < 0.0:
+                        lo = max(lo, t_cross)
+                    else:
+                        hi = min(hi, t_cross)
+                    if lo >= hi:
+                        inside = False
+                        break
+                if not inside or hi <= lo + 1e-9:
+                    continue
+                da_i, db_i = float(d_a[i]), float(d_b[i])
+                if da_i < -tol and db_i < -tol:
+                    blo, bhi = lo, hi  # whole segment behind this plane
+                else:
+                    t_star = da_i / (da_i - db_i)
+                    if da_i >= -tol:
+                        blo, bhi = max(lo, t_star), hi  # enters behind at t*
+                    else:
+                        blo, bhi = lo, min(hi, t_star)  # leaves behind at t*
+                if bhi > blo + 1e-9:
+                    hidden.append([blo, bhi])
+            if not hidden:
+                visible.append((tuple(a), tuple(b)))
+                continue
+            hidden.sort()
+            merged: List[List[float]] = []
+            for h0, h1 in hidden:
+                if merged and h0 <= merged[-1][1] + 1e-9:
+                    merged[-1][1] = max(merged[-1][1], h1)
+                else:
+                    merged.append([h0, h1])
+            cursor = 0.0
+            for h0, h1 in merged:
+                if h0 > cursor + 1e-6:
+                    visible.append((tuple(a + d * cursor), tuple(a + d * h0)))
+                cursor = max(cursor, h1)
+            if cursor < 1.0 - 1e-6:
+                visible.append((tuple(a + d * cursor), tuple(b)))
+        return visible
 
     def _analyze_group(self, vertices: List, faces: List) -> Optional[Dict]:
         """Merge coincident vertices, then derive feature edges and smooth normals.
@@ -891,22 +1027,18 @@ class Renderer:
                         edge_faces[key] = (bucket, index)
                     else:
                         edge_faces[key] = None  # non-manifold: leave un-drawn
-            feature_edges: List[Tuple[tuple, tuple, tuple]] = []
+            feature_edges: List[Tuple[tuple, tuple, tuple, Optional[tuple]]] = []
             for (u, w), bucket in edge_faces.items():
                 if bucket is None:
                     continue
                 if isinstance(bucket, int):
-                    bisector = normals[bucket]  # open boundary: face normal
+                    n1, n2 = normals[bucket], None  # open boundary: single face normal
                 else:
                     n1, n2 = normals[bucket[0]], normals[bucket[1]]
-                    if n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] >= sharp_cos:
-                        continue
-                    bisector = (n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2])
-                blen = math.sqrt(bisector[0] ** 2 + bisector[1] ** 2 + bisector[2] ** 2)
-                if blen < 1e-9:
-                    continue  # 180 deg fold: no meaningful outside direction
-                feature_edges.append((mverts[u], mverts[w],
-                                      (bisector[0] / blen, bisector[1] / blen, bisector[2] / blen)))
+                    cos_dih = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]
+                    if cos_dih >= sharp_cos or cos_dih <= -1.0 + 1e-9:
+                        continue  # smooth (or 180 deg fold): not a feature edge
+                feature_edges.append((mverts[u], mverts[w], n1, n2))
 
             smooth = self._crease_normals(tris, normals, mverts)
             triangles = [[mverts[a], mverts[b], mverts[c]] for a, b, c in tris]

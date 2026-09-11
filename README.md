@@ -8,7 +8,7 @@
   <a href="docs/mechkernel-harness-roadmap.md">Harness 路线图</a>
 </p>
 
-[![Tests](https://img.shields.io/badge/tests-409%2F409%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-411%2F411%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
@@ -393,6 +393,7 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.14** | **2026-09-09** | **F2a 装配场景命令: export_assembly（XCAF 具名装配 STEP）+ assembly_interference（bbox 预过滤+豁免表）+ render_assembly（分件着色）；无状态，不动单几何契约** | **391** | **34+10** |
 | **+ v2.15** | **2026-09-11** | **渲染净化: OCP 角向细分+焊接水密网格, show_edges 只画特征边(二面角>30°), crease-aware 平滑法线, ribbon 边深度排序; 另修坏系统字体阻断 build123d 导入(fontTools 惰性校验过滤)** | **402** | **34+10** |
 | **+ v2.16** | **2026-09-11** | **run_script 失败策略：默认 abort（op 失败即回滚+SCRIPT_OP_FAILED+failed_op 结构），可选 best_effort（收集失败但绝不静默成功）；ScriptOpError 可被脚本 try/except** | **409** | **34+10** |
+| **+ v2.16.1** | **2026-09-11** | **渲染审计 P1 修复：特征边携带双邻面法线，轮廓边（一前一后）不再被 bisector 误删（立方体斜视 6/9→9/9）；边可见性改 hidden-line elimination 区间裁剪（numpy 向量化），描边宽度不再充当深度偏移——薄板遮挡穿透 1375px→AA 缝 ~150px** | **411** | **34+10** |
 
 ## 安装
 
