@@ -442,7 +442,7 @@ def test_unknown_field_suggestion_has_valid_fields():
     r = k.execute("fillet", radius=1, bogus=2)
     assert not r.success
     assert r.suggestion["reason_code"] == "unknown_field"
-    assert sorted(r.suggestion["valid_fields"]) == ["edges", "name", "radius"]
+    assert sorted(r.suggestion["valid_fields"]) == ["edges", "expected", "name", "radius"]
     print("  ✓ test_unknown_field_suggestion_has_valid_fields")
 
 

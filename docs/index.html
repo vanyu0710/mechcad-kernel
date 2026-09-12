@@ -803,7 +803,7 @@
     <!-- 状态徽章: 1 个小 chip, 不喧宾夺主 -->
     <div class="status-chip">
       <span class="pulse"></span>
-      <span class="v">v2.16</span> &nbsp;·&nbsp; 409 tests pass &nbsp;·&nbsp; AGPL-3.0
+      <span class="v">v2.17</span> &nbsp;·&nbsp; 423 tests pass &nbsp;·&nbsp; AGPL-3.0
     </div>
 
     <!-- 标题: 整句统一深海色, 弱化强调 -->
@@ -840,10 +840,10 @@
         <span class="v">34</span><span class="l">公开 op</span>
       </div>
       <div class="mini-stat">
-        <span class="v">409</span><span class="l">测试全过</span>
+        <span class="v">423</span><span class="l">测试全过</span>
       </div>
       <div class="mini-stat">
-        <span class="v">v2.16</span><span class="l">3 端到端 demo</span>
+        <span class="v">v2.17</span><span class="l">3 端到端 demo</span>
       </div>
     </div>
   </div>
@@ -1009,6 +1009,20 @@
 
     <div class="ops-row">
       <div class="meta">
+        <div class="num">v2.17 · 几何语义</div>
+        <h4>引用锚点 + 孔语义</h4>
+        <p class="desc">select 发放带几何指纹，同串引用换代在结果里显式报 rebindings；fillet/chamfer/shell/workplane 支持 expected 锚点，不符即 TOPOLOGY_REFERENCE_REBOUND。query what=holes 用实体分类器判凹凸/贯通/深度/位置——外凸台绝不算孔。hole 盲孔深度修复：进入面沿钻轴实测（不再信全局 bbox）。</p>
+      </div>
+      <div class="ops-grid">
+        <span class="op" style="color: var(--mute); border-style: dashed;">rebindings</span>
+        <span class="op" style="color: var(--mute); border-style: dashed;">expected 锚点</span>
+        <span class="op" style="color: var(--mute); border-style: dashed;">query holes</span>
+        <span class="op" style="color: var(--mute); border-style: dashed;">entry probing</span>
+      </div>
+    </div>
+
+    <div class="ops-row">
+      <div class="meta">
         <div class="num">EXPERIMENTAL · 10 OP</div>
         <h4>装配与参考系 (闸门后)</h4>
         <p class="desc">默认不进入 LLM 能力集; 上层装配流程经 v2.14 场景命令驱动, 不直接暴露这些 op.</p>
@@ -1065,7 +1079,7 @@
     <span class="eyebrow-section">Roadmap</span>
     <h2 class="section-title">9 个月, 从 18 op 到 44 op</h2>
     <p class="section-subtitle">
-      当前 v2.16, 自评分 6.5/10, 距离工业生产 1.0 还需 2-3 人月.
+      当前 v2.17, 自评分 6.5/10, 距离工业生产 1.0 还需 2-3 人月.
     </p>
     <div class="versions-timeline">
       <div class="vt-line"></div>
@@ -1130,10 +1144,15 @@
           <div class="vt-version">v2.15</div>
           <div class="vt-label">渲染净化<br/>特征边+平滑</div>
         </div>
-        <div class="vt-node current">
+        <div class="vt-node">
           <div class="vt-dot"></div>
           <div class="vt-version">v2.16</div>
           <div class="vt-label">脚本失败<br/>即整体回滚</div>
+        </div>
+        <div class="vt-node current">
+          <div class="vt-dot"></div>
+          <div class="vt-version">v2.17</div>
+          <div class="vt-label">引用锚点<br/>孔语义</div>
         </div>
       </div>
     </div>
@@ -1153,9 +1172,9 @@
         <div class="d">从草图到装配, 13 大类, LLM 可直接调用</div>
       </div>
       <div class="metric">
-        <div class="v">409<span class="small"> / 409</span></div>
+        <div class="v">423<span class="small"> / 423</span></div>
         <div class="l">测试 100% 通过</div>
-        <div class="d">v1.0 → v2.16 全面覆盖, 含集成测试 + 几何验证</div>
+        <div class="d">v1.0 → v2.17 全面覆盖, 含集成测试 + 几何验证</div>
       </div>
       <div class="metric">
         <div class="v">2-3<span class="small"> 人月</span></div>
@@ -1174,7 +1193,7 @@
       "看 → 想 → 做 → 验" 的拟人化范式, 让 LLM 不再是一次性预测,
       而是边做边看, 错了就回退的<em style="color: var(--coral);">工程师</em>.
     </blockquote>
-    <cite><b>v2.16 自评</b> · 6.5/10 · 距离 1.0 还需 AABB + 装配诊断 + 集成 aicad</cite>
+    <cite><b>v2.17 自评</b> · 6.5/10 · 距离 1.0 还需 AABB + 装配诊断 + 集成 aicad</cite>
   </div>
 </section>
 
@@ -1210,7 +1229,7 @@
         前体视觉建模内核. <br/>AGPL-3.0-or-later · 工业自评 6.5/10.
       </p>
       <div class="badges">
-        <span class="badge"><span class="dot"></span> 409 tests passing</span>
+        <span class="badge"><span class="dot"></span> 423 tests passing</span>
         <span class="badge">build123d 0.11.1</span>
         <span class="badge">OCC 7.9.3</span>
       </div>

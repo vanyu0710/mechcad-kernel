@@ -137,6 +137,8 @@ class MechKernel:
         self._topo_cache: TopologyCache = TopologyCache()  # v2.11: face/edge 引用缓存
         self._ids = IdGeneratorSet()  # v2.11: 实例私有 ID 生成器（多实例互不污染）
         self._ref_birth_revision: Dict[str, int] = {}  # v2.11: ref → 诞生时几何 revision
+        # v2.17 P1-4: ref → 最近一次发放时的几何指纹（检测同串引用换指代对象）
+        self._ref_birth_fingerprint: Dict[str, dict] = {}
         self._pending_op_warning: Optional[str] = None  # v2.11: op 内部产生的附带警告
         self._replay_parameter_overrides: Optional[Dict[str, float]] = None
         self._last_profile_fallback: Optional[str] = None  # v2.11: 真弧线剖面回退提示
@@ -179,6 +181,9 @@ class MechKernel:
                                       description="标准面沿法向偏置距离"),
                 "face_ref": FieldSchema(type="string", required=False,
                                         description="面引用（如 'F03'，来自 select）→ 面上草图"),
+                "expected": FieldSchema(type="dict", required=False,
+                                        description="v2.17 引用锚点（防重绑定）：{type, center, radius_mm, tolerance_mm}，"
+                                                    "与当前几何指纹不符即报 TOPOLOGY_REFERENCE_REBOUND"),
             },
             permission="public",
         ))
@@ -330,17 +335,20 @@ class MechKernel:
             "fillet": {"radius": FieldSchema(type="number", required=True, min=0.001),
                        "edges": FieldSchema(type="string_or_list", required=False, default="all",
                                             description="'all' 或边引用列表（如 ['E12','E15']，来自 select element_type='edge'）"),
-                       "name": FieldSchema(type="string", required=False)},
+                       "name": FieldSchema(type="string", required=False),
+                       "expected": FieldSchema(type="dict", required=False, description="v2.17 引用锚点（防重绑定）：{type, radius_mm, center, length_mm, tolerance_mm}，与当前几何指纹不符即报 TOPOLOGY_REFERENCE_REBOUND")},
             "chamfer": {"length": FieldSchema(type="number", required=True, min=0.001),
                         "length2": FieldSchema(type="number", required=False, min=0.001),
                         "edges": FieldSchema(type="string_or_list", required=False, default="all",
                                              description="'all' 或边引用列表（如 ['E12','E15']，来自 select element_type='edge'）"),
-                        "name": FieldSchema(type="string", required=False)},
+                        "name": FieldSchema(type="string", required=False),
+                        "expected": FieldSchema(type="dict", required=False, description="v2.17 引用锚点（防重绑定）：{type, radius_mm, center, length_mm, tolerance_mm}，与当前几何指纹不符即报 TOPOLOGY_REFERENCE_REBOUND")},
             "shell": {"thickness": FieldSchema(type="number", required=True, min=0.001),
                       "face_filter": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "z+", "z-", "x+", "x-", "y+", "y-"]),
                       "name": FieldSchema(type="string", required=False),
                       "face_refs": FieldSchema(type="list", required=False, items_type="string",
-                                               description="开口面引用列表（如 ['F03']，来自 select）；提供时优先于 face_filter")},
+                                               description="开口面引用列表（如 ['F03']，来自 select）；提供时优先于 face_filter"),
+                      "expected": FieldSchema(type="dict", required=False, description="v2.17 引用锚点（防重绑定）：{type, radius_mm, center, area_mm2, tolerance_mm}，与当前几何指纹不符即报 TOPOLOGY_REFERENCE_REBOUND")},
             "linear_pattern": {"sketch_name": FieldSchema(type="string", required=True),
                                "count": FieldSchema(type="integer", required=True, min=2, max=100),
                                "direction": FieldSchema(type="tuple", required=False, default=[1, 0], items_type="number", length=2),
@@ -364,7 +372,7 @@ class MechKernel:
                        "depth": FieldSchema(type="number", required=False, min=0.001,
                                             description="拉伸深度；缺省自动取当前零件 Z 向尺寸 + 2mm")},
             "query": {"target": FieldSchema(type="string", required=True),
-                      "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count", "solid_count"])},
+                      "what": FieldSchema(type="enum", required=False, default="bounding_box", enum=["bounding_box", "volume", "centroid", "face_count", "edge_count", "vertex_count", "solid_count", "holes"])},
             "select": {"filter_type": FieldSchema(type="enum", required=False, default="all",
                                                   enum=["all", "plane", "cylinder", "cone", "sphere", "torus",
                                                         "line", "circle", "ellipse", "bezier", "bspline"]),
@@ -483,7 +491,8 @@ class MechKernel:
                 cap.func = method
 
     def create_workplane(self, name: str, type: str = "XY", origin=None, x_dir=None,
-                         normal=None, offset: float = 0.0, face_ref: str = None) -> StepResult:
+                         normal=None, offset: float = 0.0, face_ref: str = None,
+                         expected: dict = None) -> StepResult:
         """
         v2.11: 真实支持自定义平面 / 基准面偏置 / 面上草图（此前 custom 的参数被丢弃）
 
@@ -550,6 +559,8 @@ class MechKernel:
                 )
             except RefFormatError as e:
                 raise InvalidRequestError(str(e))
+            if expected:
+                self._verify_ref_expectation(info, expected, [face_ref])
             face = info.shape
             if info.geom_type != "plane":
                 raise RecoverableError(
@@ -1593,7 +1604,7 @@ class MechKernel:
             elapsed_ms=(time.time() - start) * 1000,
             step_index=self._step_counter,
         ))
-    def _resolve_edge_refs(self, edges) -> list:
+    def _resolve_edge_refs(self, edges, expected: dict = None) -> list:
         """v2.11: edges 参数 → build123d Edge 列表。
 
         接受 "all"（全部边）| "E12"（单引用）| ["E12", "E15"]（引用列表）。
@@ -1620,9 +1631,13 @@ class MechKernel:
             )
         except RefFormatError as e:
             raise InvalidRequestError(str(e))
+        if expected:
+            for info in infos:
+                self._verify_ref_expectation(info, expected, [info.ref])
         return [info.shape for info in infos]
 
-    def fillet(self, radius: float, edges: str = "all", name: str = "") -> StepResult:
+    def fillet(self, radius: float, edges: str = "all", name: str = "",
+               expected: dict = None) -> StepResult:
         """
         v1.4.1 真实 fillet（圆角）— 用 build123d Part.fillet → OCC BRepFilletAPI
         
@@ -1649,7 +1664,7 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
-            edge_list = self._resolve_edge_refs(edges)
+            edge_list = self._resolve_edge_refs(edges, expected)
 
             try:
                 self._current_geometry = self._current_geometry.fillet(radius, edge_list)
@@ -1688,7 +1703,8 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def chamfer(self, length: float, length2: float = None, edges: str = "all", name: str = "") -> StepResult:
+    def chamfer(self, length: float, length2: float = None, edges: str = "all", name: str = "",
+                expected: dict = None) -> StepResult:
         """
         v1.4.2 真实 chamfer（倒角）— 用 build123d Part.chamfer → OCC BRepFilletAPI_MakeChamfer
         
@@ -1717,7 +1733,7 @@ class MechKernel:
             )
             self.feature_graph.add(feature)
             
-            edge_list = self._resolve_edge_refs(edges)
+            edge_list = self._resolve_edge_refs(edges, expected)
 
             try:
                 self._current_geometry = self._current_geometry.chamfer(length, l2, edge_list)
@@ -1756,6 +1772,53 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
+    def _probe_entry_distance(self, shape, drill, anchor, axis_extent) -> float:
+        """沿钻轴实测进入面：返回 anchor 到真实材料表面的距离（0=锚点即表面）。
+
+        全局 bbox 锚点在异形件上会高估入口位置（底脚/法兰比功能面外伸），
+        盲孔深度必须从真实表面起算。粗走 0.5mm 找材料，再二分收敛到 0.01mm。
+        """
+        try:
+            from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+            from OCP.gp import gp_Pnt
+            from OCP.TopAbs import TopAbs_ShapeEnum, TopAbs_State
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopoDS import TopoDS
+
+            s_exp = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_SOLID)
+            if not s_exp.More():
+                return 0.0
+            solid = TopoDS.Solid_s(s_exp.Current())
+            classifier = BRepClass3d_SolidClassifier(solid)
+
+            def inside(t: float) -> bool:
+                point = gp_Pnt(anchor[0] + drill[0] * t,
+                               anchor[1] + drill[1] * t,
+                               anchor[2] + drill[2] * t)
+                classifier.Perform(point, 1e-6)
+                return classifier.State() == TopAbs_State.TopAbs_IN
+
+            step = 0.5
+            t = 0.0
+            hit = None
+            while t <= axis_extent:
+                if inside(t):
+                    hit = t
+                    break
+                t += step
+            if hit is None:
+                return 0.0
+            lo, hi = max(hit - step, 0.0), hit
+            while hi - lo > 0.01:
+                mid = (lo + hi) / 2
+                if inside(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            return (lo + hi) / 2
+        except Exception:
+            return 0.0
+
     def hole(
         self,
         position: tuple = (0, 0),
@@ -1839,9 +1902,22 @@ class MechKernel:
         else:  # y- / -Y
             anchor = (position[0], lo[1], position[1]); axis_extent = extents[1]
 
+        # v2.17 盲孔深度修复（两层）：
+        # 1) 刀具从进入面上方 margin 处起钻、总长 depth+margin → 孔底恰在 depth 深。
+        #    旧实现从进入面起钻 depth+margin，margin=5 使盲孔系统性超深。
+        # 2) 进入面按钻轴实测（bbox 角点锚点会被其它特征抬高——如底脚板 65 vs
+        #    轴承凸台实际面 62，旧代码靠 margin 过切侥幸掩盖）。
+        entry_t = self._probe_entry_distance(shape, drill, anchor, axis_extent)
+        surface = (anchor[0] + drill[0] * entry_t,
+                   anchor[1] + drill[1] * entry_t,
+                   anchor[2] + drill[2] * entry_t)
         actual_depth = (axis_extent + 2 * margin) if depth is None else (depth + margin)
-        axis_plane = B3DPlane(origin=anchor, z_dir=drill)
-        back_plane = B3DPlane(origin=anchor, z_dir=tuple(-v for v in drill))
+        cutter_origin = (surface[0] - drill[0] * margin,
+                         surface[1] - drill[1] * margin,
+                         surface[2] - drill[2] * margin)
+        axis_plane = B3DPlane(origin=cutter_origin, z_dir=drill)
+        entry_plane = B3DPlane(origin=surface, z_dir=drill)
+        back_plane = B3DPlane(origin=surface, z_dir=tuple(-v for v in drill))
         px, py = position
 
         with Transaction(self, "hole") as txn:
@@ -1851,7 +1927,7 @@ class MechKernel:
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.HOLE,
                 parameters={
-                    "position": list(position), "diameter": diameter, "depth": actual_depth,
+                    "position": list(position), "diameter": diameter, "depth": depth,
                     "hole_type": hole_type, "counterbore_diameter": counterbore_diameter,
                     "counterbore_depth": counterbore_depth, "name": name, "direction": direction,
                 },
@@ -1878,7 +1954,7 @@ class MechKernel:
                     raise InvalidRequestError(
                         f"countersink 大径 {cs_d} 必须大于孔径 {diameter}")
                 cone = B3DSolid.make_cone(
-                    cs_d / 2, diameter / 2, cs_depth, plane=axis_plane)
+                    cs_d / 2, diameter / 2, cs_depth, plane=entry_plane)
                 collar = B3DSolid.make_cylinder(cs_d / 2, margin, plane=back_plane)
                 cutter = bore + cone + collar
 
@@ -1905,7 +1981,8 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
-    def shell(self, thickness: float, face_filter: str = "top", name: str = "", face_refs: list = None) -> StepResult:
+    def shell(self, thickness: float, face_filter: str = "top", name: str = "", face_refs: list = None,
+              expected: dict = None) -> StepResult:
         """
         v1.6.1 真实 shell（抽壳）— 用 OCP BRepOffsetAPI_MakeThickSolid
 
@@ -1967,6 +2044,8 @@ class MechKernel:
             except RefFormatError as e:
                 raise InvalidRequestError(str(e))
             for info in open_infos:
+                if expected:
+                    self._verify_ref_expectation(info, expected, [info.ref])
                 faces_list.Append(info.shape.wrapped)
         else:
             if face_filter not in target_dirs:
@@ -2423,8 +2502,9 @@ class MechKernel:
         """
         start = time.time()
         if what not in ("bounding_box", "volume", "centroid", "face_count", "edge_count",
-                        "vertex_count", "solid_count"):
-            raise InvalidRequestError(f"what 必须是 bounding_box/volume/centroid/face_count/edge_count/vertex_count（当前 {what}）")
+                        "vertex_count", "solid_count", "holes"):
+            raise InvalidRequestError(f"what 必须是 bounding_box/volume/centroid/face_count/edge_count/"
+                                      f"vertex_count/solid_count/holes（当前 {what}）")
         
         # 选几何（v1.16 修复：支持 feature_id 目标 → 该 feature 完成时的几何）
         warning = None
@@ -2471,6 +2551,29 @@ class MechKernel:
                 step_index=self._step_counter,
             )
             result.value = count
+            result.target = target
+            result.what = what
+            if warning:
+                result.warning = warning
+            return result
+
+        # v2.17 P1-5: holes —— 孔语义分析（凹凸/贯通/深度/位置），feature_contract 用
+        if what == "holes":
+            from .hole_analysis import analyze_holes
+            holes = analyze_holes(geom)
+            if holes is None:
+                raise InvalidRequestError("holes 分析需要真实 B-Rep 几何（mock 不支持）")
+            self._step_counter += 1
+            result = make_success(
+                feature_id=f"Q_{self._step_counter:03d}",
+                narrative=f"query {target} holes = {len(holes)} 个",
+                current_narrative=self.narrative.copy(),
+                feature_graph_delta={"queried": [target, what]},
+                elapsed_ms=(time.time() - start) * 1000,
+                step_index=self._step_counter,
+            )
+            result.value = {"holes": holes, "count": len(holes),
+                            "revision": self._geometry_revision}
             result.target = target
             result.what = what
             if warning:
@@ -2741,6 +2844,7 @@ class MechKernel:
 
             infos = self._topo_cache.faces(self._geometry_revision, self._current_geometry)
             self._record_ref_births([i.ref for i in infos])
+            rebindings = self._note_ref_rebindings(infos)
             type_count = {"plane": 0, "cylinder": 0, "cone": 0, "sphere": 0, "torus": 0}
             all_faces = []
             for info in infos:
@@ -2758,6 +2862,11 @@ class MechKernel:
                 "revision": self._geometry_revision,
                 "note": "ref 可回喂 fillet/chamfer(edges)、shell/create_workplane(face_refs/face_ref)；几何修改后引用失效需重新 select",
             }
+            if rebindings:
+                result_value["rebindings"] = rebindings
+                result_value["warning"] = (
+                    f"{len(rebindings)} 个引用串号换代（如 {[r['ref'] for r in rebindings][:3]}）——"
+                    "同一 ref 现在指向不同几何，勿沿用记忆语义；消费时可传 expected 锚点防误用")
             if face_index is not None and 0 <= face_index < len(all_faces):
                 result_value["specific"] = all_faces[face_index]
         else:  # edge
@@ -2768,6 +2877,7 @@ class MechKernel:
 
             infos = self._topo_cache.edges(self._geometry_revision, self._current_geometry)
             self._record_ref_births([i.ref for i in infos])
+            rebindings = self._note_ref_rebindings(infos)
             type_count: dict = {}
             all_edges = []
             for info in infos:
@@ -2784,6 +2894,11 @@ class MechKernel:
                 "revision": self._geometry_revision,
                 "note": "ref 可回喂 fillet/chamfer 的 edges 参数（如 edges=['E12','E15']）；几何修改后引用失效需重新 select",
             }
+            if rebindings:
+                result_value["rebindings"] = rebindings
+                result_value["warning"] = (
+                    f"{len(rebindings)} 个引用串号换代（如 {[r['ref'] for r in rebindings][:3]}）——"
+                    "同一 ref 现在指向不同几何，勿沿用记忆语义；消费时可传 expected 锚点防误用")
             if face_index is not None and 0 <= face_index < len(all_edges):
                 result_value["specific"] = all_edges[face_index]
 
@@ -4294,6 +4409,70 @@ class MechKernel:
         for ref in refs:
             self._ref_birth_revision[ref] = self._geometry_revision
 
+    def _note_ref_rebindings(self, infos: List["TopoInfo"]) -> List[dict]:
+        """v2.17 P1-4: 记录发放时的几何指纹；同串引用换了代对象则报告 rebind。
+
+        模型的记忆里 "E00=外圆边" 不会因为重新 select 而自动更新——这里把
+        指纹变化显式写进 select 结果，让重绑定在工具输出里可见而非静默。
+        """
+        rebindings: List[dict] = []
+        if self._replaying:
+            for info in infos:
+                self._ref_birth_fingerprint[info.ref] = info.fingerprint()
+            return rebindings
+        for info in infos:
+            previous = self._ref_birth_fingerprint.get(info.ref)
+            current = info.fingerprint()
+            if previous is not None and previous != current:
+                rebindings.append({"ref": info.ref, "was": previous, "now": current})
+            self._ref_birth_fingerprint[info.ref] = current
+        return rebindings
+
+    def _verify_ref_expectation(self, info: "TopoInfo", expected: dict,
+                                refs: List[str]) -> None:
+        """v2.17 P1-4: 消费端 `expected` 锚点校验。
+
+        expected 支持键：type / radius_mm / length_mm / center（列表 [x,y,z]）
+        与 tolerance_mm（默认 0.5mm 中心、0.05mm 半径/长度）。不符即抛
+        TOPOLOGY_REFERENCE_REBOUND（RECOVERABLE，指引重新 select），
+        防止模型凭记忆把同串引用用到已换代的几何上。
+        """
+        if not isinstance(expected, dict) or not expected:
+            return
+        if self._replaying:
+            return  # 重放按历史序号确定性重建，锚点只防交互期记忆误用
+        tolerance = float(expected.get("tolerance_mm", 0.5))
+        radius_tol = float(expected.get("radius_tolerance_mm", 0.05))
+        fp = info.fingerprint()
+        problems: List[str] = []
+        want_type = expected.get("type")
+        if want_type and str(want_type) != fp.get("type"):
+            problems.append(f"type 期望 {want_type}，实际 {fp.get('type')}")
+        if expected.get("radius_mm") is not None:
+            if fp.get("radius_mm") is None:
+                problems.append(f"期望半径 {expected['radius_mm']}，该引用无半径")
+            elif abs(float(expected["radius_mm"]) - fp["radius_mm"]) > radius_tol:
+                problems.append(f"半径期望 {expected['radius_mm']}，实际 {fp.get('radius_mm')}")
+        if expected.get("length_mm") is not None:
+            if fp.get("length_mm") is None or abs(float(expected["length_mm"]) - fp["length_mm"]) > tolerance:
+                problems.append(f"长度期望 {expected['length_mm']}，实际 {fp.get('length_mm')}")
+        if expected.get("center") is not None:
+            want_center = expected.get("center")
+            if isinstance(want_center, (list, tuple)) and len(want_center) == 3:
+                if fp.get("center") is None:
+                    problems.append("期望中心坐标，但该引用无中心信息")
+                else:
+                    dist = max(abs(float(a) - float(b)) for a, b in zip(want_center, fp["center"]))
+                    if dist > tolerance:
+                        problems.append(f"中心期望 {tuple(float(v) for v in want_center)}，实际 {fp['center']}")
+        if problems:
+            raise RecoverableError(
+                f"引用 {refs} 与 expected 锚点不符（同串引用已换代）: " + "；".join(problems),
+                suggestion={"action": "重新 select 并按当前摘要选引用；不要沿用记忆中的旧语义",
+                            "reason_code": "topology_reference_rebound"},
+                reason_code="topology_reference_rebound",
+            )
+
     def _check_refs_fresh(self, refs: List[str]) -> None:
         """v2.11: 引用必须来自当前 revision（几何被修改后旧引用失效）。
 
@@ -4396,6 +4575,7 @@ class MechKernel:
             self._ids.reset()
             self._ids.seed_from_history(self._op_history)
             self._ref_birth_revision = {}
+            self._ref_birth_fingerprint = {}
             parameter_overrides = {}
             for entry in self._op_history:
                 if entry.get("op") == "add_constraint":

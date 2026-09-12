@@ -51,6 +51,24 @@ class TopoInfo:
             d["radius_mm"] = round(self.radius, 3)
         return d
 
+    def fingerprint(self) -> dict:
+        """几何身份指纹（v2.17 P1-4）：类型 + 关键尺寸 + 中心，全部粗量化。
+
+        用于：select 发放时检测同串引用换了指代对象（rebind），以及消费端
+        `expected` 锚点校验。量化到 0.1mm/0.01mm 级别，容忍浮点噪声但
+        足以区分"不同的边"。
+        """
+        fp: Dict[str, Any] = {"type": self.geom_type}
+        if self.radius is not None:
+            fp["radius_mm"] = round(self.radius, 2)
+        if self.center is not None:
+            fp["center"] = tuple(round(v, 1) for v in self.center)
+        if self.length is not None:
+            fp["length_mm"] = round(self.length, 1)
+        if self.area is not None:
+            fp["area_mm2"] = round(self.area, 1)
+        return fp
+
 
 _FACE_TYPE_NAMES = {
     0: "plane", 1: "cylinder", 2: "cone", 3: "sphere", 4: "torus",
