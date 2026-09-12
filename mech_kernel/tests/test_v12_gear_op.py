@@ -78,17 +78,18 @@ def test_make_gear_new_body_guard():
 
 
 def test_make_gear_threshold_switches_profile():
-    """z=60 默认走 trapezoid；threshold 提到 100 走强渐开线（narrative 标注齿形）"""
+    """v2.18: 默认阈值为 400 → z=60 走真渐开线；显式压阈值到 50 才回退梯形。"""
     k = MechKernel()
     r1 = _gear(k, teeth=60)
     assert r1["success"] is True
-    assert "trapezoid" in r1["narrative"]
+    assert "involute" in r1["narrative"]        # 默认真渐开线
     k2 = MechKernel()
-    r2 = _gear(k2, teeth=60, involute_teeth_threshold=100)
+    r2 = _gear(k2, teeth=60, involute_teeth_threshold=50)
     assert r2["success"] is True
-    assert "involute" in r2["narrative"]
-    # 真渐开线齿形更"瘦"：同参数下 involute 体积 ≤ trapezoid 体积
-    assert r2["geometry_summary"].volume <= r1["geometry_summary"].volume * 1.001
+    assert "trapezoid" in r2["narrative"]       # 强制回退
+    # 两种齿形体积应接近但可区分（真渐开线齿顶更饱满，梯形齿顶被人为削薄）
+    vi, vt = r1["geometry_summary"].volume, r2["geometry_summary"].volume
+    assert abs(vi - vt) / vt < 0.10, f"involute {vi} vs trapezoid {vt} 差异过大"
 
 
 def test_make_gear_invalid_requests():

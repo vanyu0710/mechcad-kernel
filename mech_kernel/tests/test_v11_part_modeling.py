@@ -449,7 +449,7 @@ def test_unknown_field_suggestion_has_valid_fields():
 def test_experimental_gate():
     """装配 op 默认拒绝, allow_experimental=True 放行"""
     k = MechKernel()
-    assert len(PUBLIC_OPS) == 34  # v2.12: + make_gear
+    assert len(PUBLIC_OPS) == 36  # v2.18: + create_keyway / create_spline
     assert len(EXPERIMENTAL_OPS) == 10
     assert "assemble" in EXPERIMENTAL_OPS and "assemble" not in PUBLIC_OPS
     r = k.execute("query_assembly")

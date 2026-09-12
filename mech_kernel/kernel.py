@@ -58,7 +58,7 @@ from .validators import (
 PUBLIC_OPS = frozenset({
     "create_workplane", "new_sketch", "add_circle", "add_rectangle", "add_line", "close_sketch",
     "extrude", "revolve", "sweep", "boolean", "make_gear",
-    "hole", "fillet", "chamfer", "shell",
+    "hole", "create_keyway", "create_spline", "fillet", "chamfer", "shell",
     "linear_pattern", "circular_pattern", "mirror",
     "query", "select", "measure",
     "undo", "redo", "delete_feature", "update_feature", "rebuild", "export",
@@ -271,7 +271,11 @@ class MechKernel:
                                     enum=["new_body", "add", "cut"]),
                 "name": FieldSchema(type="string", required=False),
                 "confirm_replace": FieldSchema(type="boolean", required=False, default=False),
-                "involute_teeth_threshold": FieldSchema(type="integer", required=False, default=30,
+                "helix_angle_deg": FieldSchema(type="number", required=False, default=0.0,
+                                                description="螺旋角（度）：0=直齿，正=右旋，|β|<45；真实变速器多用 15-25°"),
+                "helix_sections": FieldSchema(type="integer", required=False, default=4, min=2, max=16,
+                                              description="斜齿 loft 剖面数（越大螺旋越光滑、越慢）"),
+                "involute_teeth_threshold": FieldSchema(type="integer", required=False, default=400,
                                                         min=0, max=400,
                                                         description="齿数 > 此值自动用梯形近似；设大强制渐开线"),
                 "fallback_to_trapezoid": FieldSchema(type="boolean", required=False, default=True,
@@ -343,6 +347,21 @@ class MechKernel:
                                              description="'all' 或边引用列表（如 ['E12','E15']，来自 select element_type='edge'）"),
                         "name": FieldSchema(type="string", required=False),
                         "expected": FieldSchema(type="dict", required=False, description="v2.17 引用锚点（防重绑定）：{type, radius_mm, center, length_mm, tolerance_mm}，与当前几何指纹不符即报 TOPOLOGY_REFERENCE_REBOUND")},
+            "create_keyway": {"width": FieldSchema(type="number", required=True, min=0.001, description="键槽宽度 mm"),
+                              "depth": FieldSchema(type="number", required=True, min=0.001, description="径向切深 mm（从进入圆面起算）"),
+                              "length": FieldSchema(type="number", required=True, min=0.001, description="轴向长度 mm（沿零件主轴）"),
+                              "position": FieldSchema(type="tuple", required=False, default=[0, 0], items_type="number", length=2, description="进入面平面内的槽中心偏移"),
+                              "direction": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "x+", "x-", "y+", "y-"], description="从哪个方位的圆面切入（需垂直于零件主轴）"),
+                              "from_end": FieldSchema(type="boolean", required=False, default=True, description="True=槽从该轴端面起算"),
+                              "name": FieldSchema(type="string", required=False)},
+            "create_spline": {"teeth": FieldSchema(type="integer", required=True, min=6, max=200, description="花键齿数"),
+                              "module": FieldSchema(type="number", required=True, min=0.001, description="花键模数 mm"),
+                              "length": FieldSchema(type="number", required=True, min=0.001, description="花键段轴向长度 mm"),
+                              "major_diameter": FieldSchema(type="number", required=False, min=0.001, description="齿顶圆直径（缺省 m*(z+2)）"),
+                              "cut": FieldSchema(type="boolean", required=False, default=False, description="False=外花键(union)；True=内花键(subtract)"),
+                              "position": FieldSchema(type="tuple", required=False, default=[0, 0], items_type="number", length=2),
+                              "direction": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "x+", "x-", "y+", "y-"]),
+                              "name": FieldSchema(type="string", required=False)},
             "shell": {"thickness": FieldSchema(type="number", required=True, min=0.001),
                       "face_filter": FieldSchema(type="enum", required=False, default="top", enum=["top", "bottom", "z+", "z-", "x+", "x-", "y+", "y-"]),
                       "name": FieldSchema(type="string", required=False),
@@ -1110,8 +1129,9 @@ class MechKernel:
 
     def make_gear(self, module: float, teeth: int, width: float, bore: float = 0.0,
                   pressure_angle_deg: float = 20.0, mode: str = "new_body", name: str = "",
-                  confirm_replace: bool = False, involute_teeth_threshold: int = 30,
-                  fallback_to_trapezoid: bool = True) -> StepResult:
+                  confirm_replace: bool = False, involute_teeth_threshold: int = 400,
+                  fallback_to_trapezoid: bool = True, helix_angle_deg: float = 0.0,
+                  helix_sections: int = 4) -> StepResult:
         """v2.12: 直接生成齿轮坯（免草图）。
 
         在 XY 平面生成直齿圆柱齿轮 Part（分度圆中心在原点，沿 +Z 拉伸 width），
@@ -1153,6 +1173,8 @@ class MechKernel:
             gear = build_involute_gear(
                 module=module, teeth=teeth, width=width, bore=bore,
                 pressure_angle_deg=pressure_angle_deg,
+                helix_angle_deg=helix_angle_deg,
+                helix_sections=helix_sections,
                 fallback_to_trapezoid=fallback_to_trapezoid,
                 involute_teeth_threshold=involute_teeth_threshold,
             )
@@ -1183,6 +1205,7 @@ class MechKernel:
             ))
 
         profile = "trapezoid" if teeth > involute_teeth_threshold else "involute"
+        kind = "helical" if abs(helix_angle_deg) >= 1e-9 else "spur"
         with Transaction(self, "make_gear") as txn:
             entry = self._record_history(
                 "make_gear", module=module, teeth=teeth, width=width, bore=bore,
@@ -1190,6 +1213,7 @@ class MechKernel:
                 confirm_replace=confirm_replace,
                 involute_teeth_threshold=involute_teeth_threshold,
                 fallback_to_trapezoid=fallback_to_trapezoid,
+                helix_angle_deg=helix_angle_deg, helix_sections=helix_sections,
             )
             feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
@@ -1209,8 +1233,10 @@ class MechKernel:
                 )
             else:  # cut
                 self._current_geometry = self._current_geometry - gear
+            helix_note = (f" 螺旋角 {helix_angle_deg}°({kind})"
+                          if kind == "helical" else "")
             self.narrative.append(
-                f"生成齿轮 m={module} z={teeth} b={width}（{profile} 齿形）→ {feature.name}"
+                f"生成齿轮 m={module} z={teeth} b={width}（{profile} 齿形{helix_note}）→ {feature.name}"
             )
             txn.commit()
             self._feature_geometries[feature_id] = self._current_geometry
@@ -1981,6 +2007,243 @@ class MechKernel:
             step_index=self._step_counter,
         ))
     
+    def create_keyway(self, width: float, depth: float, length: float,
+                      position: tuple = (0, 0), direction: str = "top",
+                      from_end: bool = True, name: str = "") -> StepResult:
+        """v2.18: 轴键槽（GB/T 1096 A 型平行键槽）。
+
+        在轴/毂类圆柱面上切标准键槽：宽 width、径向深 depth、轴向长 length。
+        比"草图+旋转切除"可靠，且尺寸可实测复检。
+
+        Args:
+            width: 键槽宽度（mm）
+            depth: 径向切深（mm，从进入的外圆面起算）
+            length: 轴向长度（mm，沿零件主轴）
+            position: 进入面平面内的槽中心偏移（2 个数，可选）
+            direction: 从哪个方位的外圆面切入 "top"/"bottom"/"x+"/"x-"/"y+"/"y-"
+            from_end: True=槽从该轴端面起算（轴端键）；False=居中
+            name: 特征名
+        """
+        start = time.time()
+        if self._current_geometry is None:
+            raise InvalidRequestError("create_keyway 需要先有几何（先 extrude/make_gear 出轴）")
+        require_positive("width", width)
+        require_positive("depth", depth)
+        require_positive("length", length)
+
+        from build123d import Plane as B3DPlane, Solid as B3DSolid
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+
+        shape = self._current_geometry.wrapped if hasattr(self._current_geometry, "wrapped") else self._current_geometry
+        exp = TopExp_Explorer(shape, TopAbs_SOLID)
+        bbox = Bnd_Box()
+        if exp.More():
+            BRepBndLib.Add_s(TopoDS.Solid_s(exp.Current()), bbox)
+        lo, hi = bbox.CornerMin(), bbox.CornerMax()
+        lot, hit = (lo.X(), lo.Y(), lo.Z()), (hi.X(), hi.Y(), hi.Z())
+        ext = (hit[0] - lot[0], hit[1] - lot[1], hit[2] - lot[2])
+
+        axis_map = {
+            "top": (0, 0, -1), "z+": (0, 0, -1), "+Z": (0, 0, -1),
+            "bottom": (0, 0, 1), "z-": (0, 0, 1), "-Z": (0, 0, 1),
+            "x+": (-1, 0, 0), "+X": (-1, 0, 0),
+            "x-": (1, 0, 0), "-X": (1, 0, 0),
+            "y+": (0, -1, 0), "+Y": (0, -1, 0),
+            "y-": (0, 1, 0), "-Y": (0, 1, 0),
+        }
+        if direction not in axis_map:
+            raise InvalidRequestError(
+                f"direction '{direction}' 不支持。可选 top/bottom/x+/x-/y+/y-")
+        drill = axis_map[direction]
+        axis_idx = int(max(range(3), key=lambda i: ext[i]))
+        if abs(drill[axis_idx]) > 0.5:
+            raise InvalidRequestError(
+                f"direction {direction} 与零件主轴（第 {axis_idx} 轴）同向；"
+                "键槽需沿轴身切入，请改用垂直于轴的方位（如轴沿 Z 时用 x+/x-/y+）")
+
+        margin = 1.0
+        if direction in ("top", "z+", "+Z"):
+            anchor = (position[0], position[1], hit[2])
+        elif direction in ("bottom", "z-", "-Z"):
+            anchor = (position[0], position[1], lot[2])
+        elif direction in ("x+", "+X"):
+            anchor = (hit[0], position[0], position[1])
+        elif direction in ("x-", "-X"):
+            anchor = (lot[0], position[0], position[1])
+        elif direction in ("y+", "+Y"):
+            anchor = (position[0], hit[1], position[1])
+        else:
+            anchor = (position[0], lot[1], position[1])
+
+        if from_end:
+            center_axis = lot[axis_idx] + length / 2.0
+        else:
+            center_axis = (lot[axis_idx] + hit[axis_idx]) / 2.0
+
+        # 轴对齐长方体，避免 plane 旋转的局部轴歧义：
+        # 主轴方向 = length；钻孔方向跨 [进入面-depth, 进入面+margin]（margin 在外侧空气中，
+        # 保证切深恰为 depth）；第三方向 = width。
+        half = [0.0, 0.0, 0.0]
+        half[axis_idx] = length / 2.0
+        drill_idx = int(max(range(3), key=lambda i: abs(drill[i])))
+        half[drill_idx] = (depth + margin) / 2.0
+        third = [i for i in range(3) if i not in (axis_idx, drill_idx)][0]
+        half[third] = width / 2.0
+        size = [2 * v for v in half]
+        center = [0.0, 0.0, 0.0]
+        center[axis_idx] = center_axis
+        # 外侧留 margin、内侧正好 depth
+        center[drill_idx] = anchor[drill_idx] + drill[drill_idx] * (depth - margin) / 2.0
+        center[third] = anchor[third]
+        from build123d import Solid as _S
+        cutter = _S.make_box(size[0], size[1], size[2])
+        cbb = cutter.bounding_box()
+        _c0, _c1 = cbb.min.to_tuple(), cbb.max.to_tuple()
+        delta = [center[i] - (_c0[i] + _c1[i]) / 2.0 for i in range(3)]
+        cutter = cutter.translate(tuple(delta))
+
+        with Transaction(self, "create_keyway") as txn:
+            entry = self._record_history(
+                "create_keyway", width=width, depth=depth, length=length,
+                position=list(position), direction=direction, from_end=from_end, name=name,
+            )
+            feature_id = self._ids.next_feature_id()
+            entry["feature_id"] = feature_id
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.HOLE,
+                parameters={"width": width, "depth": depth, "length": length,
+                            "position": list(position), "direction": direction,
+                            "from_end": from_end, "name": name},
+                name=name or f"keyway_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            self._current_geometry = self._current_geometry - cutter
+            self._feature_geometries[feature_id] = self._current_geometry
+            self.narrative.append(
+                f"键槽 宽{width} 深{depth} 长{length} @ {direction}（沿第 {axis_idx} 轴）")
+            txn.commit()
+
+        self._bump_geometry_revision()
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"create_keyway w={width} d={depth} L={length}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+
+    def create_spline(self, teeth: int, module: float, length: float,
+                      major_diameter: float = None,
+                      cut: bool = False,
+                      position: tuple = (0, 0), direction: str = "top",
+                      name: str = "") -> StepResult:
+        """v2.18: 花键（真渐开线）—— 轴端生成花键齿（外部）或内花键（孔内）。
+
+        变速器轴常用花键传扭。复用真渐开线齿轮生成器：以 module/teeth 生成
+        齿坯，union 到轴端（外部花键）或 subtract 出内花键槽。
+
+        Args:
+            teeth: 花键齿数
+            module: 花键模数（mm）
+            length: 花键段轴向长度（mm）
+            major_diameter: 齿顶圆直径（缺省 = m*(z+2)）
+            cut: False=外部花键（union）；True=内花键（subtract）
+            position: 进入面平面内偏移（2 个数）
+            direction: 从哪个方位端面进入 "top"/"bottom"/"x+"/"x-"/"y+"/"y-"
+            name: 特征名
+        """
+        start = time.time()
+        if self._current_geometry is None:
+            raise InvalidRequestError("create_spline 需要先有几何（先建出轴坯）")
+        if not isinstance(teeth, int) or isinstance(teeth, bool) or teeth < 6:
+            raise InvalidRequestError(f"teeth 必须是 >= 6 的整数（当前 {teeth!r}）")
+        require_positive("module", module)
+        require_positive("length", length)
+
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+        from build123d import Axis as B3DAxis
+
+        from .gear import build_involute_gear
+        spline = build_involute_gear(module=module, teeth=teeth, width=length, bore=0.0)
+        if major_diameter is not None:
+            require_positive("major_diameter", major_diameter)
+            base_od = module * (teeth + 2)
+            scale = major_diameter / base_od
+            if abs(scale - 1.0) > 1e-6:
+                spline = spline.scale(scale)
+
+        shape = self._current_geometry.wrapped if hasattr(self._current_geometry, "wrapped") else self._current_geometry
+        exp = TopExp_Explorer(shape, TopAbs_SOLID)
+        bbox = Bnd_Box()
+        if exp.More():
+            BRepBndLib.Add_s(TopoDS.Solid_s(exp.Current()), bbox)
+        _lo, _hi = bbox.CornerMin(), bbox.CornerMax()
+        lot, hit = (_lo.X(), _lo.Y(), _lo.Z()), (_hi.X(), _hi.Y(), _hi.Z())
+
+        axis_idx = int(max(range(3), key=lambda i: (hit[i] - lot[i])))
+        # build_involute_gear 沿 Z 生成；旋转到主轴
+        if axis_idx == 0:
+            spline = spline.rotate(B3DAxis.Y, 90)
+        elif axis_idx == 1:
+            spline = spline.rotate(B3DAxis.X, -90)
+        cbb = spline.bounding_box()
+        cmin, cmax = cbb.min.to_tuple(), cbb.max.to_tuple()
+        # 花键段：一半嵌入端面以融合
+        center = hit[axis_idx] + length / 2.0 - module * 0.5
+        delta = [0.0, 0.0, 0.0]
+        delta[axis_idx] = center - (cmin[axis_idx] + cmax[axis_idx]) / 2.0
+        plane_axes = [i for i in range(3) if i != axis_idx]
+        delta[plane_axes[0]] += position[0]
+        delta[plane_axes[1]] += position[1]
+        spline = spline.translate(tuple(delta))
+
+        with Transaction(self, "create_spline") as txn:
+            entry = self._record_history(
+                "create_spline", teeth=teeth, module=module, length=length,
+                major_diameter=major_diameter, cut=cut,
+                position=list(position), direction=direction, name=name,
+            )
+            feature_id = self._ids.next_feature_id()
+            entry["feature_id"] = feature_id
+            feature = FeatureNode(
+                id=feature_id, type=FeatureType.GEAR,
+                parameters={"teeth": teeth, "module": module, "length": length,
+                            "major_diameter": major_diameter, "cut": cut, "name": name},
+                name=name or f"spline_{feature_id}",
+                state=FeatureState.COMPUTED,
+            )
+            self.feature_graph.add(feature)
+            if cut:
+                self._current_geometry = self._current_geometry - spline
+            else:
+                self._current_geometry = self._current_geometry + spline
+            self._feature_geometries[feature_id] = self._current_geometry
+            self.narrative.append(
+                f"{'内' if cut else '外'}花键 z={teeth} m={module} 长{length}（沿第 {axis_idx} 轴）")
+            txn.commit()
+
+        self._bump_geometry_revision()
+        self._step_counter += 1
+        return self._wrap_step_result(make_success(
+            feature_id=feature_id,
+            narrative=f"create_spline z={teeth} m={module} L={length} cut={cut}",
+            current_narrative=self.narrative.copy(),
+            feature_graph_delta={"added": [feature_id]},
+            elapsed_ms=(time.time() - start) * 1000,
+            step_index=self._step_counter,
+        ))
+
     def shell(self, thickness: float, face_filter: str = "top", name: str = "", face_refs: list = None,
               expected: dict = None) -> StepResult:
         """

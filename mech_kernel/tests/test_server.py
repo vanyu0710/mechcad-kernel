@@ -121,7 +121,7 @@ def test_missing_required_payload_field():
 
 def test_capabilities_public_and_experimental():
     data = expect_ok(make_server(), "capabilities")
-    assert data["public_count"] == 34  # v2.12: + make_gear
+    assert data["public_count"] == 36  # v2.18: + create_keyway / create_spline
     names = [c["name"] for c in data["public"]]
     for expected in ("create_workplane", "extrude", "hole", "select", "undo", "set_parameter"):
         assert expected in names

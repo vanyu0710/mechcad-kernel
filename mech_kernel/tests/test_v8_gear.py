@@ -180,9 +180,9 @@ def test_gear_geometry_in_standard():
 def test_involute_gear_volume_smaller_than_trapezoid():
     """v2.10: 真 involute 齿形比梯形 proxy 体积小 (齿形曲线更"瘦")"""
     from build123d import Part
-    g_real = build_involute_gear(module=2.0, teeth=20, width=18, n_points_flank=25)
-    g_trap = build_involute_gear(module=2.0, teeth=20, width=18, n_points_flank=25,
-                                 fallback_to_trapezoid=True)
+    g_real = build_involute_gear(module=2.0, teeth=20, width=18)
+    g_trap = build_involute_gear(module=2.0, teeth=20, width=18,
+                                 involute_teeth_threshold=1, fallback_to_trapezoid=True)
     # 强制梯形: 通过传很小 flank points 让真 involute 退化, 实际梯形 20900
     # 这里只比 g_real 跟纯梯形: g_real 应 < 纯梯形
     # 跑 import 时 fallback 是 True, 实际测的 g_real 是真 involute
