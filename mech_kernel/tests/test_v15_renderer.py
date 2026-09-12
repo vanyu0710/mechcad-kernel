@@ -205,3 +205,33 @@ def test_hidden_edges_do_not_bleed_through_front_plate():
     # hidden geometry box — that box is gone. A per-fragment depth pass
     # (review requirements 4-5, future face/edge channel) would erase the seam.
     assert diff < 400, f"hidden cube bleeds through plate: {diff} px differ"
+
+
+def test_hidden_line_elimination_scales_to_assembly_sizes():
+    """v2.16.2 性能回归：8 件变速箱规模的边×三角形不得再退化成分钟级。
+
+    旧实现对每条边逐三角形做 Python 级裁剪；7.3k 边 × 10k 面实测 185s，
+    超过 worker 120s 超时导致装配导出失败。宽相位网格 + 向量化后应秒级。
+    """
+    import time
+
+    import numpy as np
+
+    r = Renderer()
+    rng = np.random.default_rng(7)
+    n_tris = 9000
+    # 面向 -Z 相机的密集三角形网格（相机在 +Z 方向）
+    base = rng.uniform(-50, 50, size=(n_tris, 2))
+    tris = np.stack([base, base + rng.uniform(0.5, 2.0, size=(n_tris, 2)),
+                     base + rng.uniform(0.5, 2.0, size=(n_tris, 2))], axis=1)
+    z = rng.uniform(-5, 5, size=(n_tris, 3))
+    tris = np.concatenate([tris, z[:, :, None]], axis=2)
+    # 法向朝 +Z（面向相机）
+    segments = [((float(rng.uniform(-50, 50)), float(rng.uniform(-50, 50)), 0.0),
+                 (float(rng.uniform(-50, 50)), float(rng.uniform(-50, 50)), 0.0))
+                for _ in range(7000)]
+    t0 = time.time()
+    out = r._visible_edge_segments(segments, tris, (0.0, 0.0, 1.0))
+    dt = time.time() - t0
+    assert dt < 20.0, f"hidden-line elimination too slow: {dt:.1f}s for 7k segments"
+    assert isinstance(out, list)

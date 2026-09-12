@@ -873,6 +873,14 @@ class Renderer:
         on the far side of the triangle's plane. For a convex triangle that
         is one interval per segment: intersect the projected line-triangle
         interval with the behind-plane half-interval, merge, then subtract.
+
+        v2.16.2 performance: the naive form tested every segment against every
+        triangle in scalar Python — an 8-part gearbox (7.3k edges x 10k front
+        triangles) took 185s and blew the worker timeout. Two changes keep the
+        exact same occlusion semantics with ~100x fewer operations:
+        1) a 2D uniform grid over the projected front-facing triangles, so a
+           segment only tests triangles whose projected bbox it overlaps;
+        2) the interval clip is vectorised across that candidate subset.
         """
         try:
             import numpy as np
@@ -897,6 +905,46 @@ class Renderer:
         u /= np.linalg.norm(u)
         w = np.cross(v, u)
         tri2d = np.stack([tris @ u, tris @ w], axis=2)  # (n, 3, 2)
+        tri_min = tri2d.min(axis=1)  # (n, 2)
+        tri_max = tri2d.max(axis=1)
+
+        # ---- 2D uniform grid broad-phase -------------------------------------
+        lo2 = tri_min.min(axis=0)
+        hi2 = tri_max.max(axis=0)
+        span = np.maximum(hi2 - lo2, 1e-9)
+        cells = 48
+        cell = span / cells
+        # triangle index lists per cell (Python lists kept only during build)
+        cell_tris: dict[int, list[int]] = {}
+        for idx in range(len(tri2d)):
+            c0 = np.clip(((tri_min[idx] - lo2) / cell).astype(int), 0, cells - 1)
+            c1 = np.clip(((tri_max[idx] - lo2) / cell).astype(int), 0, cells - 1)
+            for gx in range(int(c0[0]), int(c1[0]) + 1):
+                base = gx * cells
+                for gy in range(int(c0[1]), int(c1[1]) + 1):
+                    cell_tris.setdefault(base + gy, []).append(idx)
+        cell_arrays = {k: np.asarray(val, dtype=int) for k, val in cell_tris.items()}
+        grid_cache: dict[tuple[int, int, int, int], "np.ndarray"] = {}
+
+        def _candidates_for(bmin, bmax):
+            c0 = np.clip(((bmin - lo2) / cell).astype(int), 0, cells - 1)
+            c1 = np.clip(((bmax - lo2) / cell).astype(int), 0, cells - 1)
+            key = (int(c0[0]), int(c1[0]), int(c0[1]), int(c1[1]))
+            cached = grid_cache.get(key)
+            if cached is not None:
+                return cached
+            chunks = []
+            for gx in range(key[0], key[1] + 1):
+                base = gx * cells
+                for gy in range(key[2], key[3] + 1):
+                    arr = cell_arrays.get(base + gy)
+                    if arr is not None:
+                        chunks.append(arr)
+            out = np.unique(np.concatenate(chunks)) if chunks else np.empty(0, dtype=int)
+            if len(grid_cache) < 200000:
+                grid_cache[key] = out
+            return out
+
         visible: List[Tuple[tuple, tuple]] = []
         for pa, pb in segments:
             try:
@@ -909,59 +957,84 @@ class Renderer:
             if dlen < 1e-9:
                 continue
             tol = max(1e-6, dlen * 1e-6)
-            d_a = ((a - tris[:, 0]) * normals).sum(axis=1)
-            d_b = ((b - tris[:, 0]) * normals).sum(axis=1)
+            a2 = np.array((float(a @ u), float(a @ w)))
+            b2 = np.array((float(b @ u), float(b @ w)))
+            seg_min = np.minimum(a2, b2)
+            seg_max = np.maximum(a2, b2)
+            cand = _candidates_for(seg_min, seg_max)
+            if cand.size == 0:
+                visible.append((tuple(a), tuple(b)))
+                continue
+            c_min = tri_min[cand]
+            c_max = tri_max[cand]
+            # exact 2D bbox reject inside the coarse grid cells
+            overlap = np.nonzero(
+                (c_min[:, 0] <= seg_max[0] + 1e-9) & (c_max[:, 0] >= seg_min[0] - 1e-9)
+                & (c_min[:, 1] <= seg_max[1] + 1e-9) & (c_max[:, 1] >= seg_min[1] - 1e-9)
+            )[0] if cand.size else np.empty(0, dtype=int)
+            if overlap.size == 0:
+                visible.append((tuple(a), tuple(b)))
+                continue
+            cand = cand[overlap]
+            c_tris = tris[cand]
+            c_norm = normals[cand]
+            c_tri2d = tri2d[cand]
+            d_a = ((a - c_tris[:, 0]) * c_norm).sum(axis=1)
+            d_b = ((b - c_tris[:, 0]) * c_norm).sum(axis=1)
             hits = np.nonzero(np.minimum(d_a, d_b) < -tol)[0]
             if hits.size == 0:
                 visible.append((tuple(a), tuple(b)))
                 continue
-            a2 = np.array((float(a @ u), float(a @ w)))
-            b2 = np.array((float(b @ u), float(b @ w)))
-            hidden: List[List[float]] = []
-            for i in hits:
-                # clip [0,1] against the triangle's projected half-planes
-                lo, hi = 0.0, 1.0
-                inside = True
-                p0, p1, p2 = tri2d[i]
-                for e0, e1, ref in ((p0, p1, p2), (p1, p2, p0), (p2, p0, p1)):
-                    exx, eyy = float(e1[0] - e0[0]), float(e1[1] - e0[1])
-                    s_ref = exx * (float(ref[1]) - float(e0[1])) - eyy * (float(ref[0]) - float(e0[0]))
-                    if abs(s_ref) < 1e-12:
-                        continue  # degenerate projected edge
-                    fa = (exx * (float(a2[1]) - float(e0[1])) - eyy * (float(a2[0]) - float(e0[0]))) * s_ref
-                    fb = (exx * (float(b2[1]) - float(e0[1])) - eyy * (float(b2[0]) - float(e0[0]))) * s_ref
-                    if fa >= 0.0 and fb >= 0.0:
-                        continue
-                    if fa < 0.0 and fb < 0.0:
-                        inside = False
-                        break
-                    t_cross = fa / (fa - fb)
-                    if fa < 0.0:
-                        lo = max(lo, t_cross)
-                    else:
-                        hi = min(hi, t_cross)
-                    if lo >= hi:
-                        inside = False
-                        break
-                if not inside or hi <= lo + 1e-9:
+            # ---- vectorised interval clip over all hits ----------------------
+            p0 = c_tri2d[hits, 0]
+            p1 = c_tri2d[hits, 1]
+            p2 = c_tri2d[hits, 2]
+            lo = np.zeros(hits.size)
+            hi = np.ones(hits.size)
+            alive = np.ones(hits.size, dtype=bool)
+            for e0, e1, ref in ((p0, p1, p2), (p1, p2, p0), (p2, p0, p1)):
+                exx = e1[:, 0] - e0[:, 0]
+                eyy = e1[:, 1] - e0[:, 1]
+                s_ref = exx * (ref[:, 1] - e0[:, 1]) - eyy * (ref[:, 0] - e0[:, 0])
+                use = alive & (np.abs(s_ref) >= 1e-12)
+                if not np.any(use):
                     continue
-                da_i, db_i = float(d_a[i]), float(d_b[i])
-                if da_i < -tol and db_i < -tol:
-                    blo, bhi = lo, hi  # whole segment behind this plane
-                else:
-                    t_star = da_i / (da_i - db_i)
-                    if da_i >= -tol:
-                        blo, bhi = max(lo, t_star), hi  # enters behind at t*
-                    else:
-                        blo, bhi = lo, min(hi, t_star)  # leaves behind at t*
-                if bhi > blo + 1e-9:
-                    hidden.append([blo, bhi])
-            if not hidden:
+                fa = (exx * (a2[1] - e0[:, 1]) - eyy * (a2[0] - e0[:, 0])) * s_ref
+                fb = (exx * (b2[1] - e0[:, 1]) - eyy * (b2[0] - e0[:, 0])) * s_ref
+                both_ok = use & (fa >= 0.0) & (fb >= 0.0)
+                both_bad = use & (fa < 0.0) & (fb < 0.0)
+                cross = use & ~both_ok & ~both_bad
+                if np.any(cross):
+                    t_cross = fa / np.where(np.abs(fa - fb) > 1e-300, fa - fb, 1.0)
+                    lowers = cross & (fa < 0.0)
+                    uppers = cross & ~lowers
+                    np.maximum(lo, np.where(lowers, t_cross, -np.inf), out=lo)
+                    np.minimum(hi, np.where(uppers, t_cross, np.inf), out=hi)
+                alive = alive & ~both_bad
+                alive = alive & (lo < hi)
+            keep = alive & (hi > lo + 1e-9)
+            if not np.any(keep):
                 visible.append((tuple(a), tuple(b)))
                 continue
-            hidden.sort()
+            da_k = d_a[hits][keep]
+            db_k = d_b[hits][keep]
+            lo_k = lo[keep]
+            hi_k = hi[keep]
+            whole = (da_k < -tol) & (db_k < -tol)
+            t_star = da_k / np.where(np.abs(da_k - db_k) > 1e-300, da_k - db_k, 1.0)
+            enters = (~whole) & (da_k >= -tol)
+            leaves = (~whole) & ~(da_k >= -tol)
+            blo = np.where(whole, lo_k, np.where(enters, np.maximum(lo_k, t_star), lo_k))
+            bhi = np.where(whole, hi_k, np.where(enters, hi_k, np.minimum(hi_k, t_star)))
+            mask = bhi > blo + 1e-9
+            if not np.any(mask):
+                visible.append((tuple(a), tuple(b)))
+                continue
+            intervals = np.stack([blo[mask], bhi[mask]], axis=1)
+            order = np.argsort(intervals[:, 0])
+            intervals = intervals[order]
             merged: List[List[float]] = []
-            for h0, h1 in hidden:
+            for h0, h1 in intervals.tolist():
                 if merged and h0 <= merged[-1][1] + 1e-9:
                     merged[-1][1] = max(merged[-1][1], h1)
                 else:
