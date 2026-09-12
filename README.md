@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.11](https://img.shields.io/badge/version-v2.17-blue)]()
+[![v2.11](https://img.shields.io/badge/version-v2.17.2-blue)]()
 
 ## 概述
 
@@ -395,6 +395,7 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.15** | **2026-09-11** | **渲染净化: OCP 角向细分+焊接水密网格, show_edges 只画特征边(二面角>30°), crease-aware 平滑法线, ribbon 边深度排序; 另修坏系统字体阻断 build123d 导入(fontTools 惰性校验过滤)** | **402** | **34+10** |
 | **+ v2.16** | **2026-09-11** | **run_script 失败策略：默认 abort（op 失败即回滚+SCRIPT_OP_FAILED+failed_op 结构），可选 best_effort（收集失败但绝不静默成功）；ScriptOpError 可被脚本 try/except** | **409** | **34+10** |
 | **+ v2.17** | **2026-09-12** | **引用锚点防重绑定(rebindings+expected) + query holes 孔语义 + hole 盲孔深度修复(进入面实测)；装配侧 active/superseded 与干涉分级由 aicad 消费** | **423** | **34+10** |
+| **+ v2.17.2** | **2026-09-12** | **渲染性能修复：隐藏线消除改宽相位 2D 网格 + 向量化裁剪（8 件变速箱四视图 328s→10.5s，31x）——此前真实 LLM 装配导出因 worker 120s 超时失败** | **424** | **34+10** |
 | **+ v2.16.1** | **2026-09-11** | **渲染审计 P1 修复：特征边携带双邻面法线，轮廓边（一前一后）不再被 bisector 误删（立方体斜视 6/9→9/9）；边可见性改 hidden-line elimination 区间裁剪（numpy 向量化），描边宽度不再充当深度偏移——薄板遮挡穿透 1375px→AA 缝 ~150px** | **411** | **34+10** |
 
 ## 安装
