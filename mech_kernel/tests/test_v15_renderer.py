@@ -181,7 +181,7 @@ def test_hidden_edges_do_not_bleed_through_front_plate():
 
     def style_of(shape):
         vs, fs = r._extract_mesh(shape)
-        return (vs, fs, r.body_color, False), r._analyze_group(vs, fs)
+        return (vs, fs, r.body_color, False, None), r._analyze_group(vs, fs)
 
     g_plate, s_plate = style_of(Box(0.05, 20, 20).translate((0.075, 0, 0)))
     g_cube, s_cube = style_of(Box(2, 10, 10).translate((-1, 0, 0)))

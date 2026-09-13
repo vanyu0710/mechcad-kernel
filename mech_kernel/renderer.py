@@ -193,7 +193,8 @@ class Renderer:
             vertices = [vertex for group in mesh_groups for vertex in group[0]]
             faces = []
             offset = 0
-            for group_vertices, group_faces, _, _ in mesh_groups:
+            for group in mesh_groups:
+                group_vertices, group_faces = group[0], group[1]
                 faces.extend([[index + offset for index in face] for face in group_faces])
                 offset += len(group_vertices)
         except Exception:
@@ -204,9 +205,9 @@ class Renderer:
         # group renders as a plain flat-shaded triangle soup.
         try:
             mesh_styles = [
-                self._analyze_group(group_vertices, group_faces)
-                if len(group_faces) <= self.STYLE_BUDGET else None
-                for group_vertices, group_faces, _, _ in mesh_groups
+                self._analyze_group(group[0], group[1])
+                if len(group[1]) <= self.STYLE_BUDGET else None
+                for group in mesh_groups
             ]
         except Exception:
             mesh_styles = [None] * len(mesh_groups)
@@ -303,7 +304,7 @@ class Renderer:
     def _extract_scene_meshes(self, geometry: Any, scene: Any, highlight: List[str]) -> list:
         if not scene:
             vertices, faces = self._extract_mesh(geometry)
-            return [(vertices, faces, self.body_color, False)]
+            return [(vertices, faces, self.body_color, False, None)]
         groups = []
         values = scene.values() if isinstance(scene, dict) else scene
         for item in values:
@@ -314,7 +315,17 @@ class Renderer:
             if item_geometry is None:
                 continue
             vertices, faces = self._extract_mesh(item_geometry)
-            groups.append((vertices, faces, tuple(get("color", self.body_color)), get("id") in highlight))
+            mat = get("material") or None
+            base = None
+            if mat is None:
+                try:
+                    from .materials import resolve_material, material_color
+                    mat = resolve_material(str(get("name") or get("id") or ""))
+                    base = material_color(mat)
+                except Exception:
+                    mat, base = None, None
+            color = tuple(get("color", base if base is not None else self.body_color))
+            groups.append((vertices, faces, color, get("id") in highlight, mat))
         # Keep an all-hidden assembly visually empty; falling back to the fused
         # solid would make instance visibility controls misleading.
         return groups
@@ -661,15 +672,16 @@ class Renderer:
             triangles = []
             triangle_colors = []
             feature_edges: List[Tuple[tuple, tuple, tuple]] = []
-            groups = mesh_groups or [(vertices, faces, self.body_color, False)]
+            groups = mesh_groups or [(vertices, faces, self.body_color, False, None)]
             styles = mesh_styles if mesh_styles is not None else [None] * len(groups)
-            for (group_vertices, group_faces, group_color, highlighted), style in zip(groups, styles):
+            for (group_vertices, group_faces, group_color, highlighted, material), style in zip(groups, styles):
                 color = tuple(min(1.0, float(channel) * (1.18 if highlighted else 1.0)) for channel in group_color)
                 if style is not None:
                     group_triangles = style["triangles"]
                     triangles.extend(group_triangles)
                     triangle_colors.extend(
-                        self._triangle_colors(group_triangles, color, normals=style["normals"], view_dir=view_dir)
+                        self._triangle_colors(group_triangles, color, normals=style["normals"],
+                                              view_dir=view_dir, material=material)
                     )
                     if effective_edges:
                         feature_edges.extend(style["edges"])
@@ -688,7 +700,8 @@ class Renderer:
                             except (IndexError, TypeError):
                                 continue
                     triangles.extend(group_triangles)
-                    triangle_colors.extend(self._triangle_colors(group_triangles, color, view_dir=view_dir))
+                    triangle_colors.extend(self._triangle_colors(group_triangles, color,
+                                                                   view_dir=view_dir, material=material))
 
             if not triangles:
                 plt.close(fig)
@@ -756,6 +769,7 @@ class Renderer:
         color: Optional[Tuple[float, float, float]] = None,
         normals: Optional[List[Tuple[float, float, float]]] = None,
         view_dir: Optional[Tuple[float, float, float]] = None,
+        material: Optional[str] = None,
     ) -> List[Tuple[float, float, float, float]]:
         """Apply stable light shading without relying on matplotlib's version-specific shade API.
 
@@ -765,10 +779,29 @@ class Renderer:
         through the shaft/bore annular gap, cylinder silhouettes) darken toward
         ambient instead of lighting up per-facet, so interiors read as uniform
         shadow rather than a dotted ring of bright facets.
+
+        v2.19 ``material``: when set, shading uses the material's
+        ambient/diffuse/specular/shininess (Blinn-Phong) instead of the plain
+        0.58+0.42*illumination factor, so cast-iron housings, steel gears and
+        bronze bearings read as different materials rather than tints.
         """
         light = (-0.45, -0.55, 0.70)
         light_len = math.sqrt(sum(value * value for value in light)) or 1.0
         light = tuple(value / light_len for value in light)
+        half = None
+        if view_dir is not None and material:
+            hx = light[0] + view_dir[0]
+            hy = light[1] + view_dir[1]
+            hz = light[2] + view_dir[2]
+            hlen = math.sqrt(hx * hx + hy * hy + hz * hz) or 1.0
+            half = (hx / hlen, hy / hlen, hz / hlen)
+        params = None
+        if material:
+            try:
+                from .materials import MATERIALS
+                params = MATERIALS.get(material)
+            except Exception:
+                params = None
         colors = []
         body_color = color or self.body_color
         for position, tri in enumerate(triangles):
@@ -780,6 +813,24 @@ class Renderer:
                     nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
                     normal_len = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
                     normal = (nx / normal_len, ny / normal_len, nz / normal_len)
+                if params is not None:
+                    # Blinn-Phong; use |N·L| so double-sided interiors still lit.
+                    ndl = abs(normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2])
+                    facing = 1.0
+                    spec = 0.0
+                    if view_dir is not None:
+                        facing = abs(normal[0] * view_dir[0] + normal[1] * view_dir[1]
+                                     + normal[2] * view_dir[2])
+                    if half is not None:
+                        ndh = abs(normal[0] * half[0] + normal[1] * half[1] + normal[2] * half[2])
+                        spec = params[3] * (ndh ** params[4])
+                    limb = 0.55 + 0.45 * facing
+                    scale = params[1] + params[2] * ndl * limb
+                    base = params[0] if color is None else body_color
+                    colors.append(tuple(
+                        min(1.0, max(0.0, base[i] * scale + spec)) for i in range(3)
+                    ) + (1.0,))
+                    continue
                 illumination = abs(normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2])
                 factor = 0.58 + 0.42 * illumination
                 if view_dir is not None:
