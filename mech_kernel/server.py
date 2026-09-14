@@ -170,6 +170,25 @@ class KernelServer:
                 failure_policy=str(payload.get("failure_policy") or "abort"))
             return _step_to_dict(result, include_render=bool(payload.get("include_render", True)))
 
+        # ---- v2.20 壳体设计分析/审计（无状态）----
+        if cmd in ("housing_brief", "audit_housing"):
+            from mech_kernel.housing_design import (
+                audit_housing as _audit, internals_design_brief as _brief,
+            )
+
+            parts = self._require(payload, "parts")
+            if cmd == "housing_brief":
+                return _brief(
+                    [p for p in parts if isinstance(p, dict)
+                     and not any(k in str(p.get("name") or "") for k in ("壳体", "箱体", "端盖", "盖"))],
+                    min_clearance=float(payload.get("min_clearance", 5.0)),
+                )
+            return _audit(
+                parts,
+                brief=payload.get("brief"),
+                design=payload.get("design"),
+            )
+
         # ---- v2.14 装配场景命令（F2a）：无状态计算，不读写 kernel 实例 ----
         if cmd in ("export_assembly", "assembly_interference", "render_assembly"):
             # 绝对导入：server.py 以脚本方式启动（python mech_kernel/server.py），
