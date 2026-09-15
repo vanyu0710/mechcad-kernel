@@ -145,3 +145,16 @@ def test_empty_mesh_list_returns_background():
     r = SoftwareRenderer(width=120, height=90, ssaa=1)
     png = r.render([])
     assert _png_ok(png)
+
+
+def test_ui_material_table_matches_materials():
+    """v2.21: UI 镜像表必须与 MATERIALS 基色一致（上层按此复刻，防漂移）。"""
+    from mech_kernel.materials import MATERIALS, UI_MATERIAL_KEYS, ui_material_table
+
+    assert set(UI_MATERIAL_KEYS) == set(MATERIALS.keys())
+    table = ui_material_table()
+    assert set(table.keys()) == set(MATERIALS.keys())
+    for key, rgb in table.items():
+        assert rgb == tuple(float(c) for c in MATERIALS[key][0]), key
+        assert len(rgb) == 3
+        assert all(0.0 <= c <= 1.0 for c in rgb)

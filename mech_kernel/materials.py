@@ -60,3 +60,14 @@ def material_color(name: str) -> Tuple[float, float, float]:
 
 def material_edge(name: str):
     return MATERIALS.get(name, MATERIALS["steel"])[5]
+
+
+# v2.21: 供上层（aicad）镜像与一致性测试比对的稳定键集。
+# 表结构保持不变；上层不得 import 本模块（内核依赖 OCC/build123d），
+# 只按路径读取此列表与其基色，防止两处材质表漂移。
+UI_MATERIAL_KEYS = tuple(sorted(MATERIALS.keys()))
+
+
+def ui_material_table() -> Dict[str, Tuple[float, float, float]]:
+    """材质键 → 基色（0..1），给上层 UI 复刻用。"""
+    return {key: tuple(MATERIALS[key][0]) for key in UI_MATERIAL_KEYS}
