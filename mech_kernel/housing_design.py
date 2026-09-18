@@ -291,12 +291,14 @@ def audit_housing(parts: List[Dict[str, Any]], brief: Optional[Dict[str, Any]] =
     cases = [(n, p) for n, p in housing]
     for hn, hp in cases:
         cyls = _cylinders(hp)
-        # 以 (轴向, 轴心平面位置) 聚类
+        # 以 (圆柱自身轴向, 轴心在垂直平面上的位置) 聚类——不能按零件主轴：
+        # 底板式箱体（宽>>高）上竖直的孔+凸台配对会被零件主轴=X 拆散。
         groups: Dict[Any, List[Dict[str, Any]]] = {}
         for c2 in cyls:
-            ax = _axis_index(hp)
+            d = c2["dir"]
+            ax = max(range(3), key=lambda i: abs(d[i]))
             plane = [i for i in range(3) if i != ax]
-            key = (round(c2["origin"][plane[0]] / 3.0), round(c2["origin"][plane[1]] / 3.0))
+            key = (ax, round(c2["origin"][plane[0]] / 3.0), round(c2["origin"][plane[1]] / 3.0))
             groups.setdefault(key, []).append(c2)
         for key, items in groups.items():
             rs = sorted({round(i["radius"], 2) for i in items})

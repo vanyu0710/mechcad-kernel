@@ -36,6 +36,35 @@ def _classify(classifier, x: float, y: float, z: float) -> str:
     return "on"
 
 
+def _is_hole_side_face(face, classifier, axis_loc, axis_dir) -> bool:
+    """面是凹的孔型面：法向指向自身轴线（dot<0）且法向侧为空腔、反侧为材料。
+    凸面（如轴承座外圆）法向背离轴线 → False。"""
+    try:
+        from build123d import Face as BFace
+        bf = BFace(face)
+        c = bf.center()
+        n = bf.normal_at()
+        p = (float(c.X), float(c.Y), float(c.Z))
+        nn = (float(n.X), float(n.Y), float(n.Z))
+        nl = sum(v * v for v in nn) ** 0.5 or 1.0
+        nn = tuple(v / nl for v in nn)
+        v0 = (p[0] - axis_loc[0], p[1] - axis_loc[1], p[2] - axis_loc[2])
+        t_along = dot(v0, axis_dir)
+        radial = (v0[0] - t_along * axis_dir[0], v0[1] - t_along * axis_dir[1],
+                  v0[2] - t_along * axis_dir[2])
+        rlen = sum(v * v for v in radial) ** 0.5
+        if rlen < 1e-9:
+            return False
+        radial = tuple(v / rlen for v in radial)
+        if dot(nn, radial) > -0.5:
+            return False
+        eps = 0.05
+        return (_classify(classifier, *(tuple(p[i] + nn[i] * eps for i in range(3)))) == "out"
+                and _classify(classifier, *(tuple(p[i] - nn[i] * eps for i in range(3)))) == "in")
+    except Exception:
+        return False
+
+
 def _face_points(face) -> List[Tuple[float, float, float]]:
     """面顶点（无顶点时退化为面的 bbox 角点投影近似）。"""
     from OCP.TopExp import TopExp_Explorer
@@ -147,12 +176,21 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                     through = _classify(classifier, *e1) == "out" and _classify(classifier, *e2) == "out"
                     entry = (loc.X() + ax[0] * z1, loc.Y() + ax[1] * z1, loc.Z() + ax[2] * z1)
                     kind = "through_hole" if through else "blind_hole"
-                    # 沉孔/锪孔：同轴大半径圆柱 / 锥面
+                    # 沉孔/锪孔：同轴大半径圆柱 / 锥面——且该面本身必须是凹的孔型面。
+                    # 凸的 coaxial 外圆（如轴承座外圆）不是沉孔台阶，否则通孔会被误判。
                     for other_face, other_cyl in cyl_faces:
                         if other_face is face:
                             continue
                         o_axis = other_cyl.Axis()
                         if abs(float(other_cyl.Radius()) - radius) <= 0.05:
+                            continue
+                        if not _is_hole_side_face(other_face, classifier,
+                                                  (float(o_axis.Location().X()),
+                                                   float(o_axis.Location().Y()),
+                                                   float(o_axis.Location().Z())),
+                                                  (float(o_axis.Direction().X()),
+                                                   float(o_axis.Direction().Y()),
+                                                   float(o_axis.Direction().Z()))):
                             continue
                         if _coaxial(axis, o_axis):
                             kind = "counterbore_hole"
@@ -164,8 +202,15 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                             if not kface.IsNull():
                                 kad = BRepAdaptor_Surface(kface)
                                 if kad.GetType() == GeomAbs_Cone and _coaxial(axis, kad.Cone().Axis()):
-                                    kind = "countersink_hole"
-                                    break
+                                    cax = kad.Cone().Axis()
+                                    if _is_hole_side_face(
+                                            kface, classifier,
+                                            (float(cax.Location().X()), float(cax.Location().Y()),
+                                             float(cax.Location().Z())),
+                                            (float(cax.Direction().X()), float(cax.Direction().Y()),
+                                             float(cax.Direction().Z()))):
+                                        kind = "countersink_hole"
+                                        break
                             kexp.Next()
                     holes.append({
                         "diameter_mm": round(2 * radius, 3),

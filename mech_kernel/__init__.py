@@ -22,7 +22,7 @@ from .errors import (
     make_geometry_failure, make_recoverable, GeometryFailureReason
 )
 
-__version__ = "2.6.0"
+__version__ = "2.21.1"
 __all__ = [
     "MechKernel",
     "StepResult", "GeometrySummary", "make_success", "make_failure",

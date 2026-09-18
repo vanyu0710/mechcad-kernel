@@ -74,6 +74,25 @@ def test_counterbore_detected():
     assert diameters == [6.0, 10.0]
 
 
+def test_coaxial_convex_boss_is_not_a_counterbore():
+    """v2.21.1 回归：同轴"凸"外圆（凸台外圆）不得把通孔误判成沉孔。
+
+    旧逻辑只要存在同轴异径圆柱就判 counterbore_hole——凸台外圆是凸面，
+    法向背离轴线，不构成沉孔台阶。凸台必须建在板顶面之上（offset workplane），
+    否则拉伸落在板内部、并集体积为 0，用例会空转。"""
+    k = MechKernel()
+    _plate(k)
+    k.create_workplane("top", "XY", offset=10)
+    k.new_sketch("top", "boss")
+    k.add_circle("boss", (0, 0), 7)  # Ø14 凸台，与孔同轴且不同径
+    k.close_sketch("boss")
+    k.extrude("boss", 6, mode="add")
+    k.hole(position=(0, 0), diameter=6)
+    holes = _holes(k)
+    assert [h["kind"] for h in holes] == ["through_hole"], holes
+    assert abs(holes[0]["diameter_mm"] - 6.0) < 0.01
+
+
 def test_counterbore_depths_correct():
     k = MechKernel()
     _plate(k)

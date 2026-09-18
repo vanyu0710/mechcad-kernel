@@ -60,3 +60,8 @@ input_shaft.step
 part_01_gear_pinion.step
 work_*.png
 work_*.py
+
+# 本地试跑产物（根目录散件：STEP/PNG/probe_*；可复现，不入库）
+/*.step
+/*.png
+probe_*
