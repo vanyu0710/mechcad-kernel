@@ -453,6 +453,17 @@ vision = OpenAICompatibleVisionLLM()
 
 ## 跑测试
 
+推荐用仓库自带的 `.venv`（内含 pytest）：
+
+```bash
+.venv/Scripts/python.exe -m pytest mech_kernel/tests -q      # Windows
+# 或
+.venv/bin/python -m pytest mech_kernel/tests -q              # Linux/macOS
+```
+
+没有 pytest 的环境可用内置兼容 shim，但它**不实现 pytest 夹具**（`tmp_path` 等），
+需要夹具的用例会报错——只作应急路径：
+
 ```bash
 PYTHONPATH=. python3 -c "
 import sys
