@@ -211,6 +211,124 @@ def test_snapshot_restore():
     assert approx(float(vol["value"]), EXPECTED_VOLUME)
 
 
+def test_select_topology_at_point_returns_brep_semantics():
+    server = make_server()
+    run_cylinder(server)
+    data = expect_ok(server, "select_topology_at_point", {
+        "point": [0, 50, 5],
+        "direction": [0, 1, 0],
+        "tolerance_mm": 0.2,
+    })
+    selection = data["selection"]
+    assert data["matched"] is True
+    assert selection["source"] == "brep"
+    assert selection["topology"]["type"] == "face"
+    assert selection["topology"]["kind"] == "cylinder"
+    assert approx(selection["geometry"]["radius_mm"], 50.0)
+    assert selection["hit"]["ray_direction"] == [0.0, 1.0, 0.0]
+    assert selection["hit"]["face_normal"][1] > 0.99
+    assert selection["display"]["type"] == "triangles"
+    assert selection["display"]["source"] == "brep"
+    assert selection["display"]["triangle_count"] > 0
+
+
+def test_select_topology_at_point_returns_edge_semantics():
+    server = make_server()
+    run_cylinder(server)
+    data = expect_ok(server, "select_topology_at_point", {
+        "point": [0, 50, 20],
+        "direction": [0, 1, 0],
+        "tolerance_mm": 0.2,
+    })
+    selection = data["selection"]
+    assert data["matched"] is True
+    assert selection["topology"]["type"] == "edge"
+    assert selection["topology"]["kind"] == "circle"
+    assert approx(selection["geometry"]["radius_mm"], 50.0)
+    assert selection["display"]["type"] == "polyline"
+
+
+def test_query_topology_by_id_round_trips_selection():
+    server = make_server()
+    run_cylinder(server)
+    selected = expect_ok(server, "select_topology_at_point", {
+        "point": [0, 50, 20],
+        "direction": [0, 1, 0],
+        "tolerance_mm": 0.2,
+    })
+    selection = selected["selection"]
+    assert selection is not None
+    revision = selected["geometry_revision"]
+    assert revision >= 0
+
+    queried = expect_ok(server, "query_topology", {"id": selection["topology"]["id"]})
+    assert queried["matched"] is True
+    assert queried["geometry_revision"] == revision
+    assert queried["selection"]["topology"] == selection["topology"]
+    assert queried["selection"]["geometry"] == selection["geometry"]
+    assert queried["selection"]["hit"] is None
+
+
+def test_query_topology_returns_structured_miss():
+    server = make_server()
+    run_cylinder(server)
+    data = expect_ok(server, "query_topology", {"id": "edge:sha256:not-current"})
+    assert data["matched"] is False
+    assert data["selection"] is None
+    assert data["reason"] == "topology_not_found"
+    assert data["geometry_revision"] >= 0
+
+
+def test_measure_topology_uses_brep_references():
+    server = make_server()
+    run_cylinder(server)
+    selected = expect_ok(server, "select_topology_at_point", {
+        "point": [0, 50, 20],
+        "direction": [0, 1, 0],
+        "tolerance_mm": 0.2,
+    })
+    topology_id = selected["selection"]["topology"]["id"]
+    data = expect_ok(server, "measure_topology", {"topology_ids": [topology_id]})
+    measurement = data["measurement"]
+    assert data["matched"] is True
+    assert measurement["metric"] == "diameter"
+    assert measurement["source"] == "brep"
+    assert approx(measurement["result"]["distance"], 100.0)
+    assert data["geometry_revision"] == selected["geometry_revision"]
+
+
+def test_select_topology_rejects_nonfinite_and_invalid_tolerance():
+    server = make_server()
+    run_cylinder(server)
+    expect_err(
+        server,
+        "select_topology_at_point",
+        {"point": [0, float("nan"), 5]},
+        kind="BAD_REQUEST",
+    )
+    expect_err(
+        server,
+        "select_topology_at_point",
+        {"point": [0, 50, 5], "tolerance_mm": float("inf")},
+        kind="BAD_REQUEST",
+    )
+    expect_err(
+        server,
+        "select_topology_at_point",
+        {"point": [0, 50, 5], "tolerance_mm": -0.2},
+        kind="BAD_REQUEST",
+    )
+
+
+def test_select_topology_at_point_returns_structured_miss():
+    server = make_server()
+    run_cylinder(server)
+    data = expect_ok(server, "select_topology_at_point", {"point": [500, 500, 500]})
+    assert data["matched"] is False
+    assert data["selection"] is None
+    assert data["reason"] == "no_brep_topology_within_tolerance"
+
+
 def test_select_refs_value():
     server = make_server()
     run_cylinder(server)

@@ -31,6 +31,9 @@
     render_assembly  {parts, views?, size?} → 装配分色四视角 PNG（v2.14）
     feature_tree     feature_graph.to_dict()
     select_refs      select(filter_type, element_type, face_index) → StepResult
+    select_topology_at_point {point, direction?, tolerance_mm?} → BRep face/edge/vertex semantic selection
+    query_topology     {id} → 按 face:/edge:/vertex: 语义 ID 反查当前 BRep 拓扑
+    measure_topology   {topology_ids:[id] | [id,id]} → BRep 直径/最小距离工程测量
     update_feature   {feature_id, new_params} → StepResult
     delete_feature   {feature_id} → StepResult
     undo / redo      {steps} → StepResult
@@ -53,6 +56,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import sys
 import time
@@ -127,6 +131,18 @@ class KernelServer:
         if key not in payload or payload[key] is None:
             raise ValueError(f"payload 缺少必填字段: {key}")
         return payload[key]
+
+    @staticmethod
+    def _vector3(value: Any, name: str) -> Tuple[float, float, float]:
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError(f"{name} 必须是长度为 3 的数组")
+        try:
+            vector = tuple(float(item) for item in value)  # type: ignore[assignment]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} 必须是数字数组") from exc
+        if not all(math.isfinite(item) for item in vector):
+            raise ValueError(f"{name} 不能包含 NaN 或无穷大")
+        return vector  # type: ignore[return-value]
 
     def _current_geometry_or_fail(self) -> Any:
         geometry = self.kernel._current_geometry
@@ -224,6 +240,73 @@ class KernelServer:
                 "op_history": _jsonable(self.kernel._op_history),
                 "narrative": list(self.kernel.narrative),
                 "parameters": _jsonable(getattr(self.kernel, "_parameters", {})),
+            }
+
+        if cmd == "select_topology_at_point":
+            from mech_kernel.topology_query import select_topology_at_point
+
+            geometry = self._current_geometry_or_fail()
+            point = self._vector3(self._require(payload, "point"), "point")
+            direction = payload.get("direction")
+            tolerance_mm = float(payload.get("tolerance_mm", 0.2))
+            if not math.isfinite(tolerance_mm) or tolerance_mm <= 0.0:
+                raise ValueError("tolerance_mm 必须是有限正数")
+            selection = select_topology_at_point(
+                geometry,
+                point,
+                feature_geometries=self.kernel._feature_geometries,
+                tolerance_mm=tolerance_mm,
+                direction=self._vector3(direction, "direction") if direction is not None else None,
+            )
+            if selection is not None:
+                selection["geometry_revision"] = int(self.kernel._geometry_revision)
+            return {
+                "selection": selection,
+                "matched": selection is not None,
+                "geometry_revision": int(self.kernel._geometry_revision),
+                "reason": None if selection is not None else "no_brep_topology_within_tolerance",
+            }
+
+        if cmd == "query_topology":
+            from mech_kernel.topology_query import query_topology_by_id
+
+            geometry = self._current_geometry_or_fail()
+            topology_id = self._require(payload, "id")
+            if not isinstance(topology_id, str):
+                raise ValueError("id 必须是字符串")
+            selection = query_topology_by_id(
+                geometry,
+                topology_id,
+                feature_geometries=self.kernel._feature_geometries,
+            )
+            if selection is not None:
+                selection["geometry_revision"] = int(self.kernel._geometry_revision)
+            return {
+                "selection": selection,
+                "matched": selection is not None,
+                "geometry_revision": int(self.kernel._geometry_revision),
+                "reason": None if selection is not None else "topology_not_found",
+            }
+
+        if cmd == "measure_topology":
+            from mech_kernel.topology_query import measure_topology
+
+            geometry = self._current_geometry_or_fail()
+            topology_ids = self._require(payload, "topology_ids")
+            if not isinstance(topology_ids, list) or not topology_ids:
+                raise ValueError("topology_ids 必须是非空数组")
+            result = measure_topology(
+                geometry,
+                topology_ids,
+                feature_geometries=self.kernel._feature_geometries,
+            )
+            if result is not None:
+                result["geometry_revision"] = int(self.kernel._geometry_revision)
+            return {
+                "measurement": result,
+                "matched": result is not None,
+                "geometry_revision": int(self.kernel._geometry_revision),
+                "reason": None if result is not None else "topology_not_found",
             }
 
         if cmd == "select_refs":
