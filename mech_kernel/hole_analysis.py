@@ -160,12 +160,26 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                     is_hole = toward_axis and void_side and material_side
                     if not is_hole:
                         continue
-                    # 轴向跨度
+                    # 轴向跨度。segment_depth 是当前圆柱面自身的几何长度；
+                    # counterbore 的小径 depth_mm 会扩为"进入面到孔底"的总孔深。
                     pts = _face_points(face)
-                    zs = [ax[0] * (x - loc.X()) + ax[1] * (y - loc.Y()) + ax[2] * (z - loc.Z())
-                          for x, y, z in pts]
+                    zs = [
+                        ax[0] * (x - loc.X()) + ax[1] * (y - loc.Y()) + ax[2] * (z - loc.Z())
+                        for x, y, z in pts
+                    ]
                     z1, z2 = min(zs), max(zs)
                     depth = z2 - z1
+                    segment_depth = depth
+                    counterbore_face = None
+                    counterbore_z1 = counterbore_z2 = None
+                    current_stage = {
+                        "diameter_mm": round(2.0 * radius, 3),
+                        "z1": z1,
+                        "z2": z2,
+                        "radius": radius,
+                        "face": face,
+                    }
+                    coaxial_stages = [current_stage]
                     # 贯通判定（局部）：孔两端各探出 eps → 两侧都见空腔才 through。
                     # 不用 bbox：凸台/其他特征会拉长材料范围导致误判。
                     eps2 = max(min(0.05, depth / 4.0), 1e-3)
@@ -182,7 +196,8 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                         if other_face is face:
                             continue
                         o_axis = other_cyl.Axis()
-                        if abs(float(other_cyl.Radius()) - radius) <= 0.05:
+                        o_radius = float(other_cyl.Radius())
+                        if abs(o_radius - radius) <= 0.05:
                             continue
                         if not _is_hole_side_face(other_face, classifier,
                                                   (float(o_axis.Location().X()),
@@ -192,9 +207,58 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                                                    float(o_axis.Direction().Y()),
                                                    float(o_axis.Direction().Z()))):
                             continue
-                        if _coaxial(axis, o_axis):
-                            kind = "counterbore_hole"
-                            break
+                        if not _coaxial(axis, o_axis):
+                            continue
+                        other_zs = [
+                            ax[0] * (x - loc.X()) + ax[1] * (y - loc.Y()) + ax[2] * (z - loc.Z())
+                            for x, y, z in _face_points(other_face)
+                        ]
+                        if not other_zs:
+                            continue
+                        other_z1, other_z2 = min(other_zs), max(other_zs)
+                        gap = max(z1 - other_z2, other_z1 - z2, 0.0)
+                        # 真沉孔的两段圆柱在肩台处相接；轴向分离的同轴孔
+                        # 不能仅凭同轴就冒充 counterbore。
+                        coaxial_stages.append({
+                            "diameter_mm": round(2.0 * o_radius, 3),
+                            "z1": other_z1,
+                            "z2": other_z2,
+                            "radius": o_radius,
+                            "face": other_face,
+                        })
+                    chain = [current_stage]
+                    grew = True
+                    while grew:
+                        grew = False
+                        for item in coaxial_stages:
+                            if item in chain:
+                                continue
+                            if any(max(item["z1"] - kept["z2"], kept["z1"] - item["z2"], 0.0) <= 0.05
+                                   for kept in chain):
+                                chain.append(item)
+                                grew = True
+                    merged = []
+                    for item in sorted(chain, key=lambda value: (value["diameter_mm"], value["z1"])):
+                        if merged and abs(merged[-1]["diameter_mm"] - item["diameter_mm"]) <= 0.05 and \
+                                max(item["z1"] - merged[-1]["z2"], merged[-1]["z1"] - item["z2"], 0.0) <= 0.05:
+                            merged[-1]["z1"] = min(merged[-1]["z1"], item["z1"])
+                            merged[-1]["z2"] = max(merged[-1]["z2"], item["z2"])
+                        else:
+                            merged.append(dict(item))
+                    stages = merged
+                    if len(stages) == 2:
+                        other = next(item for item in stages if item["face"] is not face)
+                        counterbore_face = other["face"]
+                        counterbore_z1, counterbore_z2 = other["z1"], other["z2"]
+                        kind = "counterbore_hole"
+                    elif len(stages) > 2:
+                        z1 = min(item["z1"] for item in stages)
+                        z2 = max(item["z2"] for item in stages)
+                        depth = z2 - z1
+                        entry = (loc.X() + ax[0] * z1,
+                                 loc.Y() + ax[1] * z1,
+                                 loc.Z() + ax[2] * z1)
+                        kind = "stepped_hole"
                     else:
                         kexp = TopExp_Explorer(solid, TopAbs_ShapeEnum.TopAbs_FACE)
                         while kexp.More():
@@ -212,14 +276,54 @@ def analyze_holes(geometry: Any) -> Optional[List[Dict]]:
                                         kind = "countersink_hole"
                                         break
                             kexp.Next()
-                    holes.append({
+
+                    counterbore_diameter = None
+                    counterbore_depth = None
+                    bore_diameter = None
+                    if counterbore_face is not None:
+                        other_radius = float(BRepAdaptor_Surface(counterbore_face).Cylinder().Radius())
+                        if other_radius > radius:
+                            # 当前是小径主孔：depth 从进入面（大径顶）算到孔底；
+                            # center 同步指向真实进入端，而不是肩台。
+                            counterbore_diameter = 2.0 * other_radius
+                            counterbore_depth = counterbore_z2 - counterbore_z1
+                            bore_diameter = 2.0 * radius
+                            z1 = min(z1, counterbore_z1)
+                            z2 = max(z2, counterbore_z2)
+                            depth = z2 - z1
+                            entry = (loc.X() + ax[0] * z1,
+                                     loc.Y() + ax[1] * z1,
+                                     loc.Z() + ax[2] * z1)
+                        else:
+                            # 当前是大径沉孔段：depth 即肩台深度。
+                            counterbore_diameter = 2.0 * radius
+                            counterbore_depth = segment_depth
+                            bore_diameter = 2.0 * other_radius
+
+                    hole_payload = {
                         "diameter_mm": round(2 * radius, 3),
                         "center": [round(v, 2) for v in entry],
                         "axis": [round(v, 3) for v in ax],
                         "depth_mm": round(depth, 3),
+                        "segment_depth_mm": round(segment_depth, 3),
                         "through": bool(through),
                         "kind": kind,
-                    })
+                    }
+                    if counterbore_diameter is not None:
+                        hole_payload["counterbore_diameter_mm"] = round(counterbore_diameter, 3)
+                        hole_payload["counterbore_depth_mm"] = round(counterbore_depth, 3)
+                        hole_payload["bore_diameter_mm"] = round(bore_diameter, 3)
+                    if len(stages) > 2:
+                        ordered = sorted(stages, key=lambda item: item["z1"])
+                        hole_payload["kind"] = "stepped_hole"
+                        hole_payload["stages"] = [
+                            {
+                                "diameter_mm": item["diameter_mm"],
+                                "depth_mm": round(item["z2"] - item["z1"], 3),
+                            }
+                            for item in ordered
+                        ]
+                    holes.append(hole_payload)
                 except Exception:
                     continue
         return holes

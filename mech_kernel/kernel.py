@@ -8,6 +8,7 @@ import copy
 import time
 import base64
 import hashlib
+import math
 
 from .errors import (
     MechKernelError, InvalidRequestError, KernelBugError, StateCorruptionError,
@@ -329,9 +330,11 @@ class MechKernel:
                                              description="孔位 2 坐标，相对进入面：top/bottom→(x,y)；x±→(y,z)；y±→(x,z)"),
                      "diameter": FieldSchema(type="number", required=False, default=10.0, min=0.001),
                      "depth": FieldSchema(type="number", required=False, min=0.001),
-                     "hole_type": FieldSchema(type="enum", required=False, default="simple", enum=["simple", "counterbore", "countersink"]),
+                     "hole_type": FieldSchema(type="enum", required=False, default="simple", enum=["simple", "counterbore", "countersink", "stepped"]),
                      "counterbore_diameter": FieldSchema(type="number", required=False, min=0.001),
                      "counterbore_depth": FieldSchema(type="number", required=False, min=0.001),
+                     "stages": FieldSchema(type="list", required=False, items_type="dict",
+                                            description="stepped 孔段：[{diameter, depth}] 从进入面往下逐段收小；最后一段深度可省略，表示贯通"),
                      "name": FieldSchema(type="string", required=False),
                      "direction": FieldSchema(type="enum", required=False, default="top",
                                               enum=["top", "bottom", "x+", "x-", "y+", "y-"],
@@ -1835,7 +1838,7 @@ class MechKernel:
             if hit is None:
                 return 0.0
             lo, hi = max(hit - step, 0.0), hit
-            while hi - lo > 0.01:
+            while hi - lo > 0.001:
                 mid = (lo + hi) / 2
                 if inside(mid):
                     hi = mid
@@ -1845,6 +1848,43 @@ class MechKernel:
         except Exception:
             return 0.0
 
+    def _normalize_stepped_stages(self, stages):
+        """阶梯孔段必须从进入面往下逐段收小；只有最后一段可省略深度表示贯通。"""
+        if not isinstance(stages, list) or len(stages) < 2:
+            raise InvalidRequestError("stepped 至少需要两段 {diameter, depth}")
+        normalized = []
+        for index, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                raise InvalidRequestError(f"stages[{index}] 必须是 {{diameter, depth}}")
+            extra = set(stage) - {"diameter", "depth"}
+            if extra:
+                raise InvalidRequestError(
+                    f"stages[{index}] 含非法字段 {sorted(extra)}")
+            try:
+                stage_diameter = float(stage["diameter"])
+            except (KeyError, TypeError, ValueError):
+                raise InvalidRequestError(f"stages[{index}].diameter 必须是数字")
+            if not math.isfinite(stage_diameter) or stage_diameter <= 0:
+                raise InvalidRequestError(
+                    f"stages[{index}].diameter 必须是正的有限数字（当前 {stage_diameter}）")
+            raw_depth = stage.get("depth")
+            if raw_depth is None:
+                if index != len(stages) - 1:
+                    raise InvalidRequestError("只有最后一段可以省略 depth")
+                stage_depth = None
+            else:
+                try:
+                    stage_depth = float(raw_depth)
+                except (TypeError, ValueError):
+                    raise InvalidRequestError(f"stages[{index}].depth 必须是数字")
+                if not math.isfinite(stage_depth) or stage_depth <= 0:
+                    raise InvalidRequestError(
+                        f"stages[{index}].depth 必须是正的有限数字（当前 {stage_depth}）")
+            if normalized and stage_diameter >= normalized[-1]["diameter"] - 1e-9:
+                raise InvalidRequestError("stepped 直径必须从进入面逐段变小")
+            normalized.append({"diameter": stage_diameter, "depth": stage_depth})
+        return normalized
+
     def hole(
         self,
         position: tuple = (0, 0),
@@ -1853,6 +1893,7 @@ class MechKernel:
         hole_type: str = "simple",
         counterbore_diameter: float = None,
         counterbore_depth: float = None,
+        stages: list = None,
         name: str = "",
         direction: str = "top",
     ) -> StepResult:
@@ -1878,10 +1919,51 @@ class MechKernel:
             raise InvalidRequestError("hole 需要先有几何")
         if diameter <= 0:
             raise InvalidRequestError(f"diameter 必须 > 0（当前 {diameter}）")
-        if hole_type not in ("simple", "counterbore", "countersink"):
-            raise InvalidRequestError(f"hole_type 必须 simple/counterbore/countersink（当前 {hole_type}）")
+        if hole_type not in ("simple", "counterbore", "countersink", "stepped"):
+            raise InvalidRequestError(
+                f"hole_type 必须 simple/counterbore/countersink/stepped（当前 {hole_type}）")
+        if hole_type == "stepped":
+            stages = self._normalize_stepped_stages(stages)
+            diameter = stages[-1]["diameter"]
+            depth = None if stages[-1]["depth"] is None else sum(stage["depth"] for stage in stages)
+        elif stages is not None:
+            raise InvalidRequestError("stages 只能用于 hole_type='stepped'")
+        if diameter <= 0:
+            raise InvalidRequestError(f"diameter 必须 > 0（当前 {diameter}）")
         if depth is not None and depth <= 0:
             raise InvalidRequestError(f"depth 必须 > 0（当前 {depth}）")
+
+        # JSON 数值必须先归一为有限 float。NaN/Infinity 进入 OCC 会变成不可测
+        # 几何或静默失败，不能等到布尔运算后才暴露。
+        for _name, _value in (
+            ("diameter", diameter), ("depth", depth),
+            ("counterbore_diameter", counterbore_diameter),
+            ("counterbore_depth", counterbore_depth),
+        ):
+            if _value is None:
+                continue
+            try:
+                _value = float(_value)
+            except (TypeError, ValueError):
+                raise InvalidRequestError(f"{_name} 必须是数字（当前 {_value!r}）")
+            if not math.isfinite(_value):
+                raise InvalidRequestError(f"{_name} 必须是有限数字（当前 {_value}）")
+
+        # 沉孔/锪孔的有效尺寸在这里一次解析；显式 0 不是"用默认值"，
+        # 而是非法参数。默认值仍保持既有兼容行为。
+        effective_cb_diameter = counterbore_diameter
+        effective_cb_depth = counterbore_depth
+        if hole_type in ("counterbore", "countersink"):
+            if effective_cb_diameter is None:
+                effective_cb_diameter = diameter * 1.8
+            if effective_cb_depth is None:
+                effective_cb_depth = diameter * 0.5
+            if effective_cb_diameter <= diameter:
+                raise InvalidRequestError(
+                    f"{hole_type} 大径 {effective_cb_diameter} 必须大于孔径 {diameter}")
+            if depth is not None and effective_cb_depth >= depth:
+                raise InvalidRequestError(
+                    f"{hole_type} 深度 {effective_cb_depth} 必须小于孔深 {depth}")
 
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_SOLID
@@ -1937,6 +2019,32 @@ class MechKernel:
         surface = (anchor[0] + drill[0] * entry_t,
                    anchor[1] + drill[1] * entry_t,
                    anchor[2] + drill[2] * entry_t)
+        # 实测进入面到出料面的材料跨度。仅用 bbox 会把悬伸/异形件估大，
+        # 导致"沉孔深度 >= 板厚"时仍返回成功但肩台被切穿。
+        back_anchor = (anchor[0] + drill[0] * axis_extent,
+                       anchor[1] + drill[1] * axis_extent,
+                       anchor[2] + drill[2] * axis_extent)
+        exit_t = self._probe_entry_distance(
+            shape, tuple(-value for value in drill), back_anchor, axis_extent)
+        material_extent = axis_extent - entry_t - exit_t
+        if material_extent <= 0.0:
+            material_extent = axis_extent
+        # 恰好等于材料厚度是合法边界（孔底与远端面齐平，如轴承孔开通内腔单侧壁）；
+        # 只有超过实测厚度（含探测容差 0.01）才拒绝——那会把盲孔伪装成通孔。
+        if depth is not None and depth > material_extent + 0.01:
+            raise InvalidRequestError(
+                f"盲孔深度 {depth} 超过沿孔轴实测材料厚度 {material_extent:.3f}；"
+                "如需贯通请省略 depth")
+        if hole_type in ("counterbore", "countersink") and effective_cb_depth > material_extent - 0.01:
+            raise InvalidRequestError(
+                f"{hole_type} 深度 {effective_cb_depth} 必须小于沿孔轴材料厚度 "
+                f"{material_extent:.3f}，否则没有真实肩台/锥面")
+        if hole_type == "stepped":
+            finite_depths = [stage["depth"] for stage in stages if stage["depth"] is not None]
+            if stages[-1]["depth"] is None and sum(finite_depths) >= material_extent - 0.01:
+                raise InvalidRequestError(
+                    f"stepped 前段总深 {sum(finite_depths):.3f} 必须小于沿孔轴材料厚度 "
+                    f"{material_extent:.3f}，否则没有后续小径段")
         actual_depth = (axis_extent + 2 * margin) if depth is None else (depth + margin)
         cutter_origin = (surface[0] - drill[0] * margin,
                          surface[1] - drill[1] * margin,
@@ -1947,7 +2055,11 @@ class MechKernel:
         px, py = position
 
         with Transaction(self, "hole") as txn:
-            entry = self._record_history("hole", position=position, diameter=diameter, depth=depth, hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth, name=name, direction=direction)
+            entry = self._record_history(
+                "hole", position=position, diameter=diameter, depth=depth,
+                hole_type=hole_type, counterbore_diameter=counterbore_diameter,
+                counterbore_depth=counterbore_depth, stages=stages,
+                name=name, direction=direction)
             feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
@@ -1955,7 +2067,8 @@ class MechKernel:
                 parameters={
                     "position": list(position), "diameter": diameter, "depth": depth,
                     "hole_type": hole_type, "counterbore_diameter": counterbore_diameter,
-                    "counterbore_depth": counterbore_depth, "name": name, "direction": direction,
+                    "counterbore_depth": counterbore_depth, "stages": stages,
+                    "name": name, "direction": direction,
                 },
                 name=name or f"hole_{feature_id}",
                 state=FeatureState.COMPUTED,
@@ -1969,19 +2082,39 @@ class MechKernel:
             if hole_type == "simple":
                 cutter = bore
             elif hole_type == "counterbore":
-                cb_d = counterbore_diameter or (diameter * 1.8)
-                cb_depth = counterbore_depth or (diameter * 0.5)
-                cb = B3DSolid.make_cylinder(cb_d / 2, cb_depth + margin, plane=axis_plane)
+                # 两段同轴圆柱：小径全长 + 大径浅段。上方校验保证
+                # cb_depth < depth/material_extent，因此布尔结果必有肩台。
+                cb = B3DSolid.make_cylinder(
+                    effective_cb_diameter / 2, effective_cb_depth + margin, plane=axis_plane)
                 cutter = bore + cb
+            elif hole_type == "stepped":
+                cutter = None
+                consumed = 0.0
+                for stage in stages:
+                    starts_at_entry = consumed == 0.0
+                    if stage["depth"] is None:
+                        stage_length = actual_depth - consumed
+                    elif starts_at_entry:
+                        stage_length = stage["depth"] + margin
+                    else:
+                        stage_length = stage["depth"]
+                    origin = (
+                        surface[0] + drill[0] * (consumed - (margin if starts_at_entry else 0.0)),
+                        surface[1] + drill[1] * (consumed - (margin if starts_at_entry else 0.0)),
+                        surface[2] + drill[2] * (consumed - (margin if starts_at_entry else 0.0)),
+                    )
+                    piece = B3DSolid.make_cylinder(
+                        stage["diameter"] / 2, stage_length,
+                        plane=B3DPlane(origin=origin, z_dir=drill))
+                    cutter = piece if cutter is None else cutter + piece
+                    if stage["depth"] is None:
+                        break
+                    consumed += stage["depth"]
             else:  # countersink: 真 90° 锥面
-                cs_d = counterbore_diameter or (diameter * 1.8)
-                cs_depth = counterbore_depth or (diameter * 0.5)
-                if cs_d <= diameter:
-                    raise InvalidRequestError(
-                        f"countersink 大径 {cs_d} 必须大于孔径 {diameter}")
                 cone = B3DSolid.make_cone(
-                    cs_d / 2, diameter / 2, cs_depth, plane=entry_plane)
-                collar = B3DSolid.make_cylinder(cs_d / 2, margin, plane=back_plane)
+                    effective_cb_diameter / 2, diameter / 2, effective_cb_depth, plane=entry_plane)
+                collar = B3DSolid.make_cylinder(
+                    effective_cb_diameter / 2, margin, plane=back_plane)
                 cutter = bore + cone + collar
 
             # boolean subtract

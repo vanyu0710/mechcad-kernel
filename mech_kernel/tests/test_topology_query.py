@@ -242,6 +242,101 @@ def test_query_topology_rejects_unstable_index_style_id():
         query_topology_by_id(kernel._current_geometry, "F00")
 
 
+def test_counterbore_brep_semantics_support_engineering_measurements():
+    """沉孔验收：小径、大径、肩台深度、轴线都来自可选中 BRep 面。"""
+    kernel = MechKernel()
+    kernel.create_workplane("base", "XY")
+    kernel.new_sketch("base", "plate")
+    kernel.add_rectangle("plate", 60, 40)
+    kernel.close_sketch("plate")
+    kernel.extrude("plate", 10)
+    kernel.hole(
+        position=(0, 0), diameter=6, depth=5, hole_type="counterbore",
+        counterbore_diameter=10, counterbore_depth=3,
+    )
+
+    top_before = select_face_at_point(
+        kernel._current_geometry,
+        (20, 0, 10),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 0, -1),
+    )
+    assert top_before is not None
+
+    # 加入第二个孔会改变顶面 trim/面积，旧语义指纹必须失效而不是重绑到新面。
+    kernel.hole(position=(20, 0), diameter=6)
+    assert measure_topology(
+        kernel._current_geometry,
+        [top_before["topology"]["id"]],
+        feature_geometries=kernel._feature_geometries,
+    ) is None
+
+    large = select_face_at_point(
+        kernel._current_geometry,
+        (0, 5, 8.5),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 1, 0),
+    )
+    small = select_face_at_point(
+        kernel._current_geometry,
+        (0, 3, 6),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 1, 0),
+    )
+    shoulder = select_face_at_point(
+        kernel._current_geometry,
+        (4, 0, 7),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 0, -1),
+    )
+    top = select_face_at_point(
+        kernel._current_geometry,
+        (-20, 0, 10),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 0, -1),
+    )
+    reference = select_face_at_point(
+        kernel._current_geometry,
+        (20, 3, 5),
+        feature_geometries=kernel._feature_geometries,
+        direction=(0, 1, 0),
+    )
+    assert all(item is not None for item in (large, small, shoulder, top, reference))
+    assert large["geometry"]["radius_mm"] == pytest.approx(5.0)
+    assert small["geometry"]["radius_mm"] == pytest.approx(3.0)
+    assert shoulder["geometry"]["kind"] == "plane"
+    assert top["geometry"]["kind"] == "plane"
+
+    features = kernel._feature_geometries
+    large_diameter = measure_topology(
+        kernel._current_geometry, [large["topology"]["id"]], feature_geometries=features
+    )
+    small_diameter = measure_topology(
+        kernel._current_geometry, [small["topology"]["id"]], feature_geometries=features
+    )
+    shoulder_depth = measure_topology(
+        kernel._current_geometry,
+        [top["topology"]["id"], shoulder["topology"]["id"]],
+        feature_geometries=features,
+    )
+    axis_distance = measure_topology(
+        kernel._current_geometry,
+        [small["topology"]["id"], reference["topology"]["id"]],
+        feature_geometries=features,
+    )
+    assert large_diameter["metric"] == "diameter"
+    assert large_diameter["result"]["distance"] == pytest.approx(10.0, abs=1e-5)
+    assert small_diameter["metric"] == "diameter"
+    assert small_diameter["result"]["distance"] == pytest.approx(6.0, abs=1e-5)
+    assert shoulder_depth["metric"] == "face_to_face"
+    assert shoulder_depth["result"]["distance"] == pytest.approx(3.0, abs=0.01)
+    assert axis_distance["metric"] == "axis_to_axis"
+    assert axis_distance["result"]["distance"] == pytest.approx(20.0, abs=1e-5)
+    assert all(result["source"] == "brep" for result in (
+        large_diameter, small_diameter, shoulder_depth, axis_distance
+    ))
+
+
 def test_measure_topology_returns_face_to_face_distance_for_parallel_planes():
     kernel = _box_kernel()
     top = select_face_at_point(

@@ -5,7 +5,10 @@
 """
 import math
 
+import pytest
+
 from mech_kernel import MechKernel
+from mech_kernel.errors import InvalidRequestError
 
 
 def _plate(k, size=(60, 40, 10)):
@@ -103,6 +106,117 @@ def test_counterbore_depths_correct():
     # 沉孔环 π(25-9)*3 + 主孔 π*9*5（重叠只算一次）
     expected = math.pi * 16 * 3 + math.pi * 9 * 5
     assert abs((v0 - v1) - expected) < 0.5
+
+
+def test_counterbore_reports_measurable_two_stage_semantics():
+    """counterbore 的两个圆柱面都必须携带真实几何证据。
+
+    小径 depth 是进入面到孔底的总孔深；segment_depth 单独暴露小圆柱段长度，
+    避免把肩台下 2mm 误当成整个 5mm 盲孔。
+    """
+    k = MechKernel()
+    _plate(k)
+    k.hole(position=(0, 0), diameter=6, depth=5, hole_type="counterbore",
+           counterbore_diameter=10, counterbore_depth=3)
+    holes = _holes(k)
+    assert len(holes) == 2
+    small = next(h for h in holes if abs(h["diameter_mm"] - 6.0) < 0.01)
+    large = next(h for h in holes if abs(h["diameter_mm"] - 10.0) < 0.01)
+
+    assert small["kind"] == "counterbore_hole"
+    assert small["through"] is False
+    assert abs(small["depth_mm"] - 5.0) < 0.01
+    assert abs(small["segment_depth_mm"] - 2.0) < 0.01
+    assert abs(small["counterbore_diameter_mm"] - 10.0) < 0.01
+    assert abs(small["counterbore_depth_mm"] - 3.0) < 0.01
+    assert abs(small["bore_diameter_mm"] - 6.0) < 0.01
+
+    assert large["kind"] == "counterbore_hole"
+    assert large["through"] is True
+    assert abs(large["depth_mm"] - 3.0) < 0.01
+    assert abs(large["segment_depth_mm"] - 3.0) < 0.01
+    assert abs(large["counterbore_diameter_mm"] - 10.0) < 0.01
+    assert abs(large["counterbore_depth_mm"] - 3.0) < 0.01
+    assert abs(large["bore_diameter_mm"] - 6.0) < 0.01
+
+
+def test_counterbore_rejects_degenerate_or_nonfinite_parameters():
+    """不能让单段圆柱/切穿肩台/NaN 参数伪装成 counterbore 成功。"""
+    k = MechKernel()
+    _plate(k)
+    with pytest.raises(InvalidRequestError, match="大径"):
+        k.hole(position=(0, 0), diameter=6, depth=5, hole_type="counterbore",
+               counterbore_diameter=6, counterbore_depth=3)
+    with pytest.raises(InvalidRequestError, match="深度"):
+        k.hole(position=(0, 0), diameter=6, depth=5, hole_type="counterbore",
+               counterbore_diameter=10, counterbore_depth=5)
+    with pytest.raises(InvalidRequestError, match="材料厚度"):
+        k.hole(position=(0, 0), diameter=6, depth=12, hole_type="counterbore",
+               counterbore_diameter=10, counterbore_depth=3)
+    with pytest.raises(InvalidRequestError, match="有限"):
+        k.hole(position=(0, 0), diameter=float("nan"), hole_type="counterbore")
+    with pytest.raises(InvalidRequestError, match="有限"):
+        k.hole(position=(0, 0), diameter=6, hole_type="counterbore",
+               counterbore_diameter=float("inf"))
+
+
+def test_blind_depth_equal_to_material_is_flush_boundary():
+    """深度恰好等于材料厚度是合法齐平边界：孔底与远端面重合，几何上可测为通孔。"""
+    k = MechKernel()
+    _plate(k)  # 10mm 板
+    r = k.hole(position=(0, 0), diameter=6, depth=10)
+    assert r.success, r.error
+    holes = _holes(k)
+    assert holes, "holes 查询不应为空"
+    h = holes[0]
+    assert h["diameter_mm"] == 6
+    # 没有留下盲孔底面 → 几何证据表明它是通孔，而不是参数伪装的盲孔
+    assert h["through"] is True
+
+
+def test_stepped_hole_cuts_measurable_shoulders():
+    """三段阶梯孔必须留下两级真实肩台，缺一段体积就不成立。"""
+    k = MechKernel()
+    _plate(k, size=(80, 50, 12))
+    v0 = k.query(target="_current_geometry", what="volume").value
+    result = k.hole(
+        position=(0, 0), hole_type="stepped",
+        stages=[
+            {"diameter": 14, "depth": 3},
+            {"diameter": 10, "depth": 4},
+            {"diameter": 6, "depth": 5},
+        ],
+    )
+    assert result.success, result.error
+    v1 = k.query(target="_current_geometry", what="volume").value
+    expected = math.pi * (7 * 7 * 3 + 5 * 5 * 4 + 3 * 3 * 5)
+    assert abs((v0 - v1) - expected) < 0.8
+
+    holes = _holes(k)
+    assert len(holes) == 3
+    assert {round(h["diameter_mm"], 1) for h in holes} == {14.0, 10.0, 6.0}
+    assert all(h["kind"] == "stepped_hole" for h in holes)
+    small = next(h for h in holes if abs(h["diameter_mm"] - 6.0) < 0.01)
+    assert abs(small["depth_mm"] - 12.0) < 0.05
+    assert [stage["diameter_mm"] for stage in small["stages"]] == [14.0, 10.0, 6.0]
+    assert [stage["depth_mm"] for stage in small["stages"]] == [3.0, 4.0, 5.0]
+
+
+def test_stepped_hole_rejects_illegal_stages():
+    k = MechKernel()
+    _plate(k)
+    with pytest.raises(InvalidRequestError, match="逐段变小"):
+        k.hole(position=(0, 0), hole_type="stepped", stages=[
+            {"diameter": 6, "depth": 3}, {"diameter": 10, "depth": 4},
+        ])
+    with pytest.raises(InvalidRequestError, match="有限"):
+        k.hole(position=(0, 0), hole_type="stepped", stages=[
+            {"diameter": 10, "depth": float("nan")}, {"diameter": 6, "depth": 3},
+        ])
+    with pytest.raises(InvalidRequestError, match="材料厚度"):
+        k.hole(position=(0, 0), hole_type="stepped", stages=[
+            {"diameter": 10, "depth": 10}, {"diameter": 6},
+        ])
 
 
 def test_query_holes_schema_registered():

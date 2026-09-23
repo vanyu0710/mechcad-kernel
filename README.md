@@ -8,11 +8,11 @@
   <a href="docs/mechkernel-harness-roadmap.md">Harness 路线图</a>
 </p>
 
-[![Tests](https://img.shields.io/badge/tests-455%2F455%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-488%2F488%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.12-blue)]()
 [![OCC](https://img.shields.io/badge/OCC-7.9.3-orange)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-red)](LICENSE)
-[![v2.11](https://img.shields.io/badge/version-v2.21.1-blue)]()
+[![v2.22](https://img.shields.io/badge/version-v2.22.0-blue)]()
 
 ## 概述
 
@@ -22,13 +22,14 @@ MechCAD Kernel 是 [Varen CAD](https://github.com/vanyu0710/aicad) 的**参数�
 
 ![render before/after](docs/images/render-before-after.png)
 
-**核心能力 (v2.21.1)**：
+**核心能力 (v2.22.0)**：
 - **36 op 默认公开 + 10 装配 op experimental**（全部真实实现）— 能力集聚焦零件建模主线；v2.12 新增 `make_gear`（真渐开线齿轮坯公开 op）+ worker `reset` RPC；**v2.12.1 修复 make_gear 两处几何缺陷**（渐开线齿悬浮于毂盘、bore 参数反写致假孔），新增单实体/真通孔回归门
 - **v2.18 传动件原语**：`make_gear` 升级为**真渐开线（ISO 21771）**单闭合齿廓（Spline 齿面 + 多段 twist-loft 斜齿，总扭转角 = b·tanβ/r），新增 `create_keyway`（GB/T 1096 平键槽，槽深由实测表面反推）与 `create_spline`（花键轴），三轴式变速器 26 件总成即由这些 op 一次跑通
 - **v2.19 材质 + 软件光栅渲染器**：`materials.py` 材质表（铸铁/钢/深钢/青铜…含基色与高光），`software_renderer.py` numpy z-buffer 光栅化（Blinn-Phong + 2× SSAA + 自动取景），装配分材质着色、无 GPU 也能出证据图
 - **v2.20 壳体设计闭环**：`housing_design.py` —— `internals_design_brief` 先读内部齿轮/轴/轴承包络反推箱体所需型腔（禁止先画大盒子），`audit_housing` 逐项程序审计（型腔松紧、轴承座、螺栓分组与边距、旋转件碰箱体、可拆装路径），FAIL 项阻断交付
 - **v2.21 材质对外导出**：`UI_MATERIAL_KEYS` / `ui_material_table()` 供上层（Varen CAD 视口）按同一权威表分材质着色，前端与内核材质表有跨仓一致性测试防漂移
 - **v2.21.1 孔分类修复**：沉孔/锪孔识别增加"该面必须是凹的孔型面"判据（法向指向自身轴线 + 法向侧为空腔）——同轴**凸**外圆（如轴承座外圆）不再被误当沉孔台阶，通孔不会被误标成 counterbore
+- **v2.22 真实沉孔 / 阶梯孔 BRep**：counterbore 改为两段同轴圆柱切除并保留真实肩台，小径/大径/肩台深度/轴线可经 topology query 测量验收；盲孔深度由几何证据判定；新增 `stepped` hole 多级孔段与结构化 topology_not_found 回归
 - **v2.13 代码通道 `run_script`**：模型写 Python 脚本、几何只能经 `k` 门面调公开 op（AST 白名单只许 import math、禁 `_` 属性、`__import__` 守卫版）；执行前检查点、失败整体回滚并回传原始 traceback；**脚本内 op 照常进 _op_history，代码件可参数重放**；query 新增 solid_count（单实体复检契约）
 - **v2.17 几何语义闭环**：拓扑引用带几何指纹——select 发放时报告 rebindings（同串引用换代可见），fillet/chamfer/shell/create_workplane 支持 expected 锚点，不符即 TOPOLOGY_REFERENCE_REBOUND；query what=holes 孔语义分析（实体分类器判凹凸/贯通/深度/位置，外凸台绝不算孔）；顺带修复 hole 盲孔系统性超深（margin 错加钻端 + bbox 锚点被底脚抬高，进入面改实测）
 - **v2.16 可靠性硬门控（P0 修复）**：`run_script` 默认 abort——脚本内任一 op 失败即整体回滚并返回 `SCRIPT_OP_FAILED + failed_op`（半成品绝不静默交付），可选 best_effort；op 返回失败由 ScriptOpError 显式化，try/except 仍可条件回退
@@ -406,6 +407,7 @@ k.extrude("pocket", depth=5, mode="cut", reverse=True)     # 切进材料
 | **+ v2.20** | **2026-09-16** | **壳体设计闭环 housing_design.py：internals_design_brief 按内部件包络反推型腔（禁止先画大盒）+ audit_housing 逐项审计（型腔/轴承座/螺栓分组边距/旋转件碰箱/可拆装路径），FAIL 阻断** | **447** | **36+10** |
 | **+ v2.21** | **2026-09-16** | **材质对外导出 UI_MATERIAL_KEYS / ui_material_table()，供 Varen CAD 视口按内核权威表着色（跨仓一致性测试防漂移）** | **451** | **36+10** |
 | **+ v2.21.1** | **2026-09-18** | **孔分类修复：沉孔/锪孔需"面本身是凹的孔型面"（法向指向轴线 + 法向侧空腔），同轴凸外圆（轴承座外圆）不再被误判为沉孔台阶；新增该场景回归测试（板顶 offset workplane 建真凸台，旧逻辑判 counterbore、新逻辑判 through）** | **455** | **36+10** |
+| **+ v2.22** | **2026-09-23** | **真实沉孔 BRep：两段同轴圆柱 + 真实肩台，盲孔深度几何取证，新增 stepped 多级孔；过期拓扑 ID 结构化 topology_not_found** | **488** | **36+10** |
 | **+ v2.16.1** | **2026-09-11** | **渲染审计 P1 修复：特征边携带双邻面法线，轮廓边（一前一后）不再被 bisector 误删（立方体斜视 6/9→9/9）；边可见性改 hidden-line elimination 区间裁剪（numpy 向量化），描边宽度不再充当深度偏移——薄板遮挡穿透 1375px→AA 缝 ~150px** | **411** | **34+10** |
 
 ## 安装

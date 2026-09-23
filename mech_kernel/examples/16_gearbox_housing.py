@@ -56,7 +56,7 @@ BOX = {"length": 160.0, "width": 100.0, "height": 72.0, "wall": 6.0}
 FOOT = {"length": 200.0, "width": 130.0, "height": 12.0}
 BOSS = {"diameter": 56.0, "protrusion": 12.0, "center_z": 42.0}  # Ø56: z14..70 与顶面/凸缘脱开（避免相切几何）
 BORE = {"diameter": 36.0, "depth": 18.0}
-BOLT = {"diameter": 13.0, "depth": 70.0, "offset_x": 88.0, "offset_y": 54.0}
+BOLT = {"diameter": 13.0, "offset_x": 88.0, "offset_y": 54.0}  # 通孔（孔位处只有 12mm 底脚，旧 depth=70 是靠过切打穿的伪盲孔）
 DRAIN = {"diameter": 12.0, "depth": 6.0, "x": 60.0}
 SIGHT = {"boss_diameter": 28.0, "boss_protrusion": 4.0, "center_z": 30.0,
          "hole_diameter": 20.0, "hole_depth": 21.0}
@@ -246,7 +246,7 @@ def build_housing(verbose=True):
     for sx in (1, -1):
         for sy in (1, -1):
             k.hole(position=(sx * BOLT["offset_x"], sy * BOLT["offset_y"]),
-                   diameter=BOLT["diameter"], depth=BOLT["depth"],
+                   diameter=BOLT["diameter"],  # 通孔：省略 depth，与解析体积 V_BOLTS（按 12mm 底脚）一致
                    direction="top", name=f"bolt_hole_{'p' if sx > 0 else 'n'}{'x'}{'p' if sy > 0 else 'n'}y")
     if verbose:
         check_step(k, "底脚螺栓", step); step += 1

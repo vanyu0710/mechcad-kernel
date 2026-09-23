@@ -297,6 +297,30 @@ def test_measure_topology_uses_brep_references():
     assert data["geometry_revision"] == selected["geometry_revision"]
 
 
+def test_measure_topology_reports_structured_topology_not_found():
+    server = make_server()
+    for op, args in (
+        ("create_workplane", {"name": "base", "type": "XY"}),
+        ("new_sketch", {"workplane_name": "base", "sketch_name": "s"}),
+        ("add_rectangle", {"sketch_name": "s", "width": 60, "height": 40}),
+        ("close_sketch", {"sketch_name": "s"}),
+        ("extrude", {"sketch_name": "s", "depth": 10, "mode": "new_body"}),
+        ("hole", {
+            "position": [0, 0], "diameter": 6, "depth": 5,
+            "hole_type": "counterbore",
+            "counterbore_diameter": 10, "counterbore_depth": 3,
+        }),
+    ):
+        data = expect_ok(server, "execute", {"op": op, "args": args})
+        assert data["success"] is True, f"{op} failed: {data}"
+
+    data = expect_ok(server, "measure_topology", {"topology_ids": ["face:sha256:not-current"]})
+    assert data["matched"] is False
+    assert data["measurement"] is None
+    assert data["reason"] == "topology_not_found"
+    assert data["geometry_revision"] >= 0
+
+
 def test_select_topology_rejects_nonfinite_and_invalid_tolerance():
     server = make_server()
     run_cylinder(server)

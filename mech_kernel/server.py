@@ -33,7 +33,7 @@
     select_refs      select(filter_type, element_type, face_index) → StepResult
     select_topology_at_point {point, direction?, tolerance_mm?} → BRep face/edge/vertex semantic selection
     query_topology     {id} → 按 face:/edge:/vertex: 语义 ID 反查当前 BRep 拓扑
-    measure_topology   {topology_ids:[id] | [id,id]} → BRep 直径/最小距离工程测量
+    measure_topology   {topology_ids:[id] | [id,id]} → BRep 直径/轴距/平行面距/最小距离工程测量
     update_feature   {feature_id, new_params} → StepResult
     delete_feature   {feature_id} → StepResult
     undo / redo      {steps} → StepResult
