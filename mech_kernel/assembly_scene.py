@@ -22,18 +22,41 @@ class AssemblyError(ValueError):
 
 
 def _apply_pose(part: Any, pose: dict) -> Any:
-    """位姿 = 先绕世界轴旋转（rotation_deg:[angle,[ax,ay,az]]，与 assemble 同格式）
-    再平移。与 kernel.assemble（kernel.py:3369-3371）语义一致。"""
-    from build123d import Axis, Vector
+    """Apply one rigid instance pose: rotate first, then translate.
 
-    rotation = pose.get("rotation_deg")
-    if rotation:
-        angle, axis = float(rotation[0]), tuple(float(v) for v in rotation[1])
-        part = part.rotate(Axis((0.0, 0.0, 0.0), axis), angle)
+    Compatible with the existing axis-angle format::
+
+        {"rotation_deg": [angle, [ax, ay, az]], "position": [x, y, z]}
+
+    and additionally accepts a validated proper rotation matrix::
+
+        {"rotation_matrix": [[...], [...], [...]], "position": [x, y, z]}
+
+    The two rotation representations are mutually exclusive.  This is a pure
+    rigid placement, not a mating or kinematics solver.
+    """
+    from .rigid_transform import (
+        apply_rigid_transform,
+        axis_angle_to_matrix,
+        validate_rotation_matrix,
+    )
+
+    rotation_deg = pose.get("rotation_deg")
+    rotation_matrix = pose.get("rotation_matrix")
+    if rotation_deg is not None and rotation_matrix is not None:
+        raise ValueError("rotation_deg and rotation_matrix cannot both be provided")
+    if rotation_matrix is not None:
+        rotation = validate_rotation_matrix(rotation_matrix)
+    elif rotation_deg is not None:
+        if (not isinstance(rotation_deg, (list, tuple)) or len(rotation_deg) != 2):
+            raise ValueError("rotation_deg must be [angle_deg, [ax, ay, az]]")
+        rotation = axis_angle_to_matrix(rotation_deg[0], rotation_deg[1])
+    else:
+        rotation = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
     position = pose.get("position")
-    if position:
-        part = part.translate(Vector(*[float(v) for v in position]))
-    return part
+    if position is None:
+        position = (0.0, 0.0, 0.0)
+    return apply_rigid_transform(part, rotation, position)
 
 
 def _bbox_of(part: Any) -> tuple:
@@ -70,8 +93,10 @@ def _load_parts(parts: Any) -> list:
         if name in seen:
             raise AssemblyError(f"零件名重复: {name}")
         seen.add(name)
-        pose = item.get("pose") or {}
-        if not isinstance(pose, dict):
+        pose = item.get("pose")
+        if pose is None:
+            pose = {}
+        elif not isinstance(pose, dict):
             raise AssemblyError(f"零件 {name} 的 pose 必须是对象")
         try:
             part = import_step(path)

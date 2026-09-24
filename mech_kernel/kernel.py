@@ -36,6 +36,7 @@ from .reference_frames import (
     CoordinateFrame, FrameRegistry, resolve_point as rf_resolve_point,
     resolve_placement as rf_resolve_placement,
 )
+from .rigid_transform import apply_rigid_transform, orientation_from_axis
 from .feature_graph import FeatureGraph
 from .workplane import Workplane, WorkplaneType, WorkplaneRegistry
 from .persistent_naming import PersistentNamingResolver, PersistentName
@@ -281,6 +282,14 @@ class MechKernel:
                                                         description="齿数 > 此值自动用梯形近似；设大强制渐开线"),
                 "fallback_to_trapezoid": FieldSchema(type="boolean", required=False, default=True,
                                                      description="渐开线构造失败时自动回退梯形齿"),
+                "origin": FieldSchema(type="tuple", required=False, default=[0.0, 0.0, 0.0],
+                                      items_type="number", length=3,
+                                      description="齿轮局部坐标系原点 [x,y,z]（mm），默认世界原点"),
+                "axis": FieldSchema(type="tuple", required=False, default=[0.0, 0.0, 1.0],
+                                    items_type="number", length=3,
+                                    description="齿轮轴线方向 [dx,dy,dz]，默认 +Z；无需归一化但必须非零"),
+                "reference_direction": tuple3(required=False,
+                                              description="可选局部 +X 的参考方向 [dx,dy,dz]，不能与 axis 平行"),
             },
             permission="public",
             examples=[{"module": 2.0, "teeth": 20, "width": 18, "bore": 12},
@@ -1134,13 +1143,16 @@ class MechKernel:
                   pressure_angle_deg: float = 20.0, mode: str = "new_body", name: str = "",
                   confirm_replace: bool = False, involute_teeth_threshold: int = 400,
                   fallback_to_trapezoid: bool = True, helix_angle_deg: float = 0.0,
-                  helix_sections: int = 4) -> StepResult:
+                  helix_sections: int = 4, origin: list = None, axis: list = None,
+                  reference_direction: list = None) -> StepResult:
         """v2.12: 直接生成齿轮坯（免草图）。
 
-        在 XY 平面生成直齿圆柱齿轮 Part（分度圆中心在原点，沿 +Z 拉伸 width），
-        齿形数学见 mech_kernel.gear（ISO 21771 渐开线，大齿数回退梯形近似）。
-        mode 语义与 extrude 一致：new_body/add/cut；new_body 覆盖已有几何需 confirm_replace。
-        参数全部可由 _op_history 重放（update_feature 改模数/齿数即重建）。
+        先在 XY 平面生成直齿圆柱齿轮 Part（分度圆中心在原点，沿 +Z 拉伸 width），
+        再用 origin/axis/reference_direction 施加一次刚体变换。默认 origin=[0,0,0]、
+        axis=[0,0,1]，与旧版完全兼容。齿形数学见 mech_kernel.gear（ISO 21771 渐开线，
+        大齿数回退梯形近似）。mode 语义与 extrude 一致：new_body/add/cut；new_body
+        覆盖已有几何需 confirm_replace。参数全部可由 _op_history 重放
+        （update_feature 改模数/齿数/位置即重建）。
         """
         start = time.time()
         require_positive("module", module)
@@ -1150,6 +1162,20 @@ class MechKernel:
         if teeth > 400:
             raise InvalidRequestError(f"teeth 上限 400（当前 {teeth}）")
         require_non_negative("bore", bore)
+        origin = require_tuple3("origin", origin if origin is not None else (0.0, 0.0, 0.0))
+        axis = require_tuple3("axis", axis if axis is not None else (0.0, 0.0, 1.0))
+        reference_direction = (
+            require_tuple3("reference_direction", reference_direction)
+            if reference_direction is not None else None
+        )
+        for vector_name, vector in (("origin", origin), ("axis", axis),
+                                    ("reference_direction", reference_direction)):
+            if vector is not None and not all(math.isfinite(v) for v in vector):
+                raise InvalidRequestError(f"{vector_name} 必须是有限数，收到: {vector}")
+        try:
+            orientation = orientation_from_axis(axis, reference_direction)
+        except ValueError as exc:
+            raise InvalidRequestError(f"make_gear 刚体位置参数非法: {exc}") from exc
         if mode not in ("new_body", "add", "cut"):
             raise InvalidRequestError(f"mode 必须是 new_body/add/cut（当前 {mode}）")
         if mode == "cut" and self._current_geometry is None:
@@ -1207,6 +1233,13 @@ class MechKernel:
                 step_index=self._step_counter,
             ))
 
+        try:
+            gear = apply_rigid_transform(gear, orientation, origin)
+        except Exception as exc:
+            raise InvalidRequestError(
+                f"make_gear 刚体变换失败: {type(exc).__name__}: {exc}"
+            ) from exc
+
         profile = "trapezoid" if teeth > involute_teeth_threshold else "involute"
         kind = "helical" if abs(helix_angle_deg) >= 1e-9 else "spur"
         with Transaction(self, "make_gear") as txn:
@@ -1217,13 +1250,19 @@ class MechKernel:
                 involute_teeth_threshold=involute_teeth_threshold,
                 fallback_to_trapezoid=fallback_to_trapezoid,
                 helix_angle_deg=helix_angle_deg, helix_sections=helix_sections,
+                origin=list(origin), axis=list(axis),
+                reference_direction=(list(reference_direction)
+                                     if reference_direction is not None else None),
             )
             feature_id = self._ids.next_feature_id()
             entry["feature_id"] = feature_id
             feature = FeatureNode(
                 id=feature_id, type=FeatureType.GEAR,
                 parameters={"module": module, "teeth": teeth, "width": width, "bore": bore,
-                            "pressure_angle_deg": pressure_angle_deg, "mode": mode, "name": name},
+                            "pressure_angle_deg": pressure_angle_deg, "mode": mode, "name": name,
+                            "origin": list(origin), "axis": list(axis),
+                            "reference_direction": (list(reference_direction)
+                                                    if reference_direction is not None else None)},
                 name=name or f"gear_{feature_id}",
                 state=FeatureState.COMPUTED,
             )

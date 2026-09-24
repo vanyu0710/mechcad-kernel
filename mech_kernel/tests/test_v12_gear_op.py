@@ -37,7 +37,8 @@ def test_make_gear_in_public_ops_and_cap():
     assert k.PUBLIC_OPS == frozenset(names)  # 实例派生集与 cap 一致
     cap = k.cap.get("make_gear")
     for field in ("module", "teeth", "width", "bore", "mode",
-                  "confirm_replace", "involute_teeth_threshold", "fallback_to_trapezoid"):
+                  "confirm_replace", "involute_teeth_threshold", "fallback_to_trapezoid",
+                  "origin", "axis", "reference_direction"):
         assert field in cap.input_schema, field
 
 
@@ -90,6 +91,47 @@ def test_make_gear_threshold_switches_profile():
     # 两种齿形体积应接近但可区分（真渐开线齿顶更饱满，梯形齿顶被人为削薄）
     vi, vt = r1["geometry_summary"].volume, r2["geometry_summary"].volume
     assert abs(vi - vt) / vt < 0.10, f"involute {vi} vs trapezoid {vt} 差异过大"
+
+
+def test_make_gear_rigid_placement_and_replay():
+    """显式 origin/axis/reference_direction 生成真实刚体变换，且参数化重放不丢位置。"""
+    k = MechKernel()
+    r = _gear(k, teeth=20, width=10, origin=[10, 20, 30],
+              axis=[1, 0, 0], reference_direction=[0, 1, 0])
+    assert r["success"] is True, r["error"]
+    bb = k._current_geometry.bounding_box()
+    # 局部 +Z 轴变成世界 +X：齿宽沿 X；齿面半径围绕 (20,30)。
+    assert abs(bb.min.X - 10.0) < 1e-4
+    assert abs(bb.max.X - 20.0) < 1e-4
+    assert abs((bb.min.Y + bb.max.Y) / 2 - 20.0) < 1e-4
+    assert abs((bb.min.Z + bb.max.Z) / 2 - 30.0) < 1e-4
+    entry = k._op_history[-1]["args"]
+    assert entry["origin"] == [10.0, 20.0, 30.0]
+    assert entry["axis"] == [1.0, 0.0, 0.0]
+    assert entry["reference_direction"] == [0.0, 1.0, 0.0]
+
+    ru = k.execute("update_feature", feature_id=r["feature_id"],
+                   new_params={"width": 12})
+    assert ru["success"] is True, ru["error"]
+    bb2 = k._current_geometry.bounding_box()
+    assert abs(bb2.min.X - 10.0) < 1e-4
+    assert abs(bb2.max.X - 22.0) < 1e-4
+    assert abs((bb2.min.Y + bb2.max.Y) / 2 - 20.0) < 1e-4
+    assert abs((bb2.min.Z + bb2.max.Z) / 2 - 30.0) < 1e-4
+
+
+def test_make_gear_rigid_placement_invalid_requests():
+    k = MechKernel()
+    bad_cases = [
+        {"origin": [float("nan"), 0, 0]},
+        {"axis": [0, 0, 0]},
+        {"axis": [float("inf"), 0, 0]},
+        {"reference_direction": [0, 0, 1]},  # 与默认 +Z 轴平行
+    ]
+    for kw in bad_cases:
+        r = _gear(k, **kw)
+        assert r["success"] is False, (kw, r["error"])
+        assert r["error_kind"] == "INVALID_REQUEST", (kw, r["error"])
 
 
 def test_make_gear_invalid_requests():

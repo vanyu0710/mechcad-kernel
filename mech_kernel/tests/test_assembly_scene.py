@@ -125,6 +125,8 @@ def test_export_assembly_input_guards():
                               "out_step": os.path.join(tmp, "x.step")})
         assert "导入失败" in bad({"parts": [{"path": "no_such_file.step", "name": "a"}],
                                   "out_step": os.path.join(tmp, "x.step")})
+        assert "pose 必须是对象" in bad({"parts": [{"path": real, "name": "a", "pose": 0}],
+                                         "out_step": os.path.join(tmp, "x.step")})
     print("  ✓ test_export_assembly_input_guards")
 
 
@@ -152,6 +154,68 @@ def test_assembly_interference_with_prefilter_and_exemption():
             {"a": "底板", "b": "凸台", "max_volume_mm3": 10, "reason": "too small"}]})
         assert r3["exempted_count"] == 0 and len(r3["pairs"]) == 1, r3
     print("  ✓ test_assembly_interference_with_prefilter_and_exemption")
+
+
+def test_assembly_rigid_pose_matrix_and_axis_angle():
+    """rotation_matrix / rotation_deg 均先旋转后平移；导出与干涉都使用变换后几何。"""
+    import json
+
+    with tempfile.TemporaryDirectory() as tmp:
+        plate_path = _make_parts(tmp)[0]["path"]
+        matrix_90z = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        parts = [
+            {"path": plate_path, "name": "plate",
+             "pose": {"position": [0, 0, 0]}},
+            {"path": plate_path, "name": "matrix_plate",
+             "pose": {"rotation_matrix": matrix_90z, "position": [200, 0, 0]}},
+            {"path": plate_path, "name": "axis_angle_plate",
+             "pose": {"rotation_deg": [90, [0, 0, 1]], "position": [400, 0, 0]}},
+            {"path": plate_path, "name": "axis_angle_180_plate",
+             "pose": {"rotation_deg": [180, [1, 0, 0]], "position": [600, 0, 0]}},
+        ]
+        srv = KernelServer()
+        out = os.path.join(tmp, "rigid_asm.step")
+        r = srv.dispatch("export_assembly", {"parts": parts, "out_step": out})
+        assert r["ok"] is True, r
+        # 测试板以原点为中心：100x60，绕 Z 转 90° 后轮廓为 60x100。
+        assert abs(r["bounding_box"][0] + 50.0) < 1e-5
+        assert abs(r["bounding_box"][1] + 50.0) < 1e-5
+        assert abs(r["bounding_box"][3] - 650.0) < 1e-5
+        assert abs(r["bounding_box"][4] - 50.0) < 1e-5
+
+        # 回读 STEP，确认导出文件本身保留实例变换，而不只是返回值变了。
+        from build123d import import_step
+        exported = import_step(out)
+        eb = exported.bounding_box()
+        assert abs(eb.min.X + 50.0) < 1e-4
+        assert abs(eb.min.Y + 50.0) < 1e-4
+        assert abs(eb.max.X - 650.0) < 1e-4
+        assert abs(eb.max.Y - 50.0) < 1e-4
+
+        # 四个实例互不相交；若矩阵/轴角被忽略，plate 与远端平移板会完全重叠。
+        ri = srv.dispatch("assembly_interference", {"parts": parts})
+        assert ri["ok"] is True, ri
+        assert ri["interfering_count"] == 0, ri
+        assert ri["prefiltered_pairs"] == 6, ri
+
+        # 旋转表示互斥；非 proper matrix（反射）明确拒绝。
+        def bad_pose(pose):
+            payload = {"parts": [{"path": plate_path, "name": "p", "pose": pose}],
+                       "out_step": os.path.join(tmp, "bad.step")}
+            resp = srv.handle_line(json.dumps({"id": "bad", "cmd": "export_assembly",
+                                               "payload": payload}))
+            assert resp["ok"] is False, resp
+            assert resp["error"]["kind"] == "BAD_REQUEST", resp
+            return resp["error"]["message"]
+
+        assert "cannot both" in bad_pose({
+            "rotation_matrix": matrix_90z,
+            "rotation_deg": [90, [0, 0, 1]],
+        })
+        assert "proper rotation" in bad_pose({
+            "rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, -1]]
+        })
+    print("  ✓ test_assembly_rigid_pose_matrix_and_axis_angle")
 
 
 def test_render_assembly_png():
